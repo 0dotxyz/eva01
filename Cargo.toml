@@ -51,7 +51,7 @@ ctrlc = "3.5.2"
 yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", branch = "v2.1" }
 yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", branch = "v2.1" }
 # Includes a fix to the way results are parsed.
-switchboard-on-demand-client = { git = "https://github.com/abdulrabbani00/switchboard-sdk", rev = "99cf3f29143b81fd3ad17649725a3f994b253fbb" }
+switchboard-on-demand-client = { git = "https://github.com/switchboard-xyz/switchboard-sdk", branch = "main" }
 solana-dex-superagg = { git = "https://github.com/0dotxyz/solana-dex-superagg", rev = "3ab0b4f4de424a0044e983576d113e3b349b3d94" }
 
 [dependencies.marginfi_type_crate]

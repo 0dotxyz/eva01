@@ -7395,13 +7395,14 @@ dependencies = [
 
 [[package]]
 name = "switchboard-on-demand-client"
-version = "0.4.1-alpha0.0.0"
-source = "git+https://github.com/abdulrabbani00/switchboard-sdk?rev=99cf3f29143b81fd3ad17649725a3f994b253fbb#99cf3f29143b81fd3ad17649725a3f994b253fbb"
+version = "0.5.1"
+source = "git+https://github.com/switchboard-xyz/switchboard-sdk?branch=main#7fce771e8af381058e69d8911c777e93dc20c81c"
 dependencies = [
  "anyhow_ext",
  "arrayref",
  "base58",
  "base64 0.22.1",
+ "bincode",
  "borsh 0.9.3",
  "bs58 0.4.0",
  "bytemuck",
@@ -7426,9 +7427,9 @@ dependencies = [
 
 [[package]]
 name = "switchboard-protos"
-version = "0.2.4"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d807f905f076b3feee4cdd05eb7fd6850eb0fb9a49039bcf3734bd5846f7a2a"
+checksum = "dfe8595504af7819a8b0cf16825a0ea992ac60fc0bab6ff22d96c05081161769"
 dependencies = [
  "pbjson 0.7.0",
  "pbjson-build",
