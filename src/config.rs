@@ -4,7 +4,6 @@ use std::{collections::HashMap, str::FromStr};
 
 #[derive(Clone, Debug)]
 pub struct TokenThresholds {
-    pub declared_value: f64,
     pub min_value: I80F48,
     pub max_value: I80F48,
 }
@@ -169,7 +168,7 @@ pub fn load_token_thresholds_from_env() -> anyhow::Result<HashMap<Pubkey, TokenT
         Ok(s) if !s.trim().is_empty() => {
             let raw: HashMap<String, (f64, f64, f64)> = serde_json::from_str(&s)?;
             let mut out = HashMap::with_capacity(raw.len());
-            for (k, (declared_value, min_threshold, max_threshold)) in raw {
+            for (k, (_declared_value, min_threshold, max_threshold)) in raw {
                 let pk = Pubkey::from_str(&k).map_err(|e| {
                     anyhow::anyhow!("Invalid mint pubkey in TOKEN_THRESHOLDS: {k}: {e}")
                 })?;
@@ -182,7 +181,6 @@ pub fn load_token_thresholds_from_env() -> anyhow::Result<HashMap<Pubkey, TokenT
                 out.insert(
                     pk,
                     TokenThresholds {
-                        declared_value,
                         min_value: I80F48::from_num(min_threshold),
                         max_value: I80F48::from_num(max_threshold),
                     },

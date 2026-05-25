@@ -1,7 +1,7 @@
 use crate::{
     cache::Cache,
     clock_manager,
-    config::{Eva01Config, TokenThresholds},
+    config::Eva01Config,
     metrics::{
         record_liquidation_failure, ACCOUNTS_SCANNED_TOTAL, ACCOUNT_SCAN_DURATION_SECONDS,
         ERROR_COUNT, FAILURE_REASON_INTERNAL, FAILURE_REASON_NOT_ENOUGH_FUNDS,
@@ -28,11 +28,11 @@ use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{debug, error, info, warn};
 use marginfi::state::{
-    bank::BankImpl, marginfi_account::get_health_components, price::PriceAdapter,
+    bank::BankImpl, marginfi_account::get_health_components,
 };
 use marginfi_type_crate::{
     constants::BANKRUPT_THRESHOLD,
-    types::{BalanceSide, BankOperationalState, HealthPriceMode, OraclePriceType, RequirementType},
+    types::{BalanceSide, BankOperationalState, HealthPriceMode, RequirementType},
 };
 use solana_client::client_error::ClientError;
 use solana_program::pubkey::Pubkey;
@@ -45,7 +45,6 @@ use std::{
 };
 use std::{sync::atomic::Ordering, thread};
 
-const DECLARED_VALUE_RANGE: f64 = 0.2;
 const ACCOUNT_SCAN_BATCH_SIZE: usize = 4_096;
 
 pub struct Liquidator {
@@ -56,7 +55,6 @@ pub struct Liquidator {
     stop_liquidator: Arc<AtomicBool>,
     cache: Arc<Cache>,
     swb_cranker: SwbCranker,
-    token_thresholds: HashMap<Pubkey, TokenThresholds>,
     token_dust_threshold: I80F48,
 }
 
@@ -104,7 +102,6 @@ impl Liquidator {
             stop_liquidator,
             cache,
             swb_cranker,
-            token_thresholds: config.token_thresholds,
             token_dust_threshold: config.token_dust_threshold,
         })
     }
@@ -500,53 +497,9 @@ impl Liquidator {
 
         let asset_oracle_wrapper =
             OracleWrapper::build(&self.cache, &clock, &asset_bank_wrapper.address)?;
-        let asset_price = asset_oracle_wrapper
-            .price_adapter
-            .get_price_of_type_ignore_conf(OraclePriceType::RealTime, None)?
-            .to_num::<f64>();
-        if let Some(thresholds) = self.token_thresholds.get(&asset_bank_wrapper.bank.mint) {
-            let min_asset_price = thresholds.declared_value * (1.0 - DECLARED_VALUE_RANGE);
-            if asset_price < min_asset_price {
-                warn!(
-                    "Asset ({}) price is lower than the declared range: {} < {}",
-                    asset_bank_wrapper.bank.mint, asset_price, min_asset_price
-                );
-                return Ok(LiquidationAmounts::none());
-            }
-            let max_asset_price = thresholds.declared_value * (1.0 + DECLARED_VALUE_RANGE);
-            if asset_price > max_asset_price {
-                warn!(
-                    "Asset ({}) price is higher than the declared range: {} > {}",
-                    asset_bank_wrapper.bank.mint, asset_price, max_asset_price
-                );
-                return Ok(LiquidationAmounts::none());
-            }
-        }
 
         let liab_oracle_wrapper =
             OracleWrapper::build(&self.cache, &clock, &liab_bank_wrapper.address)?;
-        let liab_price = liab_oracle_wrapper
-            .price_adapter
-            .get_price_of_type_ignore_conf(OraclePriceType::RealTime, None)?
-            .to_num::<f64>();
-        if let Some(thresholds) = self.token_thresholds.get(&liab_bank_wrapper.bank.mint) {
-            let min_liab_price = thresholds.declared_value * (1.0 - DECLARED_VALUE_RANGE);
-            if liab_price < min_liab_price {
-                warn!(
-                    "Liability ({}) price is lower than the declared range: {} < {}",
-                    liab_bank_wrapper.bank.mint, liab_price, min_liab_price
-                );
-                return Ok(LiquidationAmounts::none());
-            }
-            let max_liab_price = thresholds.declared_value * (1.0 + DECLARED_VALUE_RANGE);
-            if liab_price > max_liab_price {
-                warn!(
-                    "Liability ({}) price is higher than the declared range: {} > {}",
-                    liab_bank_wrapper.bank.mint, liab_price, max_liab_price
-                );
-                return Ok(LiquidationAmounts::none());
-            }
-        }
 
         let asset_weight_maint: I80F48 = asset_bank_wrapper.bank.config.asset_weight_maint.into();
         let liab_weight_maint: I80F48 = liab_bank_wrapper.bank.config.liability_weight_maint.into();
