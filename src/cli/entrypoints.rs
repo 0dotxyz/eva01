@@ -7,6 +7,7 @@ use crate::{
     geyser_processor::GeyserProcessor,
     liquidator::Liquidator,
     metrics::{FAILED_LIQUIDATIONS, LIQUIDATION_ATTEMPTS},
+    utils::swb_price_fetcher::SwbPriceFetcher,
     wrappers::liquidator_account::LiquidatorAccount,
 };
 use log::{error, info};
@@ -46,6 +47,9 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
 
     let accounts_to_track = get_accounts_to_track(&cache)?;
 
+    let swb_fetcher_api_url = config.project0_api_url.clone();
+    let swb_fetcher_crossbar_url = config.crossbar_api_url.clone();
+
     info!("Initializing services...");
 
     // GeyserService -> GeyserProcessor
@@ -79,6 +83,9 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         clock.clone(),
     )?;
 
+    let swb_fetcher_cache = cache.clone();
+    let swb_fetcher_stop = stop_liquidator.clone();
+
     let geyser_processor = GeyserProcessor::new(
         geyser_rx.clone(),
         run_liquidation.clone(),
@@ -87,6 +94,16 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     )?;
 
     info!("Starting services...");
+
+    thread::spawn(move || {
+        let fetcher = SwbPriceFetcher::new(
+            swb_fetcher_api_url,
+            swb_fetcher_crossbar_url,
+            swb_fetcher_cache,
+            swb_fetcher_stop,
+        );
+        fetcher.start();
+    });
 
     let cloned_stop = stop_liquidator.clone();
     thread::spawn(move || clock_manager.start(cloned_stop));

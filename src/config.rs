@@ -23,6 +23,7 @@ pub struct Eva01Config {
     pub metrics_port: u16,
     pub swb_program_id: Pubkey,
     pub crossbar_api_url: Option<String>,
+    pub project0_api_url: Option<String>,
     pub jup_swap_api_url: String,
     pub swap_mint: Pubkey,
     pub slippage_bps: u16,
@@ -87,6 +88,7 @@ impl Eva01Config {
         .expect("Invalid SWB_PROGRAM_ID Pubkey");
 
         let crossbar_api_url = std::env::var("CROSSBAR_API_URL").ok();
+        let project0_api_url = std::env::var("PROJECT_0_API_URL").ok();
 
         let jup_swap_api_url = std::env::var("JUP_SWAP_API_URL")
             .expect("JUP_SWAP_API_URL environment variable is not set");
@@ -139,6 +141,7 @@ impl Eva01Config {
             metrics_port,
             swb_program_id,
             crossbar_api_url,
+            project0_api_url,
             jup_swap_api_url,
             swap_mint,
             slippage_bps,

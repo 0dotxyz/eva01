@@ -21,10 +21,39 @@ pub trait OracleWrapperTrait {
     fn get_address(&self) -> Pubkey;
 }
 
+enum PriceSource {
+    Adapter(OraclePriceFeedAdapter),
+    Prefetched {
+        price_realtime: I80F48,
+        conf_realtime: I80F48,
+        price_weighted: I80F48,
+        conf_weighted: I80F48,
+    },
+}
+
+impl Clone for PriceSource {
+    fn clone(&self) -> Self {
+        match self {
+            PriceSource::Adapter(a) => PriceSource::Adapter(a.clone()),
+            PriceSource::Prefetched {
+                price_realtime,
+                conf_realtime,
+                price_weighted,
+                conf_weighted,
+            } => PriceSource::Prefetched {
+                price_realtime: *price_realtime,
+                conf_realtime: *conf_realtime,
+                price_weighted: *price_weighted,
+                conf_weighted: *conf_weighted,
+            },
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OracleWrapper {
     pub addresses: Vec<Pubkey>,
-    pub price_adapter: OraclePriceFeedAdapter,
+    source: PriceSource,
 }
 
 impl OracleWrapperTrait for OracleWrapper {
@@ -34,9 +63,42 @@ impl OracleWrapperTrait for OracleWrapper {
         price_bias: Option<PriceBias>,
         oracle_max_confidence: u32,
     ) -> anyhow::Result<I80F48> {
-        Ok(self
-            .price_adapter
-            .get_price_of_type(oracle_type, price_bias, oracle_max_confidence)?)
+        match &self.source {
+            PriceSource::Adapter(adapter) => Ok(adapter.get_price_of_type(
+                oracle_type,
+                price_bias,
+                oracle_max_confidence,
+            )?),
+            PriceSource::Prefetched {
+                price_realtime,
+                conf_realtime,
+                price_weighted,
+                conf_weighted,
+            } => {
+                let (price, conf) = match oracle_type {
+                    OraclePriceType::TimeWeighted => (*price_weighted, *conf_weighted),
+                    _ => (*price_realtime, *conf_realtime),
+                };
+
+                if price > I80F48::ZERO {
+                    let conf_bps =
+                        (conf / price * I80F48::from_num(10_000u32)).to_num::<u32>();
+                    if conf_bps > oracle_max_confidence {
+                        return Err(anyhow!(
+                            "SWB prefetched oracle confidence too wide: {} bps > {} bps max",
+                            conf_bps,
+                            oracle_max_confidence
+                        ));
+                    }
+                }
+
+                Ok(match price_bias {
+                    Some(PriceBias::Low) => price - conf,
+                    Some(PriceBias::High) => price + conf,
+                    None => price,
+                })
+            }
+        }
     }
 
     fn get_address(&self) -> Pubkey {
@@ -57,6 +119,24 @@ impl OracleWrapperTrait for OracleWrapper {
                     ));
                 }
 
+                // SWB: check prefetched API prices first (keyed by bank address)
+                if matches!(
+                    bank_wrapper.bank.config.oracle_setup,
+                    OracleSetup::SwitchboardPull
+                ) {
+                    if let Some(swb_price) = cache.swb_prices.get(bank_address) {
+                        return Ok(Self {
+                            addresses: oracle_addresses,
+                            source: PriceSource::Prefetched {
+                                price_realtime: swb_price.price_realtime,
+                                conf_realtime: swb_price.conf_realtime,
+                                price_weighted: swb_price.price_weighted,
+                                conf_weighted: swb_price.conf_weighted,
+                            },
+                        });
+                    }
+                }
+
                 let bank_oracle_address = *oracle_addresses.first().unwrap();
                 let mut bank_oracle = cache.oracles.try_get_account(&bank_oracle_address)?;
                 let bank_oracle_account_info =
@@ -68,11 +148,10 @@ impl OracleWrapperTrait for OracleWrapper {
                     clock,
                 )?;
 
-                let oracle_wrapper = Self {
+                result = Some(Self {
                     addresses: [bank_oracle_address].to_vec(),
-                    price_adapter,
-                };
-                result = Some(oracle_wrapper);
+                    source: PriceSource::Adapter(price_adapter),
+                });
             }
             OracleSetup::StakedWithPythPush => {
                 if oracle_addresses.len() != 3 {
@@ -107,25 +186,22 @@ impl OracleWrapperTrait for OracleWrapper {
                     ],
                     clock,
                 )?;
-                let oracle_wrapper = Self {
+                result = Some(Self {
                     addresses: vec![
                         bank_oracle_address,
                         mint_oracle_address,
                         sol_pool_oracle_address,
                     ],
-                    price_adapter,
-                };
-                result = Some(oracle_wrapper);
+                    source: PriceSource::Adapter(price_adapter),
+                });
             }
             OracleSetup::Fixed => {
                 let price_adapter =
                     OraclePriceFeedAdapter::try_from_bank(&bank_wrapper.bank, &[], clock)?;
-
-                let oracle_wrapper = Self {
+                result = Some(Self {
                     addresses: vec![],
-                    price_adapter,
-                };
-                result = Some(oracle_wrapper);
+                    source: PriceSource::Adapter(price_adapter),
+                });
             }
             OracleSetup::KaminoPythPush
             | OracleSetup::KaminoSwitchboardPull
@@ -148,20 +224,18 @@ impl OracleWrapperTrait for OracleWrapper {
                 let integration_oracle_address = *oracle_addresses.get(1).unwrap();
                 let mut integration_oracle =
                     cache.oracles.try_get_account(&integration_oracle_address)?;
-
                 let integration_oracle_account_info =
                     (&integration_oracle_address, &mut integration_oracle).into_account_info();
+
                 let price_adapter = OraclePriceFeedAdapter::try_from_bank(
                     &bank_wrapper.bank,
                     &[bank_oracle_account_info, integration_oracle_account_info],
                     clock,
                 )?;
-
-                let oracle_wrapper = Self {
+                result = Some(Self {
                     addresses: [bank_oracle_address, integration_oracle_address].to_vec(),
-                    price_adapter,
-                };
-                result = Some(oracle_wrapper);
+                    source: PriceSource::Adapter(price_adapter),
+                });
             }
             OracleSetup::FixedKamino | OracleSetup::FixedDrift | OracleSetup::FixedJuplend => {
                 if oracle_addresses.len() != 1 {
@@ -182,12 +256,10 @@ impl OracleWrapperTrait for OracleWrapper {
                     &[integration_oracle_account_info],
                     clock,
                 )?;
-
-                let oracle_wrapper = Self {
+                result = Some(Self {
                     addresses: vec![integration_oracle_address],
-                    price_adapter,
-                };
-                result = Some(oracle_wrapper);
+                    source: PriceSource::Adapter(price_adapter),
+                });
             }
             _ => {
                 error!(

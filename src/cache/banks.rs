@@ -61,6 +61,22 @@ impl BanksCache {
             .collect()
     }
 
+    /// Returns a map of SwitchboardPull oracle pubkey → bank address.
+    /// Only includes direct SwitchboardPull banks (not integration types), since
+    /// those are the only ones whose prices are stored and read via swb_prices cache.
+    pub fn get_swb_oracle_to_bank_map(&self) -> HashMap<Pubkey, Pubkey> {
+        self.banks
+            .iter()
+            .filter_map(|(bank_addr, bank)| {
+                if matches!(bank.bank.config.oracle_setup, OracleSetup::SwitchboardPull) {
+                    Some((bank.bank.config.oracle_keys[0], *bank_addr))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub fn get_kamino_reserves(&self) -> HashSet<Pubkey> {
         self.banks
             .iter()

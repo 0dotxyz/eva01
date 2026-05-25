@@ -256,15 +256,7 @@ impl Liquidator {
                 }
             }
         }
-        let swb_oracle_count = self.cache.banks.get_swb_oracles().len();
-        self.swb_cranker
-            .simulate_oracles(self.cache.as_ref())
-            .with_context(|| {
-                format!(
-                    "simulate_oracles failed (switchboard feed count: {}, refresh_integrations: {})",
-                    swb_oracle_count, refresh_integrations
-                )
-            })
+        Ok(())
     }
 
     /// Checks if liquidation is needed, for each account one by one

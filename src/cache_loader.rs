@@ -442,8 +442,11 @@ impl CacheLoader {
 pub fn get_accounts_to_track(cache: &Cache) -> Result<HashMap<Pubkey, AccountType>> {
     let mut accounts: HashMap<Pubkey, AccountType> = HashMap::new();
 
+    let swb_oracles = cache.banks.get_swb_oracles();
     for oracle_pk in cache.oracles.try_get_addresses()? {
-        accounts.insert(oracle_pk, AccountType::Oracle);
+        if !swb_oracles.contains(&oracle_pk) {
+            accounts.insert(oracle_pk, AccountType::Oracle);
+        }
     }
 
     for token in cache.mints.get_tokens() {

@@ -1,6 +1,7 @@
 pub mod healthcheck;
 pub mod simulation_cache;
 pub mod swb_cranker;
+pub mod swb_price_fetcher;
 
 use anyhow::{anyhow, Error, Result};
 use backoff::ExponentialBackoff;
