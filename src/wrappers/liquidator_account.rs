@@ -17,10 +17,7 @@ use crate::{
     metrics::{LIQUIDATION_ATTEMPTS, LIQUIDATION_LATENCY_SECONDS, LIQUIDATION_SUCCESSES},
     utils::{
         self, marginfi_account_by_authority,
-        simulation_cache::{
-            format_skipped_instruction_entries, is_tx_too_large_client,
-            simulate_instruction_batches, SimulatedInstructionEntry,
-        },
+        simulation_cache::is_tx_too_large_client,
         swb_cranker::is_stale_swb_price_error,
     },
     wrappers::oracle::OracleWrapper,
@@ -55,15 +52,12 @@ use solana_sdk::{
 };
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::Arc,
     thread,
     time::Duration,
 };
 
 pub const PROFIT_SHARE: f64 = 0.085;
-const DEFAULT_INTEGRATION_REFRESH_BATCH_HINT: usize = 12;
-const INTEGRATION_REFRESH_RPC_MAX_RETRIES: usize = 3;
-const INTEGRATION_REFRESH_RPC_RETRY_BASE_DELAY_MS: u64 = 250;
 
 #[derive(Debug)]
 pub enum LiquidationError {
@@ -109,10 +103,7 @@ pub struct LiquidatorAccount {
     rpc_client: RpcClient,
     cu_limit_ix: Instruction,
     pub cache: Arc<Cache>,
-    integration_refresh_batch_hint: Mutex<usize>,
 }
-
-type IntegrationRefreshEntry = SimulatedInstructionEntry;
 
 impl LiquidatorAccount {
     pub fn new(
@@ -162,7 +153,6 @@ impl LiquidatorAccount {
             rpc_client,
             cu_limit_ix: ComputeBudgetInstruction::set_compute_unit_limit(1400000),
             cache,
-            integration_refresh_batch_hint: Mutex::new(DEFAULT_INTEGRATION_REFRESH_BATCH_HINT),
         })
     }
 
@@ -832,87 +822,6 @@ impl LiquidatorAccount {
         Ok((drift_spot_market, reward_spot_market, reward_spot_market_2))
     }
 
-    fn build_refresh_integrations_entries(&self) -> Result<Vec<IntegrationRefreshEntry>> {
-        let mut entries = Vec::new();
-        let mut participating_accounts: HashSet<Pubkey> = HashSet::new();
-
-        for (address, reserve) in self.cache.try_get_kamino_reserves()? {
-            let instruction =
-                make_refresh_reserve_ix(address, &reserve, &mut participating_accounts);
-            debug!(
-                "Refreshing: reserve {}, mint {}",
-                address, reserve.reserve.collateral.mint_pubkey
-            );
-            entries.push(IntegrationRefreshEntry {
-                kind: "kamino",
-                address,
-                instruction,
-            });
-        }
-
-        // TODO: bring back Drift here if it's ever resurrected
-
-        for (address, lending_state) in self.cache.try_get_juplend_lending_states()? {
-            debug!("Refreshing: state {}, mint {}", address, lending_state.mint);
-            let instruction =
-                make_update_lending_rate_ix(address, &lending_state, &mut participating_accounts);
-            entries.push(IntegrationRefreshEntry {
-                kind: "juplend",
-                address,
-                instruction,
-            });
-        }
-
-        Ok(entries)
-    }
-
-    pub fn simulate_refresh_integrations(&self) -> Result<()> {
-        let luts: Vec<AddressLookupTableAccount> = self.cache.luts.lock().unwrap().clone();
-        let entries = self.build_refresh_integrations_entries()?;
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let stored_batch_hint = *self.integration_refresh_batch_hint.lock().unwrap();
-        let summary = simulate_instruction_batches(
-            &self.rpc_client,
-            &self.signer,
-            &luts,
-            &self.cu_limit_ix,
-            &entries,
-            stored_batch_hint,
-            INTEGRATION_REFRESH_RPC_MAX_RETRIES,
-            Duration::from_millis(INTEGRATION_REFRESH_RPC_RETRY_BASE_DELAY_MS),
-            |address, account| self.cache.oracles.try_update(address, account),
-        )
-        .context("simulate_instruction_batches for integrations refresh failed")?;
-
-        debug!(
-            "Integrations refresh simulation completed: refreshed_batches={}, skipped_entries={}",
-            summary.refreshed_batches,
-            summary.skipped_entries.len()
-        );
-
-        if !summary.skipped_entries.is_empty() {
-            warn!(
-                "Integrations refresh simulation completed while skipping {} failing integrations: {}",
-                summary.skipped_entries.len(),
-                format_skipped_instruction_entries(&summary.skipped_entries)
-            );
-        }
-
-        if summary.resized_down {
-            let mut batch_hint = self.integration_refresh_batch_hint.lock().unwrap();
-            if summary.preferred_batch_size < *batch_hint {
-                info!(
-                    "Reduced integrations refresh batch-size hint from {} to {} after simulation backoff",
-                    *batch_hint, summary.preferred_batch_size
-                );
-                *batch_hint = summary.preferred_batch_size;
-            }
-        }
-
-        Ok(())
-    }
 }
 
 fn contains_stale_oracles(stale_oracles: &HashSet<Pubkey>, account_oracles: &[Pubkey]) -> bool {

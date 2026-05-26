@@ -7,7 +7,10 @@ use crate::{
     geyser_processor::GeyserProcessor,
     liquidator::Liquidator,
     metrics::{FAILED_LIQUIDATIONS, LIQUIDATION_ATTEMPTS},
-    utils::swb_price_fetcher::SwbPriceFetcher,
+    utils::{
+        integration_account_fetcher::IntegrationAccountFetcher,
+        swb_price_fetcher::SwbPriceFetcher,
+    },
     wrappers::liquidator_account::LiquidatorAccount,
 };
 use log::{error, info};
@@ -49,6 +52,7 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
 
     let swb_fetcher_api_url = config.project0_api_url.clone();
     let swb_fetcher_crossbar_url = config.crossbar_api_url.clone();
+    let integration_fetcher_rpc_url = config.rpc_url.clone();
 
     info!("Initializing services...");
 
@@ -85,6 +89,8 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
 
     let swb_fetcher_cache = cache.clone();
     let swb_fetcher_stop = stop_liquidator.clone();
+    let integration_fetcher_cache = cache.clone();
+    let integration_fetcher_stop = stop_liquidator.clone();
 
     let geyser_processor = GeyserProcessor::new(
         geyser_rx.clone(),
@@ -104,6 +110,16 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         );
         fetcher.start();
     });
+
+    thread::spawn(move || {
+        let fetcher = IntegrationAccountFetcher::new(
+            integration_fetcher_rpc_url,
+            integration_fetcher_cache,
+            integration_fetcher_stop,
+        );
+        fetcher.start();
+    });
+
 
     let cloned_stop = stop_liquidator.clone();
     thread::spawn(move || clock_manager.start(cloned_stop));

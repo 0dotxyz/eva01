@@ -9,11 +9,7 @@ use crate::{
         LIQUIDATABLE_ACCOUNTS_FOUND_TOTAL, LIQUIDATION_SCAN_IN_PROGRESS,
     },
     rebalancer::Rebalancer,
-    utils::{
-        format_error_chain,
-        simulation_cache::is_transient_rpc_anyhow_error,
-        swb_cranker::{SwbCranker, SWB_STALE_HANDLED_ERROR, SWB_STALE_PRICE_ERROR_CODE_NUMBER},
-    },
+    utils::swb_cranker::{SwbCranker, SWB_STALE_HANDLED_ERROR, SWB_STALE_PRICE_ERROR_CODE_NUMBER},
     wrappers::{
         bank::BankWrapper,
         liquidator_account::{
@@ -23,10 +19,10 @@ use crate::{
         oracle::{OracleWrapper, OracleWrapperTrait},
     },
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use marginfi::state::{
     bank::BankImpl, marginfi_account::get_health_components,
 };
@@ -107,12 +103,6 @@ impl Liquidator {
     }
 
     pub fn start(&mut self) -> Result<()> {
-        if let Err(err) = self.simulate_oracles_and_integrations(false) {
-            warn!(
-                "Failed startup pre-rebalancing simulation round: {}",
-                format_error_chain(&err)
-            );
-        }
         self.rebalancer.run(HashMap::new())?;
 
         info!("Staring the Liquidator loop.");
@@ -126,18 +116,9 @@ impl Liquidator {
             info!("Running the Liquidation process...");
             self.run_liquidation.store(false, Ordering::Relaxed);
 
-            if let Err(err) = self.simulate_oracles_and_integrations(true) {
-                error!(
-                    "Failed pre-liquidation simulation: {}",
-                    format_error_chain(&err)
-                );
-                continue;
-            }
-
             let mut missing_tokens: HashMap<Pubkey, I80F48> = HashMap::new();
             let mut stale_swb_oracles: HashSet<Pubkey> = HashSet::new();
             let evaluated_accounts = self.evaluate_all_accounts(&mut stale_swb_oracles);
-            let mut cranked_stale_oracles = false;
 
             if let Ok(mut accounts) = evaluated_accounts {
                 // Accounts are sorted from the highest profit to the lowest
@@ -204,7 +185,6 @@ impl Liquidator {
                 }
                 if !stale_swb_oracles.is_empty() {
                     info!("Cranking Swb Oracles {:#?}", stale_swb_oracles);
-                    cranked_stale_oracles = true;
                     if let Err(err) = self
                         .swb_cranker
                         .crank_oracles(stale_swb_oracles.into_iter().collect())
@@ -220,19 +200,6 @@ impl Liquidator {
 
             info!("The Liquidation process is complete.");
 
-            if cranked_stale_oracles {
-                if let Err(err) = self.simulate_oracles_and_integrations(false) {
-                    warn!(
-                        "Failed pre-rebalancing simulation: {}",
-                        format_error_chain(&err)
-                    );
-                }
-            } else {
-                debug!(
-                    "Skipping pre-rebalancing oracle simulation because no stale oracles were cranked"
-                );
-            }
-
             if let Err(error) = self.rebalancer.run(missing_tokens) {
                 error!("Rebalancing failed: {:?}", error);
                 ERROR_COUNT.inc();
@@ -240,22 +207,6 @@ impl Liquidator {
         }
         info!("The Liquidator loop is stopped.");
 
-        Ok(())
-    }
-
-    fn simulate_oracles_and_integrations(&self, refresh_integrations: bool) -> Result<()> {
-        if refresh_integrations {
-            if let Err(err) = self.liquidator_account.simulate_refresh_integrations() {
-                if is_transient_rpc_anyhow_error(&err) {
-                    warn!(
-                        "Transient RPC failure while simulating integrations refresh; proceeding with cached integration state: {}",
-                        format_error_chain(&err)
-                    );
-                } else {
-                    return Err(err).context("simulate_refresh_integrations failed");
-                }
-            }
-        }
         Ok(())
     }
 

@@ -119,17 +119,6 @@ impl Cache {
         Ok(Self::build_kamino_reserve(*address, reserve))
     }
 
-    pub fn try_get_kamino_reserves(&self) -> Result<Vec<(Pubkey, KaminoReserve)>> {
-        self.try_get_kamino_reserve_addresses()?
-            .into_iter()
-            .map(|address| Ok((address, self.try_get_kamino_reserve(&address)?)))
-            .collect()
-    }
-
-    pub fn try_get_kamino_reserve_addresses(&self) -> Result<Vec<Pubkey>> {
-        Ok(self.banks.get_kamino_reserves().into_iter().collect())
-    }
-
     pub fn try_get_drift_market(&self, address: &Pubkey) -> Result<DriftSpotMarket> {
         let account = self.oracles.try_get_account(address)?;
         let mut data: &[u8] = &account.data;
@@ -157,21 +146,6 @@ impl Cache {
                 e
             )
         })
-    }
-
-    pub fn try_get_juplend_lending_states(&self) -> Result<Vec<(Pubkey, Lending)>> {
-        self.try_get_juplend_lending_state_addresses()?
-            .into_iter()
-            .map(|address| Ok((address, self.try_get_juplend_lending_state(&address)?)))
-            .collect()
-    }
-
-    pub fn try_get_juplend_lending_state_addresses(&self) -> Result<Vec<Pubkey>> {
-        Ok(self
-            .banks
-            .get_juplend_lending_states()
-            .into_iter()
-            .collect())
     }
 
     pub fn add_lut(&mut self, lut: AddressLookupTableAccount) {
