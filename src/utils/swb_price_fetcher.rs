@@ -14,6 +14,7 @@ use fixed::types::I80F48;
 use log::{debug, info, warn};
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use marginfi_type_crate::types::OracleSetup;
 use solana_sdk::{account::Account, genesis_config::ClusterType, pubkey, pubkey::Pubkey};
 use switchboard_on_demand_client::{CrossbarClient, PullFeedAccountData};
 use tokio::runtime::{Builder, Runtime};
@@ -166,10 +167,18 @@ impl SwbPriceFetcher {
             let price_rt = I80F48::from_num(price_realtime);
             let conf_rt = I80F48::from_num(conf_realtime);
             if let Ok(bank) = self.cache.banks.try_get_bank(&bank_address) {
-                if let Some(&oracle_key) = bank.bank.config.oracle_keys.first() {
-                    let synthetic = build_synthetic_swb_account(price_rt, conf_rt);
-                    if let Err(e) = self.cache.oracles.try_update(&oracle_key, synthetic) {
-                        warn!("SwbPriceFetcher: failed to write synthetic oracle for {oracle_key}: {e}");
+                if matches!(
+                    bank.bank.config.oracle_setup,
+                    OracleSetup::SwitchboardPull
+                        | OracleSetup::KaminoSwitchboardPull
+                        | OracleSetup::DriftSwitchboardPull
+                        | OracleSetup::JuplendSwitchboardPull
+                ) {
+                    if let Some(&oracle_key) = bank.bank.config.oracle_keys.first() {
+                        let synthetic = build_synthetic_swb_account(price_rt, conf_rt);
+                        if let Err(e) = self.cache.oracles.try_update(&oracle_key, synthetic) {
+                            warn!("SwbPriceFetcher: failed to write synthetic oracle for {oracle_key}: {e}");
+                        }
                     }
                 }
             }

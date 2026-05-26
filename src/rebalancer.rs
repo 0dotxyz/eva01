@@ -198,6 +198,8 @@ impl Rebalancer {
                 if e.to_string().contains("Stake pool supply is zero") {
                     self.empty_stake_banks.insert(mint);
                 } else {
+                    // SwitchboardStalePrice here at startup is harmless — SwbPriceFetcher
+                    // populates synthetic oracle accounts on its first 30-second cycle.
                     warn!("Skipping the token {} in rebalancing: {}", mint, e);
                 }
                 continue;
