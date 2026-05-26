@@ -23,29 +23,12 @@ pub trait OracleWrapperTrait {
 
 enum PriceSource {
     Adapter(OraclePriceFeedAdapter),
-    Prefetched {
-        price_realtime: I80F48,
-        conf_realtime: I80F48,
-        price_weighted: I80F48,
-        conf_weighted: I80F48,
-    },
 }
 
 impl Clone for PriceSource {
     fn clone(&self) -> Self {
         match self {
             PriceSource::Adapter(a) => PriceSource::Adapter(a.clone()),
-            PriceSource::Prefetched {
-                price_realtime,
-                conf_realtime,
-                price_weighted,
-                conf_weighted,
-            } => PriceSource::Prefetched {
-                price_realtime: *price_realtime,
-                conf_realtime: *conf_realtime,
-                price_weighted: *price_weighted,
-                conf_weighted: *conf_weighted,
-            },
         }
     }
 }
@@ -69,35 +52,6 @@ impl OracleWrapperTrait for OracleWrapper {
                 price_bias,
                 oracle_max_confidence,
             )?),
-            PriceSource::Prefetched {
-                price_realtime,
-                conf_realtime,
-                price_weighted,
-                conf_weighted,
-            } => {
-                let (price, conf) = match oracle_type {
-                    OraclePriceType::TimeWeighted => (*price_weighted, *conf_weighted),
-                    _ => (*price_realtime, *conf_realtime),
-                };
-
-                if price > I80F48::ZERO {
-                    let conf_bps =
-                        (conf / price * I80F48::from_num(10_000u32)).to_num::<u32>();
-                    if conf_bps > oracle_max_confidence {
-                        return Err(anyhow!(
-                            "SWB prefetched oracle confidence too wide: {} bps > {} bps max",
-                            conf_bps,
-                            oracle_max_confidence
-                        ));
-                    }
-                }
-
-                Ok(match price_bias {
-                    Some(PriceBias::Low) => price - conf,
-                    Some(PriceBias::High) => price + conf,
-                    None => price,
-                })
-            }
         }
     }
 
@@ -117,24 +71,6 @@ impl OracleWrapperTrait for OracleWrapper {
                         "PythPull/SwitchboardPull setup requires exactly 1 oracle key, but found {} for the Bank {:?} (setup: {:?})",
                         oracle_addresses.len(), bank_address, bank_wrapper.bank.config.oracle_setup
                     ));
-                }
-
-                // SWB: check prefetched API prices first (keyed by bank address)
-                if matches!(
-                    bank_wrapper.bank.config.oracle_setup,
-                    OracleSetup::SwitchboardPull
-                ) {
-                    if let Some(swb_price) = cache.swb_prices.get(bank_address) {
-                        return Ok(Self {
-                            addresses: oracle_addresses,
-                            source: PriceSource::Prefetched {
-                                price_realtime: swb_price.price_realtime,
-                                conf_realtime: swb_price.conf_realtime,
-                                price_weighted: swb_price.price_weighted,
-                                conf_weighted: swb_price.conf_weighted,
-                            },
-                        });
-                    }
                 }
 
                 let bank_oracle_address = *oracle_addresses.first().unwrap();

@@ -5,19 +5,49 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
+use bytemuck::Zeroable;
 use fixed::types::I80F48;
 use log::{debug, info, warn};
 use reqwest::blocking::Client;
 use serde::Deserialize;
-use solana_sdk::{genesis_config::ClusterType, pubkey::Pubkey};
-use switchboard_on_demand_client::CrossbarClient;
+use solana_sdk::{account::Account, genesis_config::ClusterType, pubkey, pubkey::Pubkey};
+use switchboard_on_demand_client::{CrossbarClient, PullFeedAccountData};
 use tokio::runtime::{Builder, Runtime};
 
-use crate::cache::{Cache, SwbPrice};
+use crate::cache::Cache;
+
+const SWITCHBOARD_PULL_PROGRAM_ID: Pubkey =
+    pubkey!("SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv");
+const SWB_PULL_FEED_DISCRIMINATOR: [u8; 8] = [196, 27, 108, 196, 10, 215, 219, 40];
+
+fn build_synthetic_swb_account(price: I80F48, conf: I80F48) -> Account {
+    let mut feed = PullFeedAccountData::zeroed();
+    feed.last_update_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    const SCALE: f64 = 1e18;
+    feed.result.value = (price.to_num::<f64>() * SCALE) as i128;
+    feed.result.std_dev = (conf.to_num::<f64>() * SCALE) as i128;
+    feed.result.mean = feed.result.value;
+    feed.result.num_samples = 1;
+
+    let mut data = Vec::with_capacity(8 + std::mem::size_of::<PullFeedAccountData>());
+    data.extend_from_slice(&SWB_PULL_FEED_DISCRIMINATOR);
+    data.extend_from_slice(bytemuck::bytes_of(&feed));
+
+    Account {
+        lamports: 1,
+        data,
+        owner: SWITCHBOARD_PULL_PROGRAM_ID,
+        executable: false,
+        rent_epoch: 0,
+    }
+}
 
 const FETCH_INTERVAL: Duration = Duration::from_secs(30);
 const FALLBACK_CROSSBAR_URL: &str = "https://crossbar.switchboard.xyz";
@@ -37,8 +67,6 @@ struct ViewPriceEntry {
 struct OraclePriceDto {
     #[serde(rename = "priceRealtime")]
     price_realtime: PriceWithConfidenceDto,
-    #[serde(rename = "priceWeighted")]
-    price_weighted: PriceWithConfidenceDto,
 }
 
 #[derive(Deserialize)]
@@ -134,22 +162,17 @@ impl SwbPriceFetcher {
                 .price_realtime
                 .confidence
                 .parse::<f64>()?;
-            let price_weighted = entry.oracle_price.price_weighted.price.parse::<f64>()?;
-            let conf_weighted = entry
-                .oracle_price
-                .price_weighted
-                .confidence
-                .parse::<f64>()?;
 
-            self.cache.swb_prices.upsert(
-                bank_address,
-                SwbPrice {
-                    price_realtime: I80F48::from_num(price_realtime),
-                    conf_realtime: I80F48::from_num(conf_realtime),
-                    price_weighted: I80F48::from_num(price_weighted),
-                    conf_weighted: I80F48::from_num(conf_weighted),
-                },
-            )?;
+            let price_rt = I80F48::from_num(price_realtime);
+            let conf_rt = I80F48::from_num(conf_realtime);
+            if let Ok(bank) = self.cache.banks.try_get_bank(&bank_address) {
+                if let Some(&oracle_key) = bank.bank.config.oracle_keys.first() {
+                    let synthetic = build_synthetic_swb_account(price_rt, conf_rt);
+                    if let Err(e) = self.cache.oracles.try_update(&oracle_key, synthetic) {
+                        warn!("SwbPriceFetcher: failed to write synthetic oracle for {oracle_key}: {e}");
+                    }
+                }
+            }
             count += 1;
         }
         Ok(count)
@@ -205,16 +228,16 @@ impl SwbPriceFetcher {
                 0.0
             };
 
-            self.cache.swb_prices.upsert(
-                bank_address,
-                SwbPrice {
-                    price_realtime: I80F48::from_num(price),
-                    conf_realtime: I80F48::from_num(conf),
-                    // Crossbar doesn't distinguish realtime vs weighted; use same value
-                    price_weighted: I80F48::from_num(price),
-                    conf_weighted: I80F48::from_num(conf),
-                },
-            )?;
+            let price_rt = I80F48::from_num(price);
+            let conf_rt = I80F48::from_num(conf);
+            if let Ok(bank) = self.cache.banks.try_get_bank(&bank_address) {
+                if let Some(&oracle_key) = bank.bank.config.oracle_keys.first() {
+                    let synthetic = build_synthetic_swb_account(price_rt, conf_rt);
+                    if let Err(e) = self.cache.oracles.try_update(&oracle_key, synthetic) {
+                        warn!("SwbPriceFetcher: failed to write synthetic oracle for {oracle_key}: {e}");
+                    }
+                }
+            }
             count += 1;
         }
         Ok(count)

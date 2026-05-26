@@ -62,8 +62,7 @@ impl BanksCache {
     }
 
     /// Returns a map of SwitchboardPull oracle pubkey → bank address.
-    /// Only includes direct SwitchboardPull banks (not integration types), since
-    /// those are the only ones whose prices are stored and read via swb_prices cache.
+    /// Only includes direct SwitchboardPull banks (not integration types).
     pub fn get_swb_oracle_to_bank_map(&self) -> HashMap<Pubkey, Pubkey> {
         self.banks
             .iter()

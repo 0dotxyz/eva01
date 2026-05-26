@@ -2,7 +2,6 @@ mod accounts;
 mod banks;
 pub mod mints;
 mod oracles;
-mod swb_prices;
 mod tokens;
 
 use std::{
@@ -20,7 +19,6 @@ use marginfi_type_crate::{
 };
 use mints::MintsCache;
 use oracles::OraclesCache;
-pub use swb_prices::{SwbPrice, SwbPricesCache};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_sdk::{
     address_lookup_table::{self, state::AddressLookupTable, AddressLookupTableAccount},
@@ -51,7 +49,6 @@ pub struct Cache {
     pub banks: BanksCache,
     pub mints: MintsCache,
     pub oracles: OraclesCache,
-    pub swb_prices: SwbPricesCache,
     pub tokens: TokensCache,
     pub clock: Arc<Mutex<Clock>>,
     pub luts: Arc<Mutex<Vec<AddressLookupTableAccount>>>,
@@ -89,7 +86,6 @@ impl Cache {
             banks: BanksCache::default(),
             mints: MintsCache::default(),
             oracles: OraclesCache::default(),
-            swb_prices: SwbPricesCache::default(),
             tokens: TokensCache::default(),
             clock,
             luts,
