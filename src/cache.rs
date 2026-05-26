@@ -201,12 +201,12 @@ impl Cache {
     }
 }
 
-fn create_lut(
+pub(crate) fn create_lut(
     rpc_client: &RpcClient,
     signer_keypair: &Keypair,
     addresses: Vec<Pubkey>,
 ) -> anyhow::Result<AddressLookupTableAccount> {
-    let recent_slot = rpc_client.get_slot()?;
+    let recent_slot = rpc_client.get_slot_with_commitment(CommitmentConfig::confirmed())?;
     let (create_ix, lut_address) = address_lookup_table::instruction::create_lookup_table(
         signer_keypair.pubkey(),
         signer_keypair.pubkey(),
@@ -239,7 +239,7 @@ fn create_lut(
     })
 }
 
-fn extend_lut(
+pub(crate) fn extend_lut(
     rpc_client: &RpcClient,
     signer_keypair: &Keypair,
     lut_address: Pubkey,

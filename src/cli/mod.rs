@@ -1,6 +1,6 @@
 use std::{
-    sync::{atomic::AtomicBool, Arc},
-    thread::{self},
+    sync::{atomic::AtomicBool, Arc, Mutex},
+    thread,
 };
 
 use crate::{
@@ -9,10 +9,9 @@ use crate::{
     utils::healthcheck::{HealthCheckServer, HealthState},
 };
 use log::error;
-use std::sync::Mutex;
 
-/// Entrypoints for the Eva
 pub mod entrypoints;
+pub use entrypoints::create_lut_entry;
 
 /// Main entrypoint for Eva
 pub fn main_entry(stop: Arc<AtomicBool>) -> anyhow::Result<()> {

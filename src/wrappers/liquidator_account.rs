@@ -665,12 +665,6 @@ impl LiquidatorAccount {
         let ixs: Vec<Instruction> = vec![self.cu_limit_ix.clone(), withdraw_ix];
         let luts: Vec<AddressLookupTableAccount> = self.cache.luts.lock().unwrap().clone();
 
-        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
-        let msg = Message::try_compile(&signer_pk, &ixs, &luts, recent_blockhash)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
-            .map_err(|e| anyhow::anyhow!(e))?;
-
         debug!(
             "Withdrawing {:?} unscaled tokens of the Mint {} from the Liquidator account {:?}, Bank {:?}, ",
             amount,
@@ -678,6 +672,23 @@ impl LiquidatorAccount {
             mint_wrapper.token,
             self.preferred_mint_bank
         );
+
+        self.send_withdraw_tx(&signer_pk, &ixs, &luts)?;
+
+        Ok(())
+    }
+
+    fn send_withdraw_tx(
+        &self,
+        signer_pk: &Pubkey,
+        ixs: &[Instruction],
+        luts: &[AddressLookupTableAccount],
+    ) -> Result<()> {
+        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
+        let msg = Message::try_compile(signer_pk, ixs, luts, recent_blockhash)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         let res = self
             .rpc_client
@@ -690,10 +701,26 @@ impl LiquidatorAccount {
                     ..Default::default()
                 },
             )
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| anyhow::anyhow!(e));
 
-        debug!("Withdrawal tx: {:?} ", res);
-        Ok(())
+        match res {
+            Ok(sig) => {
+                debug!("Withdrawal tx: {:?}", sig);
+                Ok(())
+            }
+            Err(e)
+                if !luts.is_empty()
+                    && e.to_string()
+                        .contains("address table account that doesn't exist") =>
+            {
+                warn!(
+                    "LUT is invalid or deactivated ({}); retrying withdraw without LUTs",
+                    luts[0].key
+                );
+                self.send_withdraw_tx(signer_pk, ixs, &[])
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn deposit(&self, bank: &BankWrapper, amount: u64) -> Result<()> {
