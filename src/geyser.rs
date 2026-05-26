@@ -1,15 +1,12 @@
-use crate::{
-    clock_manager, config::Eva01Config, metrics::ERROR_COUNT, utils::account_update_to_account,
-    ward,
-};
+use crate::{config::Eva01Config, metrics::ERROR_COUNT, utils::account_update_to_account, ward};
 use anchor_lang::AccountDeserialize;
 use anyhow::Result;
 use crossbeam::channel::Sender;
 use futures::StreamExt;
-use log::{error, info, trace, warn};
+use log::{error, info, warn};
 use marginfi_type_crate::types::MarginfiAccount;
 use solana_program::pubkey::Pubkey;
-use solana_sdk::{account::Account, clock::Clock};
+use solana_sdk::account::Account;
 use std::{
     collections::HashMap,
     mem::size_of,
@@ -27,8 +24,6 @@ const MARGIN_ACCOUNT_SIZE: usize = size_of::<MarginfiAccount>() + 8;
 const RATE_LIMIT_LOG_INTERVAL_SECS: u64 = 60;
 const MAX_ERRORS_PER_MINUTE: u64 = 5;
 
-/// Struct that is used to communicate between geyser and other services
-/// in the Eva
 #[derive(Debug, Clone)]
 pub struct GeyserUpdate {
     pub account_type: AccountType,
@@ -137,8 +132,8 @@ pub struct GeyserService {
     geyser_tx: Sender<GeyserUpdate>,
     tokio_rt: Runtime,
     stop: Arc<AtomicBool>,
-    clock: Arc<Mutex<Clock>>,
     error_logger: RateLimitedLogger,
+    use_fumarole: bool,
 }
 
 impl GeyserService {
@@ -147,7 +142,6 @@ impl GeyserService {
         tracked_accounts: HashMap<Pubkey, AccountType>,
         geyser_tx: Sender<GeyserUpdate>,
         stop: Arc<AtomicBool>,
-        clock: Arc<Mutex<Clock>>,
     ) -> Result<Self> {
         let tokio_rt = Builder::new_multi_thread()
             .thread_name("GeyserService")
@@ -163,8 +157,8 @@ impl GeyserService {
             geyser_tx,
             tokio_rt,
             stop,
-            clock,
             error_logger: RateLimitedLogger::new(),
+            use_fumarole: config.use_fumarole,
         })
     }
 
@@ -173,10 +167,19 @@ impl GeyserService {
 
         let tracked_accounts_vec: Vec<Pubkey> = self.tracked_accounts.keys().copied().collect();
         let tls_config = ClientTlsConfig::new().with_native_roots();
+        let mut from_slot: Option<u64> = None;
 
         while !self.stop.load(Ordering::Relaxed) {
             info!("Connecting to Geyser...");
-            let sub_req = Self::build_geyser_subscribe_request(&tracked_accounts_vec);
+            let sub_req = Self::build_geyser_subscribe_request(&tracked_accounts_vec, from_slot);
+
+            if self.use_fumarole {
+                // TODO: add support for Fumarole once the dependencies are updated to Solana 3
+                // https://crates.io/crates/yellowstone-fumarole-client/0.5.0+solana.3
+            }
+
+            // TODO: replace from_slot with auto-reconnect once we migrate to the up-to-date client (requires updating Solana deps):
+            // https://docs.triton.one/project-yellowstone/dragons-mouth-grpc-subscriptions#auto-reconnect-rust-client
             let mut client = self.tokio_rt.block_on(
                 GeyserGrpcClient::build_from_shared(self.endpoint.clone())?
                     .x_token(self.x_token.clone())?
@@ -192,15 +195,13 @@ impl GeyserService {
             while let Some(msg) = self.tokio_rt.block_on(stream.next()) {
                 match msg {
                     Ok(msg) => {
-                        trace!("Received Geyser msg: {:?}", msg);
                         let update_oneof = ward!(msg.update_oneof, continue);
                         if let subscribe_update::UpdateOneof::Account(account) = update_oneof {
-                            // Make sure that the message is not too old.
-                            let clock = clock_manager::get_clock(&self.clock)?;
-                            if account.slot < clock.slot {
-                                trace!("Discarding stale message {:?}", account);
+                            if from_slot == Some(account.slot) {
+                                // Skip the first update after reconnect since we already processed it.
                                 continue;
                             }
+                            from_slot = Some(account.slot);
 
                             let account_update = ward!(&account.account, continue);
                             let account =
@@ -271,7 +272,10 @@ impl GeyserService {
     }
 
     /// Builds a geyser subscription request payload
-    fn build_geyser_subscribe_request(tracked_accounts: &[Pubkey]) -> SubscribeRequest {
+    fn build_geyser_subscribe_request(
+        tracked_accounts: &[Pubkey],
+        from_slot: Option<u64>,
+    ) -> SubscribeRequest {
         let mut request = SubscribeRequest {
             ..Default::default()
         };
@@ -297,6 +301,7 @@ impl GeyserService {
         );
 
         request.accounts = req;
+        request.from_slot = from_slot;
 
         request
     }

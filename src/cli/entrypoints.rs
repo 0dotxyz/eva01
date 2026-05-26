@@ -78,7 +78,6 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         accounts_to_track,
         geyser_tx,
         stop_liquidator.clone(),
-        clock.clone(),
     )?;
 
     let swb_fetcher_cache = cache.clone();
