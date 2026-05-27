@@ -267,7 +267,7 @@ impl LiquidatorAccount {
         }
 
         let liab_token_balance =
-            I80F48::from_num(self.get_token_balance_for_mint(&liab_mint).unwrap());
+            I80F48::from_num(self.get_token_balance_for_mint(&liab_mint).unwrap_or(0));
 
         if liab_token_balance < dust_liab_threshold {
             if tokens_in_shortage.insert(liab_mint) {
