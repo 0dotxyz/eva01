@@ -36,7 +36,10 @@ use crate::{
     juplend_earn::accounts::Lending,
     kamino_lending::accounts::Reserve,
     utils::accessor,
-    wrappers::{oracle::{OracleWrapper, OracleWrapperTrait}, token_account::TokenAccountWrapper},
+    wrappers::{
+        oracle::{OracleWrapper, OracleWrapperTrait},
+        token_account::TokenAccountWrapper,
+    },
 };
 
 const LUT_CAPACITY: usize = 265usize;

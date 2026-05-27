@@ -12,17 +12,16 @@ use anyhow::Result;
 use bytemuck::Zeroable;
 use fixed::types::I80F48;
 use log::{debug, info, warn};
+use marginfi_type_crate::types::OracleSetup;
 use reqwest::blocking::Client;
 use serde::Deserialize;
-use marginfi_type_crate::types::OracleSetup;
 use solana_sdk::{account::Account, genesis_config::ClusterType, pubkey, pubkey::Pubkey};
 use switchboard_on_demand_client::{CrossbarClient, PullFeedAccountData};
 use tokio::runtime::{Builder, Runtime};
 
 use crate::cache::Cache;
 
-const SWITCHBOARD_PULL_PROGRAM_ID: Pubkey =
-    pubkey!("SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv");
+const SWITCHBOARD_PULL_PROGRAM_ID: Pubkey = pubkey!("SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv");
 const SWB_PULL_FEED_DISCRIMINATOR: [u8; 8] = [196, 27, 108, 196, 10, 215, 219, 40];
 
 fn build_synthetic_swb_account(price: I80F48, conf: I80F48) -> Account {
@@ -92,9 +91,7 @@ impl SwbPriceFetcher {
         cache: Arc<Cache>,
         stop: Arc<AtomicBool>,
     ) -> Self {
-        let crossbar_url = crossbar_api_url
-            .as_deref()
-            .unwrap_or(FALLBACK_CROSSBAR_URL);
+        let crossbar_url = crossbar_api_url.as_deref().unwrap_or(FALLBACK_CROSSBAR_URL);
         let tokio_rt = Builder::new_multi_thread()
             .thread_name("SwbPriceFetcher")
             .worker_threads(2)

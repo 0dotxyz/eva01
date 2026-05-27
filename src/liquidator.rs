@@ -23,9 +23,7 @@ use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{debug, error, info, warn};
-use marginfi::state::{
-    bank::BankImpl, marginfi_account::get_health_components,
-};
+use marginfi::state::{bank::BankImpl, marginfi_account::get_health_components};
 use marginfi_type_crate::{
     constants::BANKRUPT_THRESHOLD,
     types::{BalanceSide, BankOperationalState, HealthPriceMode, RequirementType},
@@ -137,7 +135,10 @@ impl Liquidator {
                         .ok()
                         .map(|bank| bank.bank.mint);
 
-                    if let Err(e) = self.liquidator_account.liquidate(acc, &mut tokens_in_shortage) {
+                    if let Err(e) = self
+                        .liquidator_account
+                        .liquidate(acc, &mut tokens_in_shortage)
+                    {
                         match e {
                             LiquidationError::Anyhow(e) => {
                                 error!("Failed to liquidate account {:?}: {:?}", liquidatee, e);
@@ -150,12 +151,21 @@ impl Liquidator {
                                 ERROR_COUNT.inc();
                             }
                             LiquidationError::StaleOracles(swb_oracles) => {
-                                info!("Cranking stale SWB oracles for next cycle: {:?}", swb_oracles);
-                                if let Err(crank_err) = self.swb_cranker.crank_oracles(swb_oracles.clone()) {
+                                info!(
+                                    "Cranking stale SWB oracles for next cycle: {:?}",
+                                    swb_oracles
+                                );
+                                if let Err(crank_err) =
+                                    self.swb_cranker.crank_oracles(swb_oracles.clone())
+                                {
                                     warn!("Failed to crank stale SWB oracles: {}", crank_err);
                                 }
                                 let oracle = swb_oracles.first().copied();
-                                record_liquidation_failure(FAILURE_REASON_STALE_ORACLES, None, oracle);
+                                record_liquidation_failure(
+                                    FAILURE_REASON_STALE_ORACLES,
+                                    None,
+                                    oracle,
+                                );
                             }
                             LiquidationError::NotEnoughFunds => {
                                 missing_tokens

@@ -135,8 +135,7 @@ impl OracleWrapper {
                 });
             }
             OracleSetup::Fixed => {
-                let price_adapter =
-                    OraclePriceFeedAdapter::try_from_bank(bank, &[], clock)?;
+                let price_adapter = OraclePriceFeedAdapter::try_from_bank(bank, &[], clock)?;
                 result = Some(Self {
                     addresses: vec![],
                     source: PriceSource::Adapter(price_adapter),
@@ -226,11 +225,9 @@ impl OracleWrapperTrait for OracleWrapper {
         oracle_max_confidence: u32,
     ) -> anyhow::Result<I80F48> {
         match &self.source {
-            PriceSource::Adapter(adapter) => Ok(adapter.get_price_of_type(
-                oracle_type,
-                price_bias,
-                oracle_max_confidence,
-            )?),
+            PriceSource::Adapter(adapter) => {
+                Ok(adapter.get_price_of_type(oracle_type, price_bias, oracle_max_confidence)?)
+            }
         }
     }
 

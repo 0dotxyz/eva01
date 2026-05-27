@@ -8,8 +8,7 @@ use crate::{
     liquidator::Liquidator,
     metrics::{FAILED_LIQUIDATIONS, LIQUIDATION_ATTEMPTS},
     utils::{
-        integration_account_fetcher::IntegrationAccountFetcher,
-        swb_price_fetcher::SwbPriceFetcher,
+        integration_account_fetcher::IntegrationAccountFetcher, swb_price_fetcher::SwbPriceFetcher,
     },
     wrappers::liquidator_account::LiquidatorAccount,
 };
@@ -22,7 +21,9 @@ use solana_client::{
     rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
     rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType},
 };
-use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair, signer::Signer};
+use solana_sdk::{
+    commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair, signer::Signer,
+};
 use std::{
     collections::HashSet,
     str::FromStr,
@@ -164,7 +165,9 @@ pub fn create_lut_entry() -> anyhow::Result<()> {
                 anyhow::anyhow!("Could not parse LUT address from CLI output:\n{stdout}")
             })?;
 
-        let lut_address: Pubkey = lut_address_str.parse().expect("Invalid LUT pubkey from CLI");
+        let lut_address: Pubkey = lut_address_str
+            .parse()
+            .expect("Invalid LUT pubkey from CLI");
         println!("  Created empty LUT: {}", lut_address);
 
         let total_chunks = bucket.chunks(EXTEND_CHUNK).count();
@@ -315,7 +318,6 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         );
         fetcher.start();
     });
-
 
     let cloned_stop = stop_liquidator.clone();
     thread::spawn(move || clock_manager.start(cloned_stop));

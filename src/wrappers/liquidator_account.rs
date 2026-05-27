@@ -16,8 +16,7 @@ use crate::{
     },
     metrics::{LIQUIDATION_ATTEMPTS, LIQUIDATION_LATENCY_SECONDS, LIQUIDATION_SUCCESSES},
     utils::{
-        self, marginfi_account_by_authority,
-        simulation_cache::is_tx_too_large_client,
+        self, marginfi_account_by_authority, simulation_cache::is_tx_too_large_client,
         swb_cranker::is_stale_swb_price_error,
     },
     wrappers::oracle::OracleWrapper,
@@ -50,12 +49,7 @@ use solana_sdk::{
     system_instruction::transfer,
     transaction::VersionedTransaction,
 };
-use std::{
-    collections::HashSet,
-    sync::Arc,
-    thread,
-    time::Duration,
-};
+use std::{collections::HashSet, sync::Arc, thread, time::Duration};
 
 pub const PROFIT_SHARE: f64 = 0.085;
 
@@ -843,7 +837,6 @@ impl LiquidatorAccount {
 
         Ok((drift_spot_market, reward_spot_market, reward_spot_market_2))
     }
-
 }
 
 #[cfg(test)]
