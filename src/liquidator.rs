@@ -150,7 +150,7 @@ impl Liquidator {
                     ) {
                         match e {
                             LiquidationError::Anyhow(e) => {
-                                error!("Failed to liquidate account {:?}", liquidatee);
+                                error!("Failed to liquidate account {:?}: {:?}", liquidatee, e);
                                 let reason = if e.downcast_ref::<ClientError>().is_some() {
                                     FAILURE_REASON_RPC_ERROR
                                 } else {
