@@ -22,7 +22,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use marginfi::state::{
     bank::BankImpl, marginfi_account::get_health_components,
 };
@@ -125,17 +125,11 @@ impl Liquidator {
                 accounts.sort_by(|a, b| a.profit.cmp(&b.profit));
                 accounts.reverse();
 
-                if !stale_swb_oracles.is_empty() {
-                    error!("STALE stale_swb_oracles: {:?}", stale_swb_oracles);
-                    continue;
-                }
-
                 let mut tokens_in_shortage: HashSet<Pubkey> = HashSet::new();
                 for acc in accounts {
                     let liquidatee = acc.liquidatee_account.address;
                     let liab_bank = acc.liab_bank;
                     let liab_amount = acc.liab_amount;
-                    // Get the liability mint for metrics
                     let liab_mint = self
                         .cache
                         .banks
@@ -143,11 +137,15 @@ impl Liquidator {
                         .ok()
                         .map(|bank| bank.bank.mint);
 
-                    if let Err(e) = self.liquidator_account.liquidate(
-                        acc,
-                        &stale_swb_oracles,
-                        &mut tokens_in_shortage,
-                    ) {
+                    // Crank all SWB oracles required for this liquidation before attempting it.
+                    let swb_oracles = acc.observation_accounts.swb_oracles.clone();
+                    if !swb_oracles.is_empty() {
+                        if let Err(e) = self.swb_cranker.crank_oracles(swb_oracles) {
+                            warn!("Pre-liquidation SWB crank failed for {:?}: {}", liquidatee, e);
+                        }
+                    }
+
+                    if let Err(e) = self.liquidator_account.liquidate(acc, &mut tokens_in_shortage) {
                         match e {
                             LiquidationError::Anyhow(e) => {
                                 error!("Failed to liquidate account {:?}: {:?}", liquidatee, e);
@@ -160,14 +158,9 @@ impl Liquidator {
                                 ERROR_COUNT.inc();
                             }
                             LiquidationError::StaleOracles(swb_oracles) => {
-                                stale_swb_oracles.extend(&swb_oracles);
-                                // Recording the first one is simpler and still useful for debugging
+                                warn!("On-chain oracle still stale after pre-liquidation crank for {:?}: {:?}", liquidatee, swb_oracles);
                                 let oracle = swb_oracles.first().copied();
-                                record_liquidation_failure(
-                                    FAILURE_REASON_STALE_ORACLES,
-                                    None,
-                                    oracle,
-                                );
+                                record_liquidation_failure(FAILURE_REASON_STALE_ORACLES, None, oracle);
                             }
                             LiquidationError::NotEnoughFunds => {
                                 missing_tokens
@@ -183,16 +176,6 @@ impl Liquidator {
                         }
                     }
                 }
-                if !stale_swb_oracles.is_empty() {
-                    info!("Cranking Swb Oracles {:#?}", stale_swb_oracles);
-                    if let Err(err) = self
-                        .swb_cranker
-                        .crank_oracles(stale_swb_oracles.into_iter().collect())
-                    {
-                        error!("Failed to crank Swb Oracles: {}", err)
-                    }
-                    info!("Completed cranking Swb Oracles.");
-                };
             } else if let Err(err) = evaluated_accounts {
                 error!("Failed to evaluate accounts in liquidation: {}", err);
                 ERROR_COUNT.inc();

@@ -210,7 +210,6 @@ impl LiquidatorAccount {
     pub fn liquidate(
         &self,
         account: PreparedLiquidatableAccount,
-        stale_swb_oracles: &HashSet<Pubkey>,
         tokens_in_shortage: &mut HashSet<Pubkey>,
     ) -> Result<(), LiquidationError> {
         let PreparedLiquidatableAccount {
@@ -312,10 +311,6 @@ impl LiquidatorAccount {
             "The Liquidatee {:?} observation accounts: {:?}",
             liquidatee_account_address, liquidatee_observation_accounts
         );
-
-        if contains_stale_oracles(stale_swb_oracles, &liquidatee_swb_oracles) {
-            return Ok(());
-        }
 
         let liquidation_record =
             if liquidatee_account.account.liquidation_record == Pubkey::default() {
@@ -851,21 +846,20 @@ impl LiquidatorAccount {
 
 }
 
-fn contains_stale_oracles(stale_oracles: &HashSet<Pubkey>, account_oracles: &[Pubkey]) -> bool {
-    if let Some(oracle) = account_oracles
-        .iter()
-        .find(|oracle| stale_oracles.contains(*oracle))
-    {
-        debug!("Found stale oracle: {}.", oracle);
-        true
-    } else {
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn contains_stale_oracles(stale_oracles: &HashSet<Pubkey>, account_oracles: &[Pubkey]) -> bool {
+        if let Some(oracle) = account_oracles
+            .iter()
+            .find(|oracle| stale_oracles.contains(*oracle))
+        {
+            true
+        } else {
+            false
+        }
+    }
 
     #[test]
     fn test_contains_stale_oracles_with_stale() {
