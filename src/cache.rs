@@ -36,7 +36,7 @@ use crate::{
     juplend_earn::accounts::Lending,
     kamino_lending::accounts::Reserve,
     utils::accessor,
-    wrappers::{oracle::OracleWrapperTrait, token_account::TokenAccountWrapper},
+    wrappers::{oracle::{OracleWrapper, OracleWrapperTrait}, token_account::TokenAccountWrapper},
 };
 
 const LUT_CAPACITY: usize = 265usize;
@@ -162,6 +162,24 @@ impl Cache {
         let bank_wrapper = self.banks.try_get_bank(&bank_address)?;
         let clock = clock_manager::get_clock(&self.clock)?;
         let oracle_wrapper = T::build(self, &clock, &bank_address)?;
+
+        Ok(TokenAccountWrapper {
+            balance: accessor::amount(&token_account.data)?,
+            bank_wrapper,
+            oracle_wrapper,
+        })
+    }
+
+    pub fn try_get_token_wrapper_lenient(
+        &self,
+        mint_address: &Pubkey,
+        token_address: &Pubkey,
+    ) -> Result<TokenAccountWrapper<OracleWrapper>> {
+        let token_account = self.tokens.try_get_account(token_address)?;
+        let bank_address = self.banks.try_get_account_for_mint(mint_address)?;
+        let bank_wrapper = self.banks.try_get_bank(&bank_address)?;
+        let clock = clock_manager::get_clock(&self.clock)?;
+        let oracle_wrapper = OracleWrapper::build_lenient(self, &clock, &bank_address)?;
 
         Ok(TokenAccountWrapper {
             balance: accessor::amount(&token_account.data)?,
