@@ -137,14 +137,6 @@ impl Liquidator {
                         .ok()
                         .map(|bank| bank.bank.mint);
 
-                    // Crank all SWB oracles required for this liquidation before attempting it.
-                    let swb_oracles = acc.observation_accounts.swb_oracles.clone();
-                    if !swb_oracles.is_empty() {
-                        if let Err(e) = self.swb_cranker.crank_oracles(swb_oracles) {
-                            warn!("Pre-liquidation SWB crank failed for {:?}: {}", liquidatee, e);
-                        }
-                    }
-
                     if let Err(e) = self.liquidator_account.liquidate(acc, &mut tokens_in_shortage) {
                         match e {
                             LiquidationError::Anyhow(e) => {
@@ -158,7 +150,10 @@ impl Liquidator {
                                 ERROR_COUNT.inc();
                             }
                             LiquidationError::StaleOracles(swb_oracles) => {
-                                warn!("On-chain oracle still stale after pre-liquidation crank for {:?}: {:?}", liquidatee, swb_oracles);
+                                info!("Cranking stale SWB oracles for next cycle: {:?}", swb_oracles);
+                                if let Err(crank_err) = self.swb_cranker.crank_oracles(swb_oracles.clone()) {
+                                    warn!("Failed to crank stale SWB oracles: {}", crank_err);
+                                }
                                 let oracle = swb_oracles.first().copied();
                                 record_liquidation_failure(FAILURE_REASON_STALE_ORACLES, None, oracle);
                             }
