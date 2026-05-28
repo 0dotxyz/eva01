@@ -9,9 +9,7 @@ pub fn is_tx_too_large_client(err: &ClientError) -> bool {
             RpcError::RpcResponseError { code, message, .. } => {
                 *code == -32602 && message.contains("too large")
             }
-            RpcError::RpcRequestError(msg) | RpcError::ForUser(msg) => {
-                msg.contains("too large")
-            }
+            RpcError::RpcRequestError(msg) | RpcError::ForUser(msg) => msg.contains("too large"),
             _ => false,
         },
         _ => false,

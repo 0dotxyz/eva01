@@ -36,10 +36,7 @@ use crate::{
     juplend_earn::accounts::Lending,
     kamino_lending::accounts::Reserve,
     utils::accessor,
-    wrappers::{
-        oracle::OracleWrapper,
-        token_account::TokenAccountWrapper,
-    },
+    wrappers::{oracle::OracleWrapper, token_account::TokenAccountWrapper},
 };
 
 const LUT_CAPACITY: usize = 265usize;
@@ -154,8 +151,6 @@ impl Cache {
     pub fn add_lut(&mut self, lut: AddressLookupTableAccount) {
         self.luts.lock().unwrap().push(lut)
     }
-
-
 
     pub fn try_get_token_wrapper_lenient(
         &self,
