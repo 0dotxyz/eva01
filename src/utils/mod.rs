@@ -236,6 +236,7 @@ pub fn log_genuine_error(prefix: &str, error: Error) {
     }
 }
 
+#[allow(dead_code)]
 pub fn format_error_chain(err: &Error) -> String {
     let mut chain = err.chain();
     let primary = chain

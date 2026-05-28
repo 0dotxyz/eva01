@@ -37,7 +37,7 @@ use crate::{
     kamino_lending::accounts::Reserve,
     utils::accessor,
     wrappers::{
-        oracle::{OracleWrapper, OracleWrapperTrait},
+        oracle::OracleWrapper,
         token_account::TokenAccountWrapper,
     },
 };
@@ -155,23 +155,7 @@ impl Cache {
         self.luts.lock().unwrap().push(lut)
     }
 
-    pub fn try_get_token_wrapper<T: OracleWrapperTrait>(
-        &self,
-        mint_address: &Pubkey,
-        token_address: &Pubkey,
-    ) -> Result<TokenAccountWrapper<T>> {
-        let token_account = self.tokens.try_get_account(token_address)?;
-        let bank_address = self.banks.try_get_account_for_mint(mint_address)?;
-        let bank_wrapper = self.banks.try_get_bank(&bank_address)?;
-        let clock = clock_manager::get_clock(&self.clock)?;
-        let oracle_wrapper = T::build(self, &clock, &bank_address)?;
 
-        Ok(TokenAccountWrapper {
-            balance: accessor::amount(&token_account.data)?,
-            bank_wrapper,
-            oracle_wrapper,
-        })
-    }
 
     pub fn try_get_token_wrapper_lenient(
         &self,
