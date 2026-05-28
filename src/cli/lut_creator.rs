@@ -1,5 +1,7 @@
 use crate::utils::{find_bank_liquidity_vault_authority, marginfi_account_by_authority};
+use anchor_lang::AccountDeserialize;
 use anchor_spl::associated_token::get_associated_token_address_with_program_id;
+use log::warn;
 use marginfi_type_crate::{
     constants::{ASSET_TAG_DEFAULT, ASSET_TAG_KAMINO, ASSET_TAG_SOL, ASSET_TAG_STAKED},
     types::{Bank, MarginfiGroup},
@@ -11,15 +13,23 @@ use solana_client::{
     rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType},
 };
 use solana_sdk::{
-    commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair, signer::Signer,
-    system_program, sysvar,
+    address_lookup_table::state::AddressLookupTable, commitment_config::CommitmentConfig,
+    pubkey::Pubkey, signature::Keypair, signer::Signer, system_program, sysvar,
 };
 use std::{collections::HashSet, str::FromStr};
 
-use anchor_lang::AccountDeserialize;
-use log::warn;
+// ── Shared context ────────────────────────────────────────────────────────────
 
-pub fn create_lut_entry() -> anyhow::Result<()> {
+struct LutContext {
+    rpc_url: String,
+    wallet_keypair_bytes: Vec<u8>,
+    rpc_client: RpcClient,
+    g1: HashSet<Pubkey>,
+    g2: HashSet<Pubkey>,
+    g3: HashSet<Pubkey>,
+}
+
+fn build_lut_context() -> anyhow::Result<LutContext> {
     let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| {
         let endpoint = std::env::var("YELLOWSTONE_ENDPOINT")
             .expect("Either RPC_URL or YELLOWSTONE_ENDPOINT must be set");
@@ -48,7 +58,6 @@ pub fn create_lut_entry() -> anyhow::Result<()> {
 
     let rpc_client = RpcClient::new_with_commitment(&rpc_url, CommitmentConfig::confirmed());
 
-    // Common accounts present in all 3 groups
     let (global_fee_state_key, _) = Pubkey::find_program_address(
         &[marginfi_type_crate::constants::FEE_STATE_SEED.as_bytes()],
         &marginfi_type_crate::ID,
@@ -85,7 +94,7 @@ pub fn create_lut_entry() -> anyhow::Result<()> {
     println!("Global fee state:            {}", global_fee_state_key);
     println!("Global fee wallet:           {}", global_fee_wallet);
 
-    // Fetch all banks for the group
+    // Fetch and partition banks
     const BANK_GROUP_PK_OFFSET: usize = 32 + 1 + 8;
     println!("\nFetching all banks...");
     let bank_accounts = rpc_client.get_program_accounts_with_config(
@@ -113,14 +122,13 @@ pub fn create_lut_entry() -> anyhow::Result<()> {
     )?;
     println!("Found {} banks.", bank_accounts.len());
 
-    // Partition banks into groups and collect per-bank addresses
     let mut g1: HashSet<Pubkey> = common.iter().cloned().collect();
     let mut g2: HashSet<Pubkey> = common.iter().cloned().collect();
     let mut g3: HashSet<Pubkey> = common.iter().cloned().collect();
     let mut g1_mints: HashSet<Pubkey> = HashSet::new();
     let mut g2_mints: HashSet<Pubkey> = HashSet::new();
     let mut g3_mints: HashSet<Pubkey> = HashSet::new();
-    let mut counts = [0usize; 3];
+    let mut counts = [0u32; 3];
 
     for (bank_address, bank_account) in &bank_accounts {
         let mut data = bank_account.data.as_slice();
@@ -191,7 +199,7 @@ pub fn create_lut_entry() -> anyhow::Result<()> {
         counts[0], counts[1], counts[2]
     );
 
-    // Derive liquidator ATAs for each group's mints
+    // Derive liquidator ATAs
     let all_mints: Vec<Pubkey> = g1_mints
         .union(&g2_mints)
         .chain(&g3_mints)
@@ -234,57 +242,124 @@ pub fn create_lut_entry() -> anyhow::Result<()> {
         g3.len()
     );
 
-    // Read any already-created LUT addresses from env so we can resume
+    Ok(LutContext {
+        rpc_url,
+        wallet_keypair_bytes,
+        rpc_client,
+        g1,
+        g2,
+        g3,
+    })
+}
+
+// ── create-lut ────────────────────────────────────────────────────────────────
+
+pub fn create_lut_entry() -> anyhow::Result<()> {
+    let ctx = build_lut_context()?;
+
     let existing_g1 = read_existing_luts("ADDRESS_LOOKUP_TABLES_GROUP1");
     let existing_g2 = read_existing_luts("ADDRESS_LOOKUP_TABLES_GROUP2");
     let existing_g3 = read_existing_luts("ADDRESS_LOOKUP_TABLES_GROUP3");
 
-    let wallet_path = write_wallet_to_tempfile(&wallet_keypair_bytes)?;
+    let wallet_path = write_wallet_to_tempfile(&ctx.wallet_keypair_bytes)?;
 
     let g1_luts = populate_group(
-        &rpc_url,
+        &ctx.rpc_url,
         &wallet_path,
-        &rpc_client,
+        &ctx.rpc_client,
         1,
-        g1.into_iter().collect(),
+        ctx.g1.into_iter().collect(),
         existing_g1,
     )?;
     let g2_luts = populate_group(
-        &rpc_url,
+        &ctx.rpc_url,
         &wallet_path,
-        &rpc_client,
+        &ctx.rpc_client,
         2,
-        g2.into_iter().collect(),
+        ctx.g2.into_iter().collect(),
         existing_g2,
     )?;
     let g3_luts = populate_group(
-        &rpc_url,
+        &ctx.rpc_url,
         &wallet_path,
-        &rpc_client,
+        &ctx.rpc_client,
         3,
-        g3.into_iter().collect(),
+        ctx.g3.into_iter().collect(),
         existing_g3,
     )?;
 
     std::fs::remove_file(&wallet_path).ok();
 
+    print_env_output(&g1_luts, &g2_luts, &g3_luts);
+    Ok(())
+}
+
+// ── sync-lut ──────────────────────────────────────────────────────────────────
+
+/// Checks existing LUTs against the current on-chain bank state and extends them
+/// with any missing addresses (new banks, changed oracle/integration keys, etc.).
+/// LUTs are append-only so changed keys are added alongside old ones.
+pub fn sync_lut_entry() -> anyhow::Result<()> {
+    let existing_g1 = read_existing_luts("ADDRESS_LOOKUP_TABLES_GROUP1");
+    let existing_g2 = read_existing_luts("ADDRESS_LOOKUP_TABLES_GROUP2");
+    let existing_g3 = read_existing_luts("ADDRESS_LOOKUP_TABLES_GROUP3");
+
+    if existing_g1.is_empty() && existing_g2.is_empty() && existing_g3.is_empty() {
+        anyhow::bail!(
+            "No existing LUT addresses found. Set ADDRESS_LOOKUP_TABLES_GROUP1/2/3 in your env, or run create-lut first."
+        );
+    }
+
+    let ctx = build_lut_context()?;
+    let wallet_path = write_wallet_to_tempfile(&ctx.wallet_keypair_bytes)?;
+
+    let g1_luts = populate_group(
+        &ctx.rpc_url,
+        &wallet_path,
+        &ctx.rpc_client,
+        1,
+        ctx.g1.into_iter().collect(),
+        existing_g1,
+    )?;
+    let g2_luts = populate_group(
+        &ctx.rpc_url,
+        &wallet_path,
+        &ctx.rpc_client,
+        2,
+        ctx.g2.into_iter().collect(),
+        existing_g2,
+    )?;
+    let g3_luts = populate_group(
+        &ctx.rpc_url,
+        &wallet_path,
+        &ctx.rpc_client,
+        3,
+        ctx.g3.into_iter().collect(),
+        existing_g3,
+    )?;
+
+    std::fs::remove_file(&wallet_path).ok();
+
+    println!("\nSync complete!");
+    print_env_output(&g1_luts, &g2_luts, &g3_luts);
+    Ok(())
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn print_env_output(g1: &[Pubkey], g2: &[Pubkey], g3: &[Pubkey]) {
     let fmt = |luts: &[Pubkey]| {
         luts.iter()
             .map(|k| k.to_string())
             .collect::<Vec<_>>()
             .join(",")
     };
-
-    println!("\nAll LUT groups complete!");
     println!("\nAdd these to your .env:");
-    println!("ADDRESS_LOOKUP_TABLES_GROUP1={}", fmt(&g1_luts));
-    println!("ADDRESS_LOOKUP_TABLES_GROUP2={}", fmt(&g2_luts));
-    println!("ADDRESS_LOOKUP_TABLES_GROUP3={}", fmt(&g3_luts));
-
-    Ok(())
+    println!("ADDRESS_LOOKUP_TABLES_GROUP1={}", fmt(g1));
+    println!("ADDRESS_LOOKUP_TABLES_GROUP2={}", fmt(g2));
+    println!("ADDRESS_LOOKUP_TABLES_GROUP3={}", fmt(g3));
 }
 
-/// Read existing LUT pubkeys from an env var (comma-separated). Returns empty vec if not set.
 fn read_existing_luts(env_var: &str) -> Vec<Pubkey> {
     std::env::var(env_var)
         .unwrap_or_default()
@@ -295,9 +370,8 @@ fn read_existing_luts(env_var: &str) -> Vec<Pubkey> {
 
 /// Create or resume a group of LUTs.
 ///
-/// Fetches any `existing` on-chain LUTs to determine which addresses are already stored,
-/// then only creates/extends LUTs for the remainder. Returns the complete set of LUT keys
-/// (existing + newly created).
+/// Fetches existing on-chain LUTs to determine which addresses are already stored,
+/// then only creates/extends LUTs for the remainder. Returns the complete set of LUT keys.
 fn populate_group(
     rpc_url: &str,
     wallet_path: &str,
@@ -306,13 +380,10 @@ fn populate_group(
     all_addresses: Vec<Pubkey>,
     existing_keys: Vec<Pubkey>,
 ) -> anyhow::Result<Vec<Pubkey>> {
-    use solana_sdk::address_lookup_table::state::AddressLookupTable;
-
     const LUT_MAX: usize = 256;
 
-    // Find addresses already stored in existing LUTs
     let mut already_stored: HashSet<Pubkey> = HashSet::new();
-    let mut last_lut_space: usize = 0; // remaining capacity in the last existing LUT
+    let mut last_lut_space: usize = 0;
 
     if !existing_keys.is_empty() {
         println!(
@@ -346,7 +417,7 @@ fn populate_group(
 
     if remaining.is_empty() {
         println!(
-            "\n[Group {}] Already complete ({} addresses covered), skipping.",
+            "\n[Group {}] Up to date ({} addresses). No changes needed.",
             group_num,
             already_stored.len()
         );
@@ -354,7 +425,7 @@ fn populate_group(
     }
 
     println!(
-        "\n[Group {}] {} addresses already stored, {} remaining.",
+        "\n[Group {}] {} addresses already stored, {} new to add.",
         group_num,
         already_stored.len(),
         remaining.len()
@@ -362,7 +433,6 @@ fn populate_group(
 
     let mut result_keys = existing_keys.clone();
 
-    // If the last existing LUT has room, extend it first before creating new ones
     let (extend_into_last, fresh) = if !existing_keys.is_empty() && last_lut_space > 0 {
         let take = remaining.len().min(last_lut_space);
         (remaining[..take].to_vec(), remaining[take..].to_vec())
@@ -373,7 +443,7 @@ fn populate_group(
     if !extend_into_last.is_empty() {
         let last_key = *existing_keys.last().unwrap();
         println!(
-            "[Group {}] Extending last existing LUT {} with {} addresses...",
+            "[Group {}] Extending last LUT {} with {} addresses...",
             group_num,
             last_key,
             extend_into_last.len()
@@ -381,7 +451,6 @@ fn populate_group(
         extend_lut_cli(rpc_url, wallet_path, group_num, last_key, &extend_into_last)?;
     }
 
-    // Create new LUTs for anything that didn't fit
     if !fresh.is_empty() {
         let new_keys = create_lut_group(rpc_url, wallet_path, group_num, fresh)?;
         result_keys.extend(new_keys);

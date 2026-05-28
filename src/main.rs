@@ -50,9 +50,16 @@ use drift_idl::*;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("create-lut") {
-        dotenv::dotenv().ok();
-        return Ok(crate::cli::create_lut_entry()?);
+    match args.get(1).map(String::as_str) {
+        Some("create-lut") => {
+            dotenv::dotenv().ok();
+            return Ok(crate::cli::create_lut_entry()?);
+        }
+        Some("sync-lut") => {
+            dotenv::dotenv().ok();
+            return Ok(crate::cli::sync_lut_entry()?);
+        }
+        _ => {}
     }
 
     init_logging();
