@@ -219,7 +219,6 @@ impl LiquidatorAccount {
 
         LIQUIDATION_ATTEMPTS.inc();
 
-        let mut participating_accounts: HashSet<Pubkey> = HashSet::new();
         let liquidatee_account_address = liquidatee_account.address;
         let asset_bank_wrapper = self
             .cache
@@ -298,9 +297,6 @@ impl LiquidatorAccount {
             juplend_states,
         } = observation_accounts;
 
-        // Note: liquidatee_observation_accounts include Kamino reserves, Drift spot markets and all of the banks and oracles.
-        participating_accounts.extend(liquidatee_observation_accounts.iter());
-
         debug!(
             "The Liquidatee {:?} observation accounts: {:?}",
             liquidatee_account_address, liquidatee_observation_accounts
@@ -315,9 +311,12 @@ impl LiquidatorAccount {
             } else {
                 liquidatee_account.account.liquidation_record
             };
-        participating_accounts.insert(liquidation_record);
-
-        let luts: Vec<AddressLookupTableAccount> = self.cache.luts.lock().unwrap().clone();
+        let all_tags: Vec<u8> = liquidatee_banks
+            .iter()
+            .filter_map(|pk| self.cache.banks.try_get_bank(pk).ok())
+            .map(|b| b.bank.config.asset_tag)
+            .collect();
+        let luts = self.cache.luts.lock().unwrap().select_for_tags(&all_tags);
         let mut ixs = Vec::new();
 
         ixs.push(self.cu_limit_ix.clone());
@@ -330,7 +329,6 @@ impl LiquidatorAccount {
             liquidation_record,
             liquidatee_observation_accounts.as_ref(),
             &liquidatee_banks,
-            &mut participating_accounts,
         );
 
         for kamino_reserve_address in kamino_reserves {
@@ -344,11 +342,8 @@ impl LiquidatorAccount {
                 kamino_reserve_address
             );
 
-            let refresh_reserve_ix = make_refresh_reserve_ix(
-                kamino_reserve_address,
-                &kamino_reserve,
-                &mut participating_accounts,
-            );
+            let refresh_reserve_ix =
+                make_refresh_reserve_ix(kamino_reserve_address, &kamino_reserve);
             ixs.push(refresh_reserve_ix);
         }
 
@@ -362,7 +357,6 @@ impl LiquidatorAccount {
                 spot_market_address,
                 spot_market.market.vault,
                 spot_market.market.oracle,
-                &mut participating_accounts,
             );
             ixs.push(refresh_spot_market_ix);
         }
@@ -373,11 +367,8 @@ impl LiquidatorAccount {
                 .try_get_juplend_lending_state(&lending_state_address)
                 .map_err(LiquidationError::from_anyhow)?;
 
-            let update_lending_rate_ix = make_update_lending_rate_ix(
-                lending_state_address,
-                &lending_state,
-                &mut participating_accounts,
-            );
+            let update_lending_rate_ix =
+                make_update_lending_rate_ix(lending_state_address, &lending_state);
             ixs.push(update_lending_rate_ix);
         }
 
@@ -397,7 +388,6 @@ impl LiquidatorAccount {
                 liquidatee_observation_accounts.as_ref(),
                 asset_amount.to_num(),
                 false,
-                Some(&mut participating_accounts),
             ),
             ASSET_TAG_KAMINO => {
                 let kamino_reserve = self
@@ -409,7 +399,6 @@ impl LiquidatorAccount {
                     asset_bank_wrapper.bank.integration_acc_2,
                     kamino_reserve.reserve.lending_market,
                     &[asset_bank_wrapper.bank.integration_acc_1],
-                    &mut participating_accounts,
                 );
                 ixs.push(refresh_obligation_ix);
 
@@ -424,7 +413,6 @@ impl LiquidatorAccount {
                     liquidatee_observation_accounts.as_ref(),
                     asset_amount.to_num(),
                     false,
-                    &mut participating_accounts,
                 )
             }
             ASSET_TAG_DRIFT => {
@@ -444,7 +432,6 @@ impl LiquidatorAccount {
                     liquidatee_observation_accounts.as_ref(),
                     asset_amount.to_num(),
                     false,
-                    &mut participating_accounts,
                 )
             }
             ASSET_TAG_JUPLEND => {
@@ -463,7 +450,6 @@ impl LiquidatorAccount {
                     liquidatee_observation_accounts.as_ref(),
                     asset_amount.to_num(),
                     false,
-                    &mut participating_accounts,
                 )
             }
             _ => {
@@ -489,7 +475,6 @@ impl LiquidatorAccount {
             &liab_mint_wrapper,
             liab_amount.to_num(),
             false,
-            &mut participating_accounts,
         );
         ixs.push(repay_ix);
 
@@ -500,7 +485,6 @@ impl LiquidatorAccount {
             self.cache.global_fee_state_key,
             self.cache.global_fee_wallet,
             &liquidatee_banks,
-            &mut participating_accounts,
         );
         ixs.push(end_ix);
 
@@ -547,7 +531,7 @@ impl LiquidatorAccount {
             Err(err) => {
                 if is_tx_too_large_client(&err) {
                     warn!("The liquidation tx was too large: adding the observation accounts to a LUT and retrying");
-                    match self.retry_with_new_luts(ixs, participating_accounts) {
+                    match self.retry_with_new_luts(ixs) {
                         Ok(signature) => {
                             info!(
                                 "Liquidation tx for the Account {} was confirmed. Signature: {}",
@@ -576,15 +560,21 @@ impl LiquidatorAccount {
         }
     }
 
-    fn retry_with_new_luts(
-        &self,
-        ixs: Vec<Instruction>,
-        participating_accounts: HashSet<Pubkey>,
-    ) -> Result<Signature> {
-        self.cache
-            .add_addresses_to_lut(&self.rpc_client, &self.signer, participating_accounts)?;
+    fn retry_with_new_luts(&self, ixs: Vec<Instruction>) -> Result<Signature> {
+        let all_accounts: Vec<Pubkey> = ixs
+            .iter()
+            .flat_map(|ix| ix.accounts.iter().map(|a| a.pubkey))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
 
-        let luts: Vec<AddressLookupTableAccount> = self.cache.luts.lock().unwrap().clone();
+        // Create one targeted LUT with exactly these accounts and retry with only that LUT.
+        // Using a single tight LUT avoids the header overhead of the pre-built group LUTs,
+        // which is what caused the tx to overflow in the first place.
+        let targeted_lut =
+            self.cache
+                .create_targeted_lut(&self.rpc_client, &self.signer, all_accounts)?;
+        let luts = vec![targeted_lut];
 
         let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
 
@@ -648,11 +638,15 @@ impl LiquidatorAccount {
             observation_accounts.as_ref(),
             amount,
             withdraw_all,
-            None,
         );
 
         let ixs: Vec<Instruction> = vec![self.cu_limit_ix.clone(), withdraw_ix];
-        let luts: Vec<AddressLookupTableAccount> = self.cache.luts.lock().unwrap().clone();
+        let luts = self
+            .cache
+            .luts
+            .lock()
+            .unwrap()
+            .select_for_tags(&[bank.bank.config.asset_tag]);
 
         debug!(
             "Withdrawing {:?} unscaled tokens of the Mint {} from the Liquidator account {:?}, Bank {:?}, ",

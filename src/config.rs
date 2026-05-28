@@ -16,7 +16,9 @@ pub struct Eva01Config {
     pub wallet_keypair: Vec<u8>,
     pub compute_unit_price_micro_lamports: u64,
     pub marginfi_group_key: Pubkey,
-    pub address_lookup_tables: Vec<Pubkey>,
+    pub luts_group1: Vec<Pubkey>,
+    pub luts_group2: Vec<Pubkey>,
+    pub luts_group3: Vec<Pubkey>,
     pub min_profit: f64,
     pub healthcheck_port: u16,
     pub metrics_bind_addr: String,
@@ -61,8 +63,9 @@ impl Eva01Config {
         )
         .expect("Invalid MARGINFI_GROUP_KEY Pubkey");
 
-        let address_lookup_tables: Vec<Pubkey> =
-            parse_pubkey_list("ADDRESS_LOOKUP_TABLES").unwrap_or_else(|_| vec![]);
+        let luts_group1 = parse_pubkey_list("ADDRESS_LOOKUP_TABLES_GROUP1").unwrap_or_default();
+        let luts_group2 = parse_pubkey_list("ADDRESS_LOOKUP_TABLES_GROUP2").unwrap_or_default();
+        let luts_group3 = parse_pubkey_list("ADDRESS_LOOKUP_TABLES_GROUP3").unwrap_or_default();
 
         let min_profit: f64 = std::env::var("MIN_PROFIT")
             .expect("MIN_PROFIT environment variable is not set")
@@ -134,7 +137,9 @@ impl Eva01Config {
             wallet_keypair,
             compute_unit_price_micro_lamports,
             marginfi_group_key,
-            address_lookup_tables,
+            luts_group1,
+            luts_group2,
+            luts_group3,
             min_profit,
             healthcheck_port,
             metrics_bind_addr,
@@ -231,7 +236,9 @@ mod tests {
         let yellowstone_x_token = "token";
         let compute_unit_price_micro_lamports = "1000";
         let marginfi_group_key = Pubkey::new_unique().to_string();
-        let address_lookup_tables = Pubkey::new_unique().to_string();
+        let lut_group1 = Pubkey::new_unique().to_string();
+        let lut_group2 = Pubkey::new_unique().to_string();
+        let lut_group3 = Pubkey::new_unique().to_string();
         let min_profit = "0.01";
         let default_token_max_threshold = "10.0";
         let token_dust_threshold = "0.01";
@@ -246,7 +253,9 @@ mod tests {
             compute_unit_price_micro_lamports,
         );
         jail.set_env("MARGINFI_GROUP_KEY", &marginfi_group_key);
-        jail.set_env("ADDRESS_LOOKUP_TABLES", &address_lookup_tables);
+        jail.set_env("ADDRESS_LOOKUP_TABLES_GROUP1", &lut_group1);
+        jail.set_env("ADDRESS_LOOKUP_TABLES_GROUP2", &lut_group2);
+        jail.set_env("ADDRESS_LOOKUP_TABLES_GROUP3", &lut_group3);
         jail.set_env("MIN_PROFIT", min_profit);
         jail.set_env("PORT", healthcheck_port);
         jail.set_env("METRICS_BIND_ADDR", "127.0.0.1");
