@@ -77,7 +77,9 @@ struct PriceWithConfidenceDto {
     confidence: f64,
 }
 
-fn deserialize_f64_from_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+fn deserialize_f64_from_string<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
     String::deserialize(deserializer)?
         .parse::<f64>()
         .map_err(serde::de::Error::custom)
@@ -239,7 +241,11 @@ impl SwbPriceFetcher {
             for bank_address in bank_addresses {
                 if let Ok(bank) = self.cache.banks.try_get_bank(bank_address) {
                     if let Some(&oracle_key) = bank.bank.config.oracle_keys.first() {
-                        if let Err(e) = self.cache.oracles.try_update(&oracle_key, synthetic.clone()) {
+                        if let Err(e) = self
+                            .cache
+                            .oracles
+                            .try_update(&oracle_key, synthetic.clone())
+                        {
                             warn!("SwbPriceFetcher: failed to write synthetic oracle for {oracle_key}: {e}");
                         }
                     }

@@ -396,5 +396,4 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0], feed_id);
     }
-
 }
