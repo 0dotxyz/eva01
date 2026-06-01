@@ -257,11 +257,7 @@ impl Cache {
     }
 
     /// Closes any deactivated LUTs that have passed the 512-slot cooldown, reclaiming rent.
-    pub fn try_close_deactivated_luts(
-        &self,
-        rpc_client: &RpcClient,
-        signer_keypair: &Keypair,
-    ) {
+    pub fn try_close_deactivated_luts(&self, rpc_client: &RpcClient, signer_keypair: &Keypair) {
         const DEACTIVATION_COOLDOWN: u64 = 512;
 
         let current_slot = match rpc_client.get_slot_with_commitment(CommitmentConfig::confirmed())
