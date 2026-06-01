@@ -47,6 +47,9 @@ pub struct GroupedLuts {
     /// On-the-fly LUTs created during retry_with_new_luts for edge-case liquidations.
     /// Persists across liquidations so the same edge case doesn't re-trigger creation.
     pub overflow: Vec<AddressLookupTableAccount>,
+    /// LUTs pending closure: (address, slot at which deactivation was sent).
+    /// Closeable after 512-slot cooldown.
+    pub deactivating: Vec<(Pubkey, u64)>,
 }
 
 impl GroupedLuts {
@@ -216,6 +219,111 @@ impl Cache {
         let lut = create_lut(rpc_client, signer_keypair, accounts)?;
         self.luts.lock().unwrap().overflow.push(lut.clone());
         Ok(lut)
+    }
+
+    /// Deactivates a targeted LUT after use, removing it from overflow and queuing it
+    /// for closure once the 512-slot cooldown has elapsed.
+    pub fn deactivate_targeted_lut(
+        &self,
+        rpc_client: &RpcClient,
+        signer_keypair: &Keypair,
+        lut_key: Pubkey,
+    ) -> anyhow::Result<()> {
+        let ix = address_lookup_table::instruction::deactivate_lookup_table(
+            lut_key,
+            signer_keypair.pubkey(),
+        );
+        let recent_blockhash = rpc_client.get_latest_blockhash()?;
+        let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&signer_keypair.pubkey()),
+            &[signer_keypair],
+            recent_blockhash,
+        );
+        rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+            &tx,
+            CommitmentConfig::confirmed(),
+            RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..Default::default()
+            },
+        )?;
+
+        let slot = rpc_client.get_slot_with_commitment(CommitmentConfig::confirmed())?;
+        let mut luts = self.luts.lock().unwrap();
+        luts.overflow.retain(|l| l.key != lut_key);
+        luts.deactivating.push((lut_key, slot));
+        Ok(())
+    }
+
+    /// Closes any deactivated LUTs that have passed the 512-slot cooldown, reclaiming rent.
+    pub fn try_close_deactivated_luts(
+        &self,
+        rpc_client: &RpcClient,
+        signer_keypair: &Keypair,
+    ) {
+        const DEACTIVATION_COOLDOWN: u64 = 512;
+
+        let current_slot = match rpc_client.get_slot_with_commitment(CommitmentConfig::confirmed())
+        {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Failed to get slot for LUT cleanup: {e}");
+                return;
+            }
+        };
+
+        let ready: Vec<Pubkey> = {
+            let luts = self.luts.lock().unwrap();
+            luts.deactivating
+                .iter()
+                .filter(|(_, deactivated_at)| {
+                    current_slot >= deactivated_at + DEACTIVATION_COOLDOWN
+                })
+                .map(|(key, _)| *key)
+                .collect()
+        };
+
+        for lut_key in ready {
+            let ix = address_lookup_table::instruction::close_lookup_table(
+                lut_key,
+                signer_keypair.pubkey(),
+                signer_keypair.pubkey(),
+            );
+            let blockhash = match rpc_client.get_latest_blockhash() {
+                Ok(h) => h,
+                Err(e) => {
+                    log::warn!("Failed to get blockhash for closing LUT {lut_key}: {e}");
+                    continue;
+                }
+            };
+            let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signer_keypair.pubkey()),
+                &[signer_keypair],
+                blockhash,
+            );
+            match rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+                &tx,
+                CommitmentConfig::confirmed(),
+                RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    ..Default::default()
+                },
+            ) {
+                Ok(_) => {
+                    log::info!("Closed deactivated LUT {lut_key}, reclaimed rent.");
+                    self.luts
+                        .lock()
+                        .unwrap()
+                        .deactivating
+                        .retain(|(k, _)| *k != lut_key);
+                }
+                Err(e) => {
+                    log::warn!("Failed to close LUT {lut_key}: {e}");
+                }
+            }
+        }
     }
 }
 

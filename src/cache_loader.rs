@@ -102,6 +102,7 @@ impl CacheLoader {
             group2,
             group3,
             overflow: vec![],
+            deactivating: vec![],
         };
 
         Ok(())

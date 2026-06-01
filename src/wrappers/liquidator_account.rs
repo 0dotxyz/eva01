@@ -561,6 +561,9 @@ impl LiquidatorAccount {
     }
 
     fn retry_with_new_luts(&self, ixs: Vec<Instruction>) -> Result<Signature> {
+        self.cache
+            .try_close_deactivated_luts(&self.rpc_client, &self.signer);
+
         let all_accounts: Vec<Pubkey> = ixs
             .iter()
             .flat_map(|ix| ix.accounts.iter().map(|a| a.pubkey))
@@ -568,21 +571,17 @@ impl LiquidatorAccount {
             .into_iter()
             .collect();
 
-        // Create one targeted LUT with exactly these accounts and retry with only that LUT.
-        // Using a single tight LUT avoids the header overhead of the pre-built group LUTs,
-        // which is what caused the tx to overflow in the first place.
         let targeted_lut =
             self.cache
                 .create_targeted_lut(&self.rpc_client, &self.signer, all_accounts)?;
+        let lut_key = targeted_lut.key;
         let luts = vec![targeted_lut];
 
         let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
-
         let msg = Message::try_compile(&self.signer.pubkey(), &ixs, &luts, recent_blockhash)?;
-
         let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])?;
 
-        let signature = self
+        let result = self
             .rpc_client
             .send_and_confirm_transaction_with_spinner_and_config(
                 &tx,
@@ -592,9 +591,16 @@ impl LiquidatorAccount {
                     preflight_commitment: Some(CommitmentLevel::Processed),
                     ..Default::default()
                 },
-            )?;
+            );
 
-        Ok(signature)
+        if let Err(e) = self
+            .cache
+            .deactivate_targeted_lut(&self.rpc_client, &self.signer, lut_key)
+        {
+            warn!("Failed to deactivate targeted LUT {lut_key}: {e}");
+        }
+
+        Ok(result?)
     }
 
     pub fn withdraw(&self, bank: &BankWrapper, amount: u64, withdraw_all: bool) -> Result<()> {
