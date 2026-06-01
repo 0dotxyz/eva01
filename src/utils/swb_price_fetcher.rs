@@ -58,14 +58,14 @@ struct ViewPriceResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ViewPriceEntry {
-    #[serde(rename = "oraclePrice")]
     oracle_price: OraclePriceDto,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OraclePriceDto {
-    #[serde(rename = "priceRealtime")]
     price_realtime: PriceWithConfidenceDto,
 }
 
