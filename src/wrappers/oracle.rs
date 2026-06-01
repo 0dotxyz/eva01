@@ -21,22 +21,10 @@ pub trait OracleWrapperTrait {
     fn get_address(&self) -> Pubkey;
 }
 
-enum PriceSource {
-    Adapter(OraclePriceFeedAdapter),
-}
-
-impl Clone for PriceSource {
-    fn clone(&self) -> Self {
-        match self {
-            PriceSource::Adapter(a) => PriceSource::Adapter(a.clone()),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct OracleWrapper {
     pub addresses: Vec<Pubkey>,
-    source: PriceSource,
+    source: OraclePriceFeedAdapter,
 }
 
 impl OracleWrapper {
@@ -89,7 +77,7 @@ impl OracleWrapper {
 
                 result = Some(Self {
                     addresses: [bank_oracle_address].to_vec(),
-                    source: PriceSource::Adapter(price_adapter),
+                    source: price_adapter,
                 });
             }
             OracleSetup::StakedWithPythPush => {
@@ -131,14 +119,14 @@ impl OracleWrapper {
                         mint_oracle_address,
                         sol_pool_oracle_address,
                     ],
-                    source: PriceSource::Adapter(price_adapter),
+                    source: price_adapter,
                 });
             }
             OracleSetup::Fixed => {
                 let price_adapter = OraclePriceFeedAdapter::try_from_bank(bank, &[], clock)?;
                 result = Some(Self {
                     addresses: vec![],
-                    source: PriceSource::Adapter(price_adapter),
+                    source: price_adapter,
                 });
             }
             OracleSetup::KaminoPythPush
@@ -172,7 +160,7 @@ impl OracleWrapper {
                 )?;
                 result = Some(Self {
                     addresses: [bank_oracle_address, integration_oracle_address].to_vec(),
-                    source: PriceSource::Adapter(price_adapter),
+                    source: price_adapter,
                 });
             }
             OracleSetup::FixedKamino | OracleSetup::FixedDrift | OracleSetup::FixedJuplend => {
@@ -196,7 +184,7 @@ impl OracleWrapper {
                 )?;
                 result = Some(Self {
                     addresses: vec![integration_oracle_address],
-                    source: PriceSource::Adapter(price_adapter),
+                    source: price_adapter,
                 });
             }
             _ => {
@@ -224,11 +212,9 @@ impl OracleWrapperTrait for OracleWrapper {
         price_bias: Option<PriceBias>,
         oracle_max_confidence: u32,
     ) -> anyhow::Result<I80F48> {
-        match &self.source {
-            PriceSource::Adapter(adapter) => {
-                Ok(adapter.get_price_of_type(oracle_type, price_bias, oracle_max_confidence)?)
-            }
-        }
+        Ok(self
+            .source
+            .get_price_of_type(oracle_type, price_bias, oracle_max_confidence)?)
     }
 
     fn get_address(&self) -> Pubkey {
