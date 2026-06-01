@@ -344,10 +344,7 @@ impl Rebalancer {
         );
 
         const WSOL: Pubkey = Pubkey::from_str_const("So11111111111111111111111111111111111111112");
-        // Use wrap_and_unwrap_sol=true only when wSOL is the INPUT (native SOL needs wrapping).
-        // When wSOL is the OUTPUT we want Jupiter to deposit into the wSOL ATA directly so
-        // the SPL token cache picks it up — unwrapping to native SOL would bypass that.
-        let wrap_and_unwrap_sol = input_mint == WSOL;
+        let wrap_and_unwrap_sol = input_mint == WSOL || output_mint == WSOL;
 
         let result = self.tokio_rt.block_on(self.dex_client.swap(
             &input_mint.to_string(),
