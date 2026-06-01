@@ -14,7 +14,7 @@ use fixed::types::I80F48;
 use log::{debug, info, warn};
 use marginfi_type_crate::types::OracleSetup;
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use solana_sdk::{account::Account, genesis_config::ClusterType, pubkey, pubkey::Pubkey};
 use switchboard_on_demand_client::{CrossbarClient, PullFeedAccountData};
 use tokio::runtime::{Builder, Runtime};
@@ -71,8 +71,16 @@ struct OraclePriceDto {
 
 #[derive(Deserialize)]
 struct PriceWithConfidenceDto {
-    price: String,
-    confidence: String,
+    #[serde(deserialize_with = "deserialize_f64_from_string")]
+    price: f64,
+    #[serde(deserialize_with = "deserialize_f64_from_string")]
+    confidence: f64,
+}
+
+fn deserialize_f64_from_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    String::deserialize(deserializer)?
+        .parse::<f64>()
+        .map_err(serde::de::Error::custom)
 }
 
 pub struct SwbPriceFetcher {
@@ -154,15 +162,8 @@ impl SwbPriceFetcher {
                 anyhow::anyhow!("Invalid bank pubkey '{bank_addr_str}' in /v0/realprice: {e}")
             })?;
 
-            let price_realtime = entry.oracle_price.price_realtime.price.parse::<f64>()?;
-            let conf_realtime = entry
-                .oracle_price
-                .price_realtime
-                .confidence
-                .parse::<f64>()?;
-
-            let price_rt = I80F48::from_num(price_realtime);
-            let conf_rt = I80F48::from_num(conf_realtime);
+            let price_rt = I80F48::from_num(entry.oracle_price.price_realtime.price);
+            let conf_rt = I80F48::from_num(entry.oracle_price.price_realtime.confidence);
             if let Ok(bank) = self.cache.banks.try_get_bank(&bank_address) {
                 if matches!(
                     bank.bank.config.oracle_setup,
