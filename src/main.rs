@@ -49,19 +49,6 @@ mod drift_idl {
 use drift_idl::*;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("create-lut") => {
-            dotenv::dotenv().ok();
-            return Ok(crate::cli::create_lut_entry()?);
-        }
-        Some("sync-lut") => {
-            dotenv::dotenv().ok();
-            return Ok(crate::cli::sync_lut_entry()?);
-        }
-        _ => {}
-    }
-
     init_logging();
 
     std::panic::set_hook(Box::new(|panic_info| {

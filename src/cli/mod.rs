@@ -11,8 +11,6 @@ use crate::{
 use log::error;
 
 pub mod entrypoints;
-pub mod lut_creator;
-pub use lut_creator::{create_lut_entry, sync_lut_entry};
 
 /// Main entrypoint for Eva
 pub fn main_entry(stop: Arc<AtomicBool>) -> anyhow::Result<()> {
