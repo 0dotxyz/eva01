@@ -100,9 +100,7 @@ impl SwbPriceFetcher {
         stop: Arc<AtomicBool>,
     ) -> Self {
         let crossbar_url = crossbar_api_url.as_deref().unwrap_or(FALLBACK_CROSSBAR_URL);
-        let tokio_rt = Builder::new_multi_thread()
-            .thread_name("SwbPriceFetcher")
-            .worker_threads(2)
+        let tokio_rt = Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("Failed to build SwbPriceFetcher tokio runtime");
