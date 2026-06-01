@@ -205,7 +205,7 @@ impl SwbPriceFetcher {
                 )
             })?;
 
-            let Some(&bank_address) = oracle_to_bank.get(&oracle_pk) else {
+            let Some(bank_addresses) = oracle_to_bank.get(&oracle_pk) else {
                 continue;
             };
 
@@ -236,11 +236,13 @@ impl SwbPriceFetcher {
 
             let price_rt = I80F48::from_num(price);
             let conf_rt = I80F48::from_num(conf);
-            if let Ok(bank) = self.cache.banks.try_get_bank(&bank_address) {
-                if let Some(&oracle_key) = bank.bank.config.oracle_keys.first() {
-                    let synthetic = build_synthetic_swb_account(price_rt, conf_rt);
-                    if let Err(e) = self.cache.oracles.try_update(&oracle_key, synthetic) {
-                        warn!("SwbPriceFetcher: failed to write synthetic oracle for {oracle_key}: {e}");
+            let synthetic = build_synthetic_swb_account(price_rt, conf_rt);
+            for bank_address in bank_addresses {
+                if let Ok(bank) = self.cache.banks.try_get_bank(bank_address) {
+                    if let Some(&oracle_key) = bank.bank.config.oracle_keys.first() {
+                        if let Err(e) = self.cache.oracles.try_update(&oracle_key, synthetic.clone()) {
+                            warn!("SwbPriceFetcher: failed to write synthetic oracle for {oracle_key}: {e}");
+                        }
                     }
                 }
             }
