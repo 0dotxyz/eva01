@@ -110,7 +110,7 @@ impl Rebalancer {
         let swap_token_address = self.cache.tokens.try_get_token_for_mint(&self.swap_mint)?;
         let swap_wrapper = self
             .cache
-            .try_get_token_wrapper::<OracleWrapper>(&self.swap_mint, &swap_token_address)?;
+            .try_get_token_wrapper_lenient(&self.swap_mint, &swap_token_address)?;
 
         if let Err(e) = self.handle_token_accounts(missing_tokens, &swap_wrapper) {
             error!("Failed to handle the Liquidator's tokens: {}", e);
@@ -160,17 +160,24 @@ impl Rebalancer {
                 self.liquidator_account
                     .withdraw(&swap_bank_wrapper, amount.to_num(), false)
             {
-                // Check if this is a stale oracle error and record it in metrics
-                if let Some(client_err) = e.downcast_ref::<ClientError>() {
-                    if is_stale_swb_price_error(client_err) {
-                        record_liquidation_failure(
-                            FAILURE_REASON_STALE_ORACLES,
-                            None,
-                            Some(oracle),
-                        );
+                let err_str = e.to_string();
+                // BankAccountNotFound (0x1782): no balance account opened for this bank
+                // (or no deposit). Nothing to withdraw — proceed with wallet balance only.
+                if err_str.contains("0x1782") || err_str.contains("BankAccountNotFound") {
+                    warn!("No swap mint balance in marginfi lending account; proceeding with wallet balance only");
+                } else {
+                    // Check if this is a stale oracle error and record it in metrics
+                    if let Some(client_err) = e.downcast_ref::<ClientError>() {
+                        if is_stale_swb_price_error(client_err) {
+                            record_liquidation_failure(
+                                FAILURE_REASON_STALE_ORACLES,
+                                None,
+                                Some(oracle),
+                            );
+                        }
                     }
+                    return Err(e);
                 }
-                return Err(e);
             }
         }
 
@@ -190,14 +197,14 @@ impl Rebalancer {
             }
 
             let token = self.cache.tokens.try_get_token_for_mint(&mint)?;
-            let wrapper = self
-                .cache
-                .try_get_token_wrapper::<OracleWrapper>(&mint, &token);
+            let wrapper = self.cache.try_get_token_wrapper_lenient(&mint, &token);
             if let Err(e) = wrapper {
                 // Ignore empty stake banks
                 if e.to_string().contains("Stake pool supply is zero") {
                     self.empty_stake_banks.insert(mint);
                 } else {
+                    // SwitchboardStalePrice here at startup is harmless — SwbPriceFetcher
+                    // populates synthetic oracle accounts on its first 30-second cycle.
                     warn!("Skipping the token {} in rebalancing: {}", mint, e);
                 }
                 continue;
@@ -336,15 +343,14 @@ impl Rebalancer {
             amount, input_mint, output_mint
         );
 
-        if output_mint == Pubkey::from_str_const("So11111111111111111111111111111111111111112") {
-            return Err(anyhow::anyhow!("FIX WSOL SWAPS!"));
-        }
+        const WSOL: Pubkey = Pubkey::from_str_const("So11111111111111111111111111111111111111112");
+        let wrap_and_unwrap_sol = input_mint == WSOL || output_mint == WSOL;
 
         let result = self.tokio_rt.block_on(self.dex_client.swap(
             &input_mint.to_string(),
             &output_mint.to_string(),
             amount,
-            false,
+            wrap_and_unwrap_sol,
         ))?;
 
         info!(

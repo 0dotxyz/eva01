@@ -16,11 +16,7 @@ use crate::{
     },
     metrics::{LIQUIDATION_ATTEMPTS, LIQUIDATION_LATENCY_SECONDS, LIQUIDATION_SUCCESSES},
     utils::{
-        self, marginfi_account_by_authority,
-        simulation_cache::{
-            format_skipped_instruction_entries, is_tx_too_large_client,
-            simulate_instruction_batches, SimulatedInstructionEntry,
-        },
+        self, marginfi_account_by_authority, simulation_cache::is_tx_too_large_client,
         swb_cranker::is_stale_swb_price_error,
     },
     wrappers::oracle::OracleWrapper,
@@ -53,17 +49,9 @@ use solana_sdk::{
     system_instruction::transfer,
     transaction::VersionedTransaction,
 };
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
-};
+use std::{collections::HashSet, sync::Arc, thread, time::Duration};
 
 pub const PROFIT_SHARE: f64 = 0.085;
-const DEFAULT_INTEGRATION_REFRESH_BATCH_HINT: usize = 12;
-const INTEGRATION_REFRESH_RPC_MAX_RETRIES: usize = 3;
-const INTEGRATION_REFRESH_RPC_RETRY_BASE_DELAY_MS: u64 = 250;
 
 #[derive(Debug)]
 pub enum LiquidationError {
@@ -109,10 +97,7 @@ pub struct LiquidatorAccount {
     rpc_client: RpcClient,
     cu_limit_ix: Instruction,
     pub cache: Arc<Cache>,
-    integration_refresh_batch_hint: Mutex<usize>,
 }
-
-type IntegrationRefreshEntry = SimulatedInstructionEntry;
 
 impl LiquidatorAccount {
     pub fn new(
@@ -162,7 +147,6 @@ impl LiquidatorAccount {
             rpc_client,
             cu_limit_ix: ComputeBudgetInstruction::set_compute_unit_limit(1400000),
             cache,
-            integration_refresh_batch_hint: Mutex::new(DEFAULT_INTEGRATION_REFRESH_BATCH_HINT),
         })
     }
 
@@ -220,7 +204,6 @@ impl LiquidatorAccount {
     pub fn liquidate(
         &self,
         account: PreparedLiquidatableAccount,
-        stale_swb_oracles: &HashSet<Pubkey>,
         tokens_in_shortage: &mut HashSet<Pubkey>,
     ) -> Result<(), LiquidationError> {
         let PreparedLiquidatableAccount {
@@ -236,7 +219,6 @@ impl LiquidatorAccount {
 
         LIQUIDATION_ATTEMPTS.inc();
 
-        let mut participating_accounts: HashSet<Pubkey> = HashSet::new();
         let liquidatee_account_address = liquidatee_account.address;
         let asset_bank_wrapper = self
             .cache
@@ -277,7 +259,7 @@ impl LiquidatorAccount {
         }
 
         let liab_token_balance =
-            I80F48::from_num(self.get_token_balance_for_mint(&liab_mint).unwrap());
+            I80F48::from_num(self.get_token_balance_for_mint(&liab_mint).unwrap_or(0));
 
         if liab_token_balance < dust_liab_threshold {
             if tokens_in_shortage.insert(liab_mint) {
@@ -315,17 +297,10 @@ impl LiquidatorAccount {
             juplend_states,
         } = observation_accounts;
 
-        // Note: liquidatee_observation_accounts include Kamino reserves, Drift spot markets and all of the banks and oracles.
-        participating_accounts.extend(liquidatee_observation_accounts.iter());
-
         debug!(
             "The Liquidatee {:?} observation accounts: {:?}",
             liquidatee_account_address, liquidatee_observation_accounts
         );
-
-        if contains_stale_oracles(stale_swb_oracles, &liquidatee_swb_oracles) {
-            return Ok(());
-        }
 
         let liquidation_record =
             if liquidatee_account.account.liquidation_record == Pubkey::default() {
@@ -336,9 +311,12 @@ impl LiquidatorAccount {
             } else {
                 liquidatee_account.account.liquidation_record
             };
-        participating_accounts.insert(liquidation_record);
-
-        let luts: Vec<AddressLookupTableAccount> = self.cache.luts.lock().unwrap().clone();
+        let all_tags: Vec<u8> = liquidatee_banks
+            .iter()
+            .filter_map(|pk| self.cache.banks.try_get_bank(pk).ok())
+            .map(|b| b.bank.config.asset_tag)
+            .collect();
+        let luts = self.cache.luts.lock().unwrap().select_for_tags(&all_tags);
         let mut ixs = Vec::new();
 
         ixs.push(self.cu_limit_ix.clone());
@@ -351,7 +329,6 @@ impl LiquidatorAccount {
             liquidation_record,
             liquidatee_observation_accounts.as_ref(),
             &liquidatee_banks,
-            &mut participating_accounts,
         );
 
         for kamino_reserve_address in kamino_reserves {
@@ -365,11 +342,8 @@ impl LiquidatorAccount {
                 kamino_reserve_address
             );
 
-            let refresh_reserve_ix = make_refresh_reserve_ix(
-                kamino_reserve_address,
-                &kamino_reserve,
-                &mut participating_accounts,
-            );
+            let refresh_reserve_ix =
+                make_refresh_reserve_ix(kamino_reserve_address, &kamino_reserve);
             ixs.push(refresh_reserve_ix);
         }
 
@@ -383,7 +357,6 @@ impl LiquidatorAccount {
                 spot_market_address,
                 spot_market.market.vault,
                 spot_market.market.oracle,
-                &mut participating_accounts,
             );
             ixs.push(refresh_spot_market_ix);
         }
@@ -394,11 +367,8 @@ impl LiquidatorAccount {
                 .try_get_juplend_lending_state(&lending_state_address)
                 .map_err(LiquidationError::from_anyhow)?;
 
-            let update_lending_rate_ix = make_update_lending_rate_ix(
-                lending_state_address,
-                &lending_state,
-                &mut participating_accounts,
-            );
+            let update_lending_rate_ix =
+                make_update_lending_rate_ix(lending_state_address, &lending_state);
             ixs.push(update_lending_rate_ix);
         }
 
@@ -418,7 +388,6 @@ impl LiquidatorAccount {
                 liquidatee_observation_accounts.as_ref(),
                 asset_amount.to_num(),
                 false,
-                Some(&mut participating_accounts),
             ),
             ASSET_TAG_KAMINO => {
                 let kamino_reserve = self
@@ -430,7 +399,6 @@ impl LiquidatorAccount {
                     asset_bank_wrapper.bank.integration_acc_2,
                     kamino_reserve.reserve.lending_market,
                     &[asset_bank_wrapper.bank.integration_acc_1],
-                    &mut participating_accounts,
                 );
                 ixs.push(refresh_obligation_ix);
 
@@ -445,7 +413,6 @@ impl LiquidatorAccount {
                     liquidatee_observation_accounts.as_ref(),
                     asset_amount.to_num(),
                     false,
-                    &mut participating_accounts,
                 )
             }
             ASSET_TAG_DRIFT => {
@@ -465,7 +432,6 @@ impl LiquidatorAccount {
                     liquidatee_observation_accounts.as_ref(),
                     asset_amount.to_num(),
                     false,
-                    &mut participating_accounts,
                 )
             }
             ASSET_TAG_JUPLEND => {
@@ -484,7 +450,6 @@ impl LiquidatorAccount {
                     liquidatee_observation_accounts.as_ref(),
                     asset_amount.to_num(),
                     false,
-                    &mut participating_accounts,
                 )
             }
             _ => {
@@ -510,7 +475,6 @@ impl LiquidatorAccount {
             &liab_mint_wrapper,
             liab_amount.to_num(),
             false,
-            &mut participating_accounts,
         );
         ixs.push(repay_ix);
 
@@ -521,7 +485,6 @@ impl LiquidatorAccount {
             self.cache.global_fee_state_key,
             self.cache.global_fee_wallet,
             &liquidatee_banks,
-            &mut participating_accounts,
         );
         ixs.push(end_ix);
 
@@ -568,7 +531,7 @@ impl LiquidatorAccount {
             Err(err) => {
                 if is_tx_too_large_client(&err) {
                     warn!("The liquidation tx was too large: adding the observation accounts to a LUT and retrying");
-                    match self.retry_with_new_luts(ixs, participating_accounts) {
+                    match self.retry_with_new_luts(ixs) {
                         Ok(signature) => {
                             info!(
                                 "Liquidation tx for the Account {} was confirmed. Signature: {}",
@@ -597,23 +560,28 @@ impl LiquidatorAccount {
         }
     }
 
-    fn retry_with_new_luts(
-        &self,
-        ixs: Vec<Instruction>,
-        participating_accounts: HashSet<Pubkey>,
-    ) -> Result<Signature> {
+    fn retry_with_new_luts(&self, ixs: Vec<Instruction>) -> Result<Signature> {
         self.cache
-            .add_addresses_to_lut(&self.rpc_client, &self.signer, participating_accounts)?;
+            .try_close_deactivated_luts(&self.rpc_client, &self.signer);
 
-        let luts: Vec<AddressLookupTableAccount> = self.cache.luts.lock().unwrap().clone();
+        let all_accounts: Vec<Pubkey> = ixs
+            .iter()
+            .flat_map(|ix| ix.accounts.iter().map(|a| a.pubkey))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let targeted_lut =
+            self.cache
+                .create_targeted_lut(&self.rpc_client, &self.signer, all_accounts)?;
+        let lut_key = targeted_lut.key;
+        let luts = vec![targeted_lut];
 
         let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
-
         let msg = Message::try_compile(&self.signer.pubkey(), &ixs, &luts, recent_blockhash)?;
-
         let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])?;
 
-        let signature = self
+        let result = self
             .rpc_client
             .send_and_confirm_transaction_with_spinner_and_config(
                 &tx,
@@ -623,9 +591,16 @@ impl LiquidatorAccount {
                     preflight_commitment: Some(CommitmentLevel::Processed),
                     ..Default::default()
                 },
-            )?;
+            );
 
-        Ok(signature)
+        if let Err(e) = self
+            .cache
+            .deactivate_targeted_lut(&self.rpc_client, &self.signer, lut_key)
+        {
+            warn!("Failed to deactivate targeted LUT {lut_key}: {e}");
+        }
+
+        Ok(result?)
     }
 
     pub fn withdraw(&self, bank: &BankWrapper, amount: u64, withdraw_all: bool) -> Result<()> {
@@ -669,17 +644,15 @@ impl LiquidatorAccount {
             observation_accounts.as_ref(),
             amount,
             withdraw_all,
-            None,
         );
 
         let ixs: Vec<Instruction> = vec![self.cu_limit_ix.clone(), withdraw_ix];
-        let luts: Vec<AddressLookupTableAccount> = self.cache.luts.lock().unwrap().clone();
-
-        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
-        let msg = Message::try_compile(&signer_pk, &ixs, &luts, recent_blockhash)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let luts = self
+            .cache
+            .luts
+            .lock()
+            .unwrap()
+            .select_for_tags(&[bank.bank.config.asset_tag]);
 
         debug!(
             "Withdrawing {:?} unscaled tokens of the Mint {} from the Liquidator account {:?}, Bank {:?}, ",
@@ -688,6 +661,23 @@ impl LiquidatorAccount {
             mint_wrapper.token,
             self.preferred_mint_bank
         );
+
+        self.send_withdraw_tx(&signer_pk, &ixs, &luts)?;
+
+        Ok(())
+    }
+
+    fn send_withdraw_tx(
+        &self,
+        signer_pk: &Pubkey,
+        ixs: &[Instruction],
+        luts: &[AddressLookupTableAccount],
+    ) -> Result<()> {
+        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
+        let msg = Message::try_compile(signer_pk, ixs, luts, recent_blockhash)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         let res = self
             .rpc_client
@@ -700,10 +690,26 @@ impl LiquidatorAccount {
                     ..Default::default()
                 },
             )
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| anyhow::anyhow!(e));
 
-        debug!("Withdrawal tx: {:?} ", res);
-        Ok(())
+        match res {
+            Ok(sig) => {
+                debug!("Withdrawal tx: {:?}", sig);
+                Ok(())
+            }
+            Err(e)
+                if !luts.is_empty()
+                    && e.to_string()
+                        .contains("address table account that doesn't exist") =>
+            {
+                warn!(
+                    "LUT is invalid or deactivated ({}); retrying withdraw without LUTs",
+                    luts[0].key
+                );
+                self.send_withdraw_tx(signer_pk, ixs, &[])
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn deposit(&self, bank: &BankWrapper, amount: u64) -> Result<()> {
@@ -831,105 +837,22 @@ impl LiquidatorAccount {
 
         Ok((drift_spot_market, reward_spot_market, reward_spot_market_2))
     }
-
-    fn build_refresh_integrations_entries(&self) -> Result<Vec<IntegrationRefreshEntry>> {
-        let mut entries = Vec::new();
-        let mut participating_accounts: HashSet<Pubkey> = HashSet::new();
-
-        for (address, reserve) in self.cache.try_get_kamino_reserves()? {
-            let instruction =
-                make_refresh_reserve_ix(address, &reserve, &mut participating_accounts);
-            debug!(
-                "Refreshing: reserve {}, mint {}",
-                address, reserve.reserve.collateral.mint_pubkey
-            );
-            entries.push(IntegrationRefreshEntry {
-                kind: "kamino",
-                address,
-                instruction,
-            });
-        }
-
-        // TODO: bring back Drift here if it's ever resurrected
-
-        for (address, lending_state) in self.cache.try_get_juplend_lending_states()? {
-            debug!("Refreshing: state {}, mint {}", address, lending_state.mint);
-            let instruction =
-                make_update_lending_rate_ix(address, &lending_state, &mut participating_accounts);
-            entries.push(IntegrationRefreshEntry {
-                kind: "juplend",
-                address,
-                instruction,
-            });
-        }
-
-        Ok(entries)
-    }
-
-    pub fn simulate_refresh_integrations(&self) -> Result<()> {
-        let luts: Vec<AddressLookupTableAccount> = self.cache.luts.lock().unwrap().clone();
-        let entries = self.build_refresh_integrations_entries()?;
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let stored_batch_hint = *self.integration_refresh_batch_hint.lock().unwrap();
-        let summary = simulate_instruction_batches(
-            &self.rpc_client,
-            &self.signer,
-            &luts,
-            &self.cu_limit_ix,
-            &entries,
-            stored_batch_hint,
-            INTEGRATION_REFRESH_RPC_MAX_RETRIES,
-            Duration::from_millis(INTEGRATION_REFRESH_RPC_RETRY_BASE_DELAY_MS),
-            |address, account| self.cache.oracles.try_update(address, account),
-        )
-        .context("simulate_instruction_batches for integrations refresh failed")?;
-
-        debug!(
-            "Integrations refresh simulation completed: refreshed_batches={}, skipped_entries={}",
-            summary.refreshed_batches,
-            summary.skipped_entries.len()
-        );
-
-        if !summary.skipped_entries.is_empty() {
-            warn!(
-                "Integrations refresh simulation completed while skipping {} failing integrations: {}",
-                summary.skipped_entries.len(),
-                format_skipped_instruction_entries(&summary.skipped_entries)
-            );
-        }
-
-        if summary.resized_down {
-            let mut batch_hint = self.integration_refresh_batch_hint.lock().unwrap();
-            if summary.preferred_batch_size < *batch_hint {
-                info!(
-                    "Reduced integrations refresh batch-size hint from {} to {} after simulation backoff",
-                    *batch_hint, summary.preferred_batch_size
-                );
-                *batch_hint = summary.preferred_batch_size;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-fn contains_stale_oracles(stale_oracles: &HashSet<Pubkey>, account_oracles: &[Pubkey]) -> bool {
-    if let Some(oracle) = account_oracles
-        .iter()
-        .find(|oracle| stale_oracles.contains(*oracle))
-    {
-        debug!("Found stale oracle: {}.", oracle);
-        true
-    } else {
-        false
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn contains_stale_oracles(stale_oracles: &HashSet<Pubkey>, account_oracles: &[Pubkey]) -> bool {
+        if let Some(oracle) = account_oracles
+            .iter()
+            .find(|oracle| stale_oracles.contains(*oracle))
+        {
+            true
+        } else {
+            false
+        }
+    }
 
     #[test]
     fn test_contains_stale_oracles_with_stale() {

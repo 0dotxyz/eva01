@@ -61,6 +61,20 @@ impl BanksCache {
             .collect()
     }
 
+    /// Returns a map of SwitchboardPull oracle pubkey → bank addresses.
+    /// Multiple banks can share the same oracle key, so each entry is a Vec.
+    pub fn get_swb_oracle_to_bank_map(&self) -> HashMap<Pubkey, Vec<Pubkey>> {
+        let mut map: HashMap<Pubkey, Vec<Pubkey>> = HashMap::new();
+        for (bank_addr, bank) in &self.banks {
+            if matches!(bank.bank.config.oracle_setup, OracleSetup::SwitchboardPull) {
+                map.entry(bank.bank.config.oracle_keys[0])
+                    .or_default()
+                    .push(*bank_addr);
+            }
+        }
+        map
+    }
+
     pub fn get_kamino_reserves(&self) -> HashSet<Pubkey> {
         self.banks
             .iter()

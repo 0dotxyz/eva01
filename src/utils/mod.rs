@@ -1,6 +1,8 @@
 pub mod healthcheck;
+pub mod integration_account_fetcher;
 pub mod simulation_cache;
 pub mod swb_cranker;
+pub mod swb_price_fetcher;
 
 use anyhow::{anyhow, Error, Result};
 use backoff::ExponentialBackoff;
@@ -234,21 +236,6 @@ pub fn log_genuine_error(prefix: &str, error: Error) {
     }
 }
 
-pub fn format_error_chain(err: &Error) -> String {
-    let mut chain = err.chain();
-    let primary = chain
-        .next()
-        .map(|cause| cause.to_string())
-        .unwrap_or_else(|| "unknown error".to_string());
-
-    let causes = chain.map(ToString::to_string).collect::<Vec<_>>();
-    if causes.is_empty() {
-        return primary;
-    }
-
-    format!("{primary} | caused by: {}", causes.join(" -> "))
-}
-
 pub fn marginfi_account_by_authority(
     authority: Pubkey,
     rpc_client: &RpcClient,
@@ -292,9 +279,8 @@ pub fn marginfi_account_by_authority(
 mod tests {
 
     use crate::utils::find_oracle_keys;
-    use anyhow::anyhow;
 
-    use super::{accessor, format_error_chain};
+    use super::accessor;
     use marginfi_type_crate::types::{BankConfig, OracleSetup};
     use solana_program::pubkey::Pubkey;
 
@@ -409,19 +395,5 @@ mod tests {
         keys = find_oracle_keys(&config);
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0], feed_id);
-    }
-
-    #[test]
-    fn test_format_error_chain_includes_all_causes() {
-        let err = anyhow!("root failure")
-            .context("middle failure")
-            .context("top-level failure");
-
-        let formatted = format_error_chain(&err);
-
-        assert!(formatted.contains("top-level failure"));
-        assert!(formatted.contains("middle failure"));
-        assert!(formatted.contains("root failure"));
-        assert!(formatted.contains("caused by:"));
     }
 }

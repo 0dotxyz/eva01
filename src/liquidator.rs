@@ -1,7 +1,7 @@
 use crate::{
     cache::Cache,
     clock_manager,
-    config::{Eva01Config, TokenThresholds},
+    config::Eva01Config,
     metrics::{
         record_liquidation_failure, ACCOUNTS_SCANNED_TOTAL, ACCOUNT_SCAN_DURATION_SECONDS,
         ERROR_COUNT, FAILURE_REASON_INTERNAL, FAILURE_REASON_NOT_ENOUGH_FUNDS,
@@ -9,11 +9,7 @@ use crate::{
         LIQUIDATABLE_ACCOUNTS_FOUND_TOTAL, LIQUIDATION_SCAN_IN_PROGRESS,
     },
     rebalancer::Rebalancer,
-    utils::{
-        format_error_chain,
-        simulation_cache::is_transient_rpc_anyhow_error,
-        swb_cranker::{SwbCranker, SWB_STALE_HANDLED_ERROR, SWB_STALE_PRICE_ERROR_CODE_NUMBER},
-    },
+    utils::swb_cranker::{SwbCranker, SWB_STALE_HANDLED_ERROR, SWB_STALE_PRICE_ERROR_CODE_NUMBER},
     wrappers::{
         bank::BankWrapper,
         liquidator_account::{
@@ -23,16 +19,14 @@ use crate::{
         oracle::{OracleWrapper, OracleWrapperTrait},
     },
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{debug, error, info, warn};
-use marginfi::state::{
-    bank::BankImpl, marginfi_account::get_health_components, price::PriceAdapter,
-};
+use marginfi::state::{bank::BankImpl, marginfi_account::get_health_components};
 use marginfi_type_crate::{
     constants::BANKRUPT_THRESHOLD,
-    types::{BalanceSide, BankOperationalState, HealthPriceMode, OraclePriceType, RequirementType},
+    types::{BalanceSide, BankOperationalState, HealthPriceMode, RequirementType},
 };
 use solana_client::client_error::ClientError;
 use solana_program::pubkey::Pubkey;
@@ -45,7 +39,6 @@ use std::{
 };
 use std::{sync::atomic::Ordering, thread};
 
-const DECLARED_VALUE_RANGE: f64 = 0.2;
 const ACCOUNT_SCAN_BATCH_SIZE: usize = 4_096;
 
 pub struct Liquidator {
@@ -56,7 +49,6 @@ pub struct Liquidator {
     stop_liquidator: Arc<AtomicBool>,
     cache: Arc<Cache>,
     swb_cranker: SwbCranker,
-    token_thresholds: HashMap<Pubkey, TokenThresholds>,
     token_dust_threshold: I80F48,
 }
 
@@ -104,18 +96,11 @@ impl Liquidator {
             stop_liquidator,
             cache,
             swb_cranker,
-            token_thresholds: config.token_thresholds,
             token_dust_threshold: config.token_dust_threshold,
         })
     }
 
     pub fn start(&mut self) -> Result<()> {
-        if let Err(err) = self.simulate_oracles_and_integrations(false) {
-            warn!(
-                "Failed startup pre-rebalancing simulation round: {}",
-                format_error_chain(&err)
-            );
-        }
         self.rebalancer.run(HashMap::new())?;
 
         info!("Staring the Liquidator loop.");
@@ -129,35 +114,20 @@ impl Liquidator {
             info!("Running the Liquidation process...");
             self.run_liquidation.store(false, Ordering::Relaxed);
 
-            if let Err(err) = self.simulate_oracles_and_integrations(true) {
-                error!(
-                    "Failed pre-liquidation simulation: {}",
-                    format_error_chain(&err)
-                );
-                continue;
-            }
-
             let mut missing_tokens: HashMap<Pubkey, I80F48> = HashMap::new();
             let mut stale_swb_oracles: HashSet<Pubkey> = HashSet::new();
             let evaluated_accounts = self.evaluate_all_accounts(&mut stale_swb_oracles);
-            let mut cranked_stale_oracles = false;
 
             if let Ok(mut accounts) = evaluated_accounts {
                 // Accounts are sorted from the highest profit to the lowest
                 accounts.sort_by(|a, b| a.profit.cmp(&b.profit));
                 accounts.reverse();
 
-                if !stale_swb_oracles.is_empty() {
-                    error!("STALE stale_swb_oracles: {:?}", stale_swb_oracles);
-                    continue;
-                }
-
                 let mut tokens_in_shortage: HashSet<Pubkey> = HashSet::new();
                 for acc in accounts {
                     let liquidatee = acc.liquidatee_account.address;
                     let liab_bank = acc.liab_bank;
                     let liab_amount = acc.liab_amount;
-                    // Get the liability mint for metrics
                     let liab_mint = self
                         .cache
                         .banks
@@ -165,11 +135,10 @@ impl Liquidator {
                         .ok()
                         .map(|bank| bank.bank.mint);
 
-                    if let Err(e) = self.liquidator_account.liquidate(
-                        acc,
-                        &stale_swb_oracles,
-                        &mut tokens_in_shortage,
-                    ) {
+                    if let Err(e) = self
+                        .liquidator_account
+                        .liquidate(acc, &mut tokens_in_shortage)
+                    {
                         match e {
                             LiquidationError::Anyhow(e) => {
                                 error!("Failed to liquidate account {:?}", liquidatee);
@@ -182,8 +151,15 @@ impl Liquidator {
                                 ERROR_COUNT.inc();
                             }
                             LiquidationError::StaleOracles(swb_oracles) => {
-                                stale_swb_oracles.extend(&swb_oracles);
-                                // Recording the first one is simpler and still useful for debugging
+                                info!(
+                                    "Cranking stale SWB oracles for next cycle: {:?}",
+                                    swb_oracles
+                                );
+                                if let Err(crank_err) =
+                                    self.swb_cranker.crank_oracles(swb_oracles.clone())
+                                {
+                                    warn!("Failed to crank stale SWB oracles: {}", crank_err);
+                                }
                                 let oracle = swb_oracles.first().copied();
                                 record_liquidation_failure(
                                     FAILURE_REASON_STALE_ORACLES,
@@ -205,36 +181,12 @@ impl Liquidator {
                         }
                     }
                 }
-                if !stale_swb_oracles.is_empty() {
-                    info!("Cranking Swb Oracles {:#?}", stale_swb_oracles);
-                    cranked_stale_oracles = true;
-                    if let Err(err) = self
-                        .swb_cranker
-                        .crank_oracles(stale_swb_oracles.into_iter().collect())
-                    {
-                        error!("Failed to crank Swb Oracles: {}", err)
-                    }
-                    info!("Completed cranking Swb Oracles.");
-                };
             } else if let Err(err) = evaluated_accounts {
                 error!("Failed to evaluate accounts in liquidation: {}", err);
                 ERROR_COUNT.inc();
             }
 
             info!("The Liquidation process is complete.");
-
-            if cranked_stale_oracles {
-                if let Err(err) = self.simulate_oracles_and_integrations(false) {
-                    warn!(
-                        "Failed pre-rebalancing simulation: {}",
-                        format_error_chain(&err)
-                    );
-                }
-            } else {
-                debug!(
-                    "Skipping pre-rebalancing oracle simulation because no stale oracles were cranked"
-                );
-            }
 
             if let Err(error) = self.rebalancer.run(missing_tokens) {
                 error!("Rebalancing failed: {:?}", error);
@@ -244,30 +196,6 @@ impl Liquidator {
         info!("The Liquidator loop is stopped.");
 
         Ok(())
-    }
-
-    fn simulate_oracles_and_integrations(&self, refresh_integrations: bool) -> Result<()> {
-        if refresh_integrations {
-            if let Err(err) = self.liquidator_account.simulate_refresh_integrations() {
-                if is_transient_rpc_anyhow_error(&err) {
-                    warn!(
-                        "Transient RPC failure while simulating integrations refresh; proceeding with cached integration state: {}",
-                        format_error_chain(&err)
-                    );
-                } else {
-                    return Err(err).context("simulate_refresh_integrations failed");
-                }
-            }
-        }
-        let swb_oracle_count = self.cache.banks.get_swb_oracles().len();
-        self.swb_cranker
-            .simulate_oracles(self.cache.as_ref())
-            .with_context(|| {
-                format!(
-                    "simulate_oracles failed (switchboard feed count: {}, refresh_integrations: {})",
-                    swb_oracle_count, refresh_integrations
-                )
-            })
     }
 
     /// Checks if liquidation is needed, for each account one by one
@@ -500,53 +428,9 @@ impl Liquidator {
 
         let asset_oracle_wrapper =
             OracleWrapper::build(&self.cache, &clock, &asset_bank_wrapper.address)?;
-        let asset_price = asset_oracle_wrapper
-            .price_adapter
-            .get_price_of_type_ignore_conf(OraclePriceType::RealTime, None)?
-            .to_num::<f64>();
-        if let Some(thresholds) = self.token_thresholds.get(&asset_bank_wrapper.bank.mint) {
-            let min_asset_price = thresholds.declared_value * (1.0 - DECLARED_VALUE_RANGE);
-            if asset_price < min_asset_price {
-                warn!(
-                    "Asset ({}) price is lower than the declared range: {} < {}",
-                    asset_bank_wrapper.bank.mint, asset_price, min_asset_price
-                );
-                return Ok(LiquidationAmounts::none());
-            }
-            let max_asset_price = thresholds.declared_value * (1.0 + DECLARED_VALUE_RANGE);
-            if asset_price > max_asset_price {
-                warn!(
-                    "Asset ({}) price is higher than the declared range: {} > {}",
-                    asset_bank_wrapper.bank.mint, asset_price, max_asset_price
-                );
-                return Ok(LiquidationAmounts::none());
-            }
-        }
 
         let liab_oracle_wrapper =
             OracleWrapper::build(&self.cache, &clock, &liab_bank_wrapper.address)?;
-        let liab_price = liab_oracle_wrapper
-            .price_adapter
-            .get_price_of_type_ignore_conf(OraclePriceType::RealTime, None)?
-            .to_num::<f64>();
-        if let Some(thresholds) = self.token_thresholds.get(&liab_bank_wrapper.bank.mint) {
-            let min_liab_price = thresholds.declared_value * (1.0 - DECLARED_VALUE_RANGE);
-            if liab_price < min_liab_price {
-                warn!(
-                    "Liability ({}) price is lower than the declared range: {} < {}",
-                    liab_bank_wrapper.bank.mint, liab_price, min_liab_price
-                );
-                return Ok(LiquidationAmounts::none());
-            }
-            let max_liab_price = thresholds.declared_value * (1.0 + DECLARED_VALUE_RANGE);
-            if liab_price > max_liab_price {
-                warn!(
-                    "Liability ({}) price is higher than the declared range: {} > {}",
-                    liab_bank_wrapper.bank.mint, liab_price, max_liab_price
-                );
-                return Ok(LiquidationAmounts::none());
-            }
-        }
 
         let asset_weight_maint: I80F48 = asset_bank_wrapper.bank.config.asset_weight_maint.into();
         let liab_weight_maint: I80F48 = liab_bank_wrapper.bank.config.liability_weight_maint.into();

@@ -7,6 +7,9 @@ use crate::{
     geyser_processor::GeyserProcessor,
     liquidator::Liquidator,
     metrics::{FAILED_LIQUIDATIONS, LIQUIDATION_ATTEMPTS},
+    utils::{
+        integration_account_fetcher::IntegrationAccountFetcher, swb_price_fetcher::SwbPriceFetcher,
+    },
     wrappers::liquidator_account::LiquidatorAccount,
 };
 use log::{error, info};
@@ -26,7 +29,6 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     let wallet_pubkey = Keypair::from_bytes(&config.wallet_keypair)?.pubkey();
     info!("Liquidator public key: {}", wallet_pubkey);
 
-    // Solana Clock
     let clock = {
         let rpc_client = RpcClient::new(config.rpc_url.clone());
         Arc::new(Mutex::new(clock_manager::fetch_clock(&rpc_client)?))
@@ -39,21 +41,21 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     let cache_loader = CacheLoader::new(
         &config.wallet_keypair,
         config.rpc_url.clone(),
-        config.clone().address_lookup_tables,
+        config.luts_group1.clone(),
+        config.luts_group2.clone(),
+        config.luts_group3.clone(),
     )?;
-
     cache_loader.load_cache(&mut cache)?;
 
     let accounts_to_track = get_accounts_to_track(&cache)?;
+    let swb_fetcher_api_url = config.project0_api_url.clone();
+    let swb_fetcher_crossbar_url = config.crossbar_api_url.clone();
+    let integration_fetcher_rpc_url = config.rpc_url.clone();
 
     info!("Initializing services...");
 
-    // GeyserService -> GeyserProcessor
-    // GeyserProcessor -> Liquidator/Rebalancer
-    // Liquidator/Rebalancer -> TransactionManager
     let (geyser_tx, geyser_rx) = crossbeam::channel::unbounded::<GeyserUpdate>();
     let run_liquidation = Arc::new(AtomicBool::new(false));
-
     let cache = Arc::new(cache);
 
     let liquidator_account = Arc::new(LiquidatorAccount::new(
@@ -79,6 +81,11 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         clock.clone(),
     )?;
 
+    let swb_fetcher_cache = cache.clone();
+    let swb_fetcher_stop = stop_liquidator.clone();
+    let integration_fetcher_cache = cache.clone();
+    let integration_fetcher_stop = stop_liquidator.clone();
+
     let geyser_processor = GeyserProcessor::new(
         geyser_rx.clone(),
         run_liquidation.clone(),
@@ -87,6 +94,25 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     )?;
 
     info!("Starting services...");
+
+    thread::spawn(move || {
+        SwbPriceFetcher::new(
+            swb_fetcher_api_url,
+            swb_fetcher_crossbar_url,
+            swb_fetcher_cache,
+            swb_fetcher_stop,
+        )
+        .start();
+    });
+
+    thread::spawn(move || {
+        IntegrationAccountFetcher::new(
+            integration_fetcher_rpc_url,
+            integration_fetcher_cache,
+            integration_fetcher_stop,
+        )
+        .start();
+    });
 
     let cloned_stop = stop_liquidator.clone();
     thread::spawn(move || clock_manager.start(cloned_stop));

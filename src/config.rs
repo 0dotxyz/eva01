@@ -4,7 +4,6 @@ use std::{collections::HashMap, str::FromStr};
 
 #[derive(Clone, Debug)]
 pub struct TokenThresholds {
-    pub declared_value: f64,
     pub min_value: I80F48,
     pub max_value: I80F48,
 }
@@ -17,13 +16,16 @@ pub struct Eva01Config {
     pub wallet_keypair: Vec<u8>,
     pub compute_unit_price_micro_lamports: u64,
     pub marginfi_group_key: Pubkey,
-    pub address_lookup_tables: Vec<Pubkey>,
+    pub luts_group1: Vec<Pubkey>,
+    pub luts_group2: Vec<Pubkey>,
+    pub luts_group3: Vec<Pubkey>,
     pub min_profit: f64,
     pub healthcheck_port: u16,
     pub metrics_bind_addr: String,
     pub metrics_port: u16,
     pub swb_program_id: Pubkey,
     pub crossbar_api_url: Option<String>,
+    pub project0_api_url: Option<String>,
     pub jup_swap_api_url: String,
     pub swap_mint: Pubkey,
     pub slippage_bps: u16,
@@ -61,8 +63,9 @@ impl Eva01Config {
         )
         .expect("Invalid MARGINFI_GROUP_KEY Pubkey");
 
-        let address_lookup_tables: Vec<Pubkey> =
-            parse_pubkey_list("ADDRESS_LOOKUP_TABLES").unwrap_or_else(|_| vec![]);
+        let luts_group1 = parse_pubkey_list("ADDRESS_LOOKUP_TABLES_GROUP1").unwrap_or_default();
+        let luts_group2 = parse_pubkey_list("ADDRESS_LOOKUP_TABLES_GROUP2").unwrap_or_default();
+        let luts_group3 = parse_pubkey_list("ADDRESS_LOOKUP_TABLES_GROUP3").unwrap_or_default();
 
         let min_profit: f64 = std::env::var("MIN_PROFIT")
             .expect("MIN_PROFIT environment variable is not set")
@@ -88,6 +91,7 @@ impl Eva01Config {
         .expect("Invalid SWB_PROGRAM_ID Pubkey");
 
         let crossbar_api_url = std::env::var("CROSSBAR_API_URL").ok();
+        let project0_api_url = std::env::var("PROJECT_0_API_URL").ok();
 
         let jup_swap_api_url = std::env::var("JUP_SWAP_API_URL")
             .expect("JUP_SWAP_API_URL environment variable is not set");
@@ -133,13 +137,16 @@ impl Eva01Config {
             wallet_keypair,
             compute_unit_price_micro_lamports,
             marginfi_group_key,
-            address_lookup_tables,
+            luts_group1,
+            luts_group2,
+            luts_group3,
             min_profit,
             healthcheck_port,
             metrics_bind_addr,
             metrics_port,
             swb_program_id,
             crossbar_api_url,
+            project0_api_url,
             jup_swap_api_url,
             swap_mint,
             slippage_bps,
@@ -169,7 +176,7 @@ pub fn load_token_thresholds_from_env() -> anyhow::Result<HashMap<Pubkey, TokenT
         Ok(s) if !s.trim().is_empty() => {
             let raw: HashMap<String, (f64, f64, f64)> = serde_json::from_str(&s)?;
             let mut out = HashMap::with_capacity(raw.len());
-            for (k, (declared_value, min_threshold, max_threshold)) in raw {
+            for (k, (_declared_value, min_threshold, max_threshold)) in raw {
                 let pk = Pubkey::from_str(&k).map_err(|e| {
                     anyhow::anyhow!("Invalid mint pubkey in TOKEN_THRESHOLDS: {k}: {e}")
                 })?;
@@ -182,7 +189,6 @@ pub fn load_token_thresholds_from_env() -> anyhow::Result<HashMap<Pubkey, TokenT
                 out.insert(
                     pk,
                     TokenThresholds {
-                        declared_value,
                         min_value: I80F48::from_num(min_threshold),
                         max_value: I80F48::from_num(max_threshold),
                     },
@@ -230,7 +236,9 @@ mod tests {
         let yellowstone_x_token = "token";
         let compute_unit_price_micro_lamports = "1000";
         let marginfi_group_key = Pubkey::new_unique().to_string();
-        let address_lookup_tables = Pubkey::new_unique().to_string();
+        let lut_group1 = Pubkey::new_unique().to_string();
+        let lut_group2 = Pubkey::new_unique().to_string();
+        let lut_group3 = Pubkey::new_unique().to_string();
         let min_profit = "0.01";
         let default_token_max_threshold = "10.0";
         let token_dust_threshold = "0.01";
@@ -245,7 +253,9 @@ mod tests {
             compute_unit_price_micro_lamports,
         );
         jail.set_env("MARGINFI_GROUP_KEY", &marginfi_group_key);
-        jail.set_env("ADDRESS_LOOKUP_TABLES", &address_lookup_tables);
+        jail.set_env("ADDRESS_LOOKUP_TABLES_GROUP1", &lut_group1);
+        jail.set_env("ADDRESS_LOOKUP_TABLES_GROUP2", &lut_group2);
+        jail.set_env("ADDRESS_LOOKUP_TABLES_GROUP3", &lut_group3);
         jail.set_env("MIN_PROFIT", min_profit);
         jail.set_env("PORT", healthcheck_port);
         jail.set_env("METRICS_BIND_ADDR", "127.0.0.1");

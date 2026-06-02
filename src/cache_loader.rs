@@ -23,7 +23,7 @@ use solana_sdk::{
 };
 
 use crate::{
-    cache::Cache,
+    cache::{Cache, GroupedLuts},
     drift,
     geyser::AccountType,
     utils::{batch_get_multiple_accounts, BatchLoadingConfig},
@@ -40,11 +40,19 @@ pub struct CacheLoader {
     signer: Keypair,
     rpc_url: String,
     rpc_client: RpcClient,
-    lut_addresses: Vec<Pubkey>,
+    lut_addresses_group1: Vec<Pubkey>,
+    lut_addresses_group2: Vec<Pubkey>,
+    lut_addresses_group3: Vec<Pubkey>,
 }
 
 impl CacheLoader {
-    pub fn new(wallet_keypair: &[u8], rpc_url: String, lut_addresses: Vec<Pubkey>) -> Result<Self> {
+    pub fn new(
+        wallet_keypair: &[u8],
+        rpc_url: String,
+        lut_addresses_group1: Vec<Pubkey>,
+        lut_addresses_group2: Vec<Pubkey>,
+        lut_addresses_group3: Vec<Pubkey>,
+    ) -> Result<Self> {
         let signer = Keypair::from_bytes(wallet_keypair)?;
         let rpc_client = RpcClient::new(&rpc_url);
 
@@ -52,7 +60,9 @@ impl CacheLoader {
             signer,
             rpc_url,
             rpc_client,
-            lut_addresses,
+            lut_addresses_group1,
+            lut_addresses_group2,
+            lut_addresses_group3,
         })
     }
 
@@ -76,30 +86,59 @@ impl CacheLoader {
     fn load_luts(&self, cache: &mut Cache) -> anyhow::Result<()> {
         info!("Loading LUTs.");
 
-        let lut_accounts = self.rpc_client.get_multiple_accounts(&self.lut_addresses)?;
+        let group1 = self.load_lut_vec(&self.lut_addresses_group1, "group1")?;
+        let group2 = self.load_lut_vec(&self.lut_addresses_group2, "group2")?;
+        let group3 = self.load_lut_vec(&self.lut_addresses_group3, "group3")?;
 
-        let luts: Vec<AddressLookupTableAccount> = self
-            .lut_addresses
+        info!(
+            "Loaded LUTs: group1={}, group2={}, group3={}",
+            group1.len(),
+            group2.len(),
+            group3.len()
+        );
+
+        *cache.luts.lock().unwrap() = GroupedLuts {
+            group1,
+            group2,
+            group3,
+            overflow: vec![],
+            deactivating: vec![],
+        };
+
+        Ok(())
+    }
+
+    fn load_lut_vec(
+        &self,
+        addresses: &[Pubkey],
+        label: &str,
+    ) -> anyhow::Result<Vec<AddressLookupTableAccount>> {
+        if addresses.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let lut_accounts = self.rpc_client.get_multiple_accounts(addresses)?;
+
+        addresses
             .iter()
-            .zip(lut_accounts.into_iter())
+            .zip(lut_accounts)
             .map(|(lut_address, lut_account_opt)| {
                 let lut_account = lut_account_opt
-                    .ok_or_else(|| anyhow!("Failed to find the {} LUT.", lut_address))?;
+                    .ok_or_else(|| anyhow!("Failed to find {} LUT {}.", label, lut_address))?;
                 let lut = AddressLookupTable::deserialize(&lut_account.data).map_err(|e| {
-                    anyhow!("Failed to deserialize the {} LUT : {:?}", lut_address, e)
+                    anyhow!(
+                        "Failed to deserialize {} LUT {}: {:?}",
+                        label,
+                        lut_address,
+                        e
+                    )
                 })?;
                 Ok(AddressLookupTableAccount {
                     key: *lut_address,
                     addresses: lut.addresses.to_vec(),
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        luts.into_iter().for_each(|lut| cache.add_lut(lut));
-
-        info!("Loaded {} LUTs.", &cache.luts.lock().unwrap().len());
-
-        Ok(())
+            .collect()
     }
 
     fn load_marginfi_accounts(&self, cache: &mut Cache) -> anyhow::Result<()> {
@@ -442,8 +481,11 @@ impl CacheLoader {
 pub fn get_accounts_to_track(cache: &Cache) -> Result<HashMap<Pubkey, AccountType>> {
     let mut accounts: HashMap<Pubkey, AccountType> = HashMap::new();
 
+    let swb_oracles = cache.banks.get_swb_oracles();
     for oracle_pk in cache.oracles.try_get_addresses()? {
-        accounts.insert(oracle_pk, AccountType::Oracle);
+        if !swb_oracles.contains(&oracle_pk) {
+            accounts.insert(oracle_pk, AccountType::Oracle);
+        }
     }
 
     for token in cache.mints.get_tokens() {

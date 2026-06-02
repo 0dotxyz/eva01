@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use anchor_lang::{Id, InstructionData, ToAccountMetas};
 
 use marginfi_type_crate::pdas::derive_drift_state;
@@ -11,7 +9,6 @@ pub fn make_refresh_spot_market_ix(
     spot_market: Pubkey,
     spot_market_vault: Pubkey,
     oracle: Pubkey,
-    participating_accounts: &mut HashSet<Pubkey>,
 ) -> Instruction {
     let accounts = drift::accounts::UpdateSpotMarketCumulativeInterest {
         state: derive_drift_state().0,
@@ -20,8 +17,6 @@ pub fn make_refresh_spot_market_ix(
         spot_market_vault,
     }
     .to_account_metas(None);
-
-    participating_accounts.extend(accounts.iter().map(|a| a.pubkey));
 
     Instruction {
         program_id: Drift::id(),

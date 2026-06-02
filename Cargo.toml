@@ -37,6 +37,7 @@ log = "0.4.29"
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 bincode = "1.3.3"
 base64 = "0.22.1"
 tokio = { version = "1.50.0", features = ["rt", "macros"] }
@@ -53,6 +54,7 @@ yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", 
 # Includes a fix to the way results are parsed.
 switchboard-on-demand-client = { git = "https://github.com/switchboard-xyz/switchboard-sdk", branch = "main" }
 solana-dex-superagg = { git = "https://github.com/0dotxyz/solana-dex-superagg", rev = "3ab0b4f4de424a0044e983576d113e3b349b3d94" }
+rust_decimal = "1.42.0"
 
 [dependencies.marginfi_type_crate]
 git = "https://github.com/mrgnlabs/marginfi-v2"

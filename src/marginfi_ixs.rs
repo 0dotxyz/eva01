@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use anchor_lang::{Id, InstructionData, Key, ToAccountMetas};
 
 use anchor_spl::{associated_token, token_2022};
@@ -68,7 +66,6 @@ pub fn make_start_liquidate_ix(
     liquidation_record: Pubkey,
     observation_accounts: &[Pubkey],
     banks: &[Pubkey],
-    participating_accounts: &mut HashSet<Pubkey>,
 ) -> Instruction {
     let mut accounts = marginfi::accounts::StartLiquidation {
         marginfi_account: liquidatee_account,
@@ -86,8 +83,6 @@ pub fn make_start_liquidate_ix(
             AccountMeta::new_readonly(a.key(), false)
         }
     }));
-
-    participating_accounts.extend(accounts.iter().map(|a| a.pubkey));
 
     Instruction {
         program_id: marginfi_type_crate::ID,
@@ -138,7 +133,6 @@ pub fn make_repay_ix(
     mint_wrapper: &MintWrapper,
     amount: u64,
     repay_all: bool,
-    participating_accounts: &mut HashSet<Pubkey>,
 ) -> Instruction {
     let mut accounts = marginfi::accounts::LendingAccountRepay {
         marginfi_account,
@@ -152,8 +146,6 @@ pub fn make_repay_ix(
     .to_account_metas(None);
     maybe_add_bank_mint(&mut accounts, bank.bank.mint, &mint_wrapper.account.owner);
     mark_signer(&mut accounts, signer);
-
-    participating_accounts.extend(accounts.iter().map(|a| a.pubkey));
 
     Instruction {
         program_id: marginfi_type_crate::ID,
@@ -176,7 +168,6 @@ pub fn make_withdraw_ix(
     observation_accounts: &[Pubkey],
     amount: u64,
     withdraw_all: bool,
-    participating_accounts: Option<&mut HashSet<Pubkey>>,
 ) -> Instruction {
     let mut accounts = marginfi::accounts::LendingAccountWithdraw {
         marginfi_account,
@@ -206,10 +197,6 @@ pub fn make_withdraw_ix(
             .map(|a| AccountMeta::new_readonly(a.key(), false)),
     );
 
-    if let Some(participating_accounts) = participating_accounts {
-        participating_accounts.extend(accounts.iter().map(|a| a.pubkey));
-    }
-
     Instruction {
         program_id: marginfi_type_crate::ID,
         accounts,
@@ -228,7 +215,6 @@ pub fn make_end_liquidate_ix(
     fee_state: Pubkey,
     global_fee_wallet: Pubkey,
     banks: &[Pubkey],
-    participating_accounts: &mut HashSet<Pubkey>,
 ) -> Instruction {
     let mut accounts = marginfi::accounts::EndLiquidation {
         marginfi_account: liquidatee_account,
@@ -242,8 +228,6 @@ pub fn make_end_liquidate_ix(
     mark_signer(&mut accounts, liquidator_account);
 
     accounts.extend(banks.iter().map(|a| AccountMeta::new(a.key(), false)));
-
-    participating_accounts.extend(accounts.iter().map(|a| a.pubkey));
 
     Instruction {
         program_id: marginfi_type_crate::ID,
@@ -337,7 +321,6 @@ pub fn make_kamino_withdraw_ix(
     remaining: &[Pubkey],
     amount: u64,
     withdraw_all: bool,
-    participating_accounts: &mut HashSet<Pubkey>,
 ) -> Instruction {
     let (reserve_farm_state, obligation_farm_user_state) =
         if kamino_reserve.reserve.farm_collateral == Pubkey::default() {
@@ -391,8 +374,6 @@ pub fn make_kamino_withdraw_ix(
             .map(|a| AccountMeta::new_readonly(*a, false)),
     );
 
-    participating_accounts.extend(accounts.iter().map(|a| a.pubkey));
-
     Instruction {
         program_id: marginfi_type_crate::ID,
         accounts,
@@ -417,7 +398,6 @@ pub fn make_drift_withdraw_ix(
     remaining: &[Pubkey],
     amount: u64,
     withdraw_all: bool,
-    participating_accounts: &mut HashSet<Pubkey>,
 ) -> Instruction {
     let drift_oracle = if bank.bank.mint
         == Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
@@ -478,8 +458,6 @@ pub fn make_drift_withdraw_ix(
             .map(|a| AccountMeta::new_readonly(*a, false)),
     );
 
-    participating_accounts.extend(accounts.iter().map(|a| a.pubkey));
-
     Instruction {
         program_id: marginfi_type_crate::ID,
         accounts,
@@ -502,7 +480,6 @@ pub fn make_juplend_withdraw_ix(
     remaining: &[Pubkey],
     amount: u64,
     withdraw_all: bool,
-    participating_accounts: &mut HashSet<Pubkey>,
 ) -> Instruction {
     let mut accounts = marginfi::accounts::JuplendWithdraw {
         group,
@@ -541,8 +518,6 @@ pub fn make_juplend_withdraw_ix(
             .iter()
             .map(|a| AccountMeta::new_readonly(*a, false)),
     );
-
-    participating_accounts.extend(accounts.iter().map(|a| a.pubkey));
 
     Instruction {
         program_id: marginfi_type_crate::ID,
