@@ -440,11 +440,11 @@ impl Liquidator {
         let all = asset_weight_maint - liab_weight_maint * liquidation_discount;
 
         if all >= I80F48::ZERO {
-            debug!("Account {:?} has no liquidatable amount: {:?}, asset_weight_maint: {:?}, liab_weight_maint: {:?}", account.address, all, asset_weight_maint, liab_weight_maint);
+            warn!("Account {:?} has no liquidatable amount: {:?}, asset_weight_maint: {:?}, liab_weight_maint: {:?}", account.address, all, asset_weight_maint, liab_weight_maint);
             return Ok(LiquidationAmounts::none());
         }
 
-        let underwater_maint_value =
+        let underwater_value =
             maintenance_health / (asset_weight_maint - liab_weight_maint * liquidation_discount);
 
         let (asset_amount, _) = account.get_balance_for_bank(asset_bank_wrapper)?;
@@ -454,17 +454,17 @@ impl Liquidator {
             &asset_oracle_wrapper,
             asset_amount,
             BalanceSide::Assets,
-            RequirementType::Maintenance,
+            RequirementType::Equity,
         )?;
 
         let liab_value = liab_bank_wrapper.calc_value(
             &liab_oracle_wrapper,
             liab_amount,
             BalanceSide::Liabilities,
-            RequirementType::Maintenance,
+            RequirementType::Equity,
         )?;
 
-        let max_liquidatable_value = min(min(asset_value, liab_value), underwater_maint_value);
+        let max_liquidatable_value = min(min(asset_value, liab_value), underwater_value);
         let liquidator_profit = max_liquidatable_value
             .checked_mul(I80F48::from_num(PROFIT_SHARE))
             .unwrap();
@@ -477,14 +477,14 @@ impl Liquidator {
             &asset_oracle_wrapper,
             max_liquidatable_value,
             BalanceSide::Assets,
-            RequirementType::Maintenance,
+            RequirementType::Equity,
         )?;
 
         let max_liquidatable_liab_amount = liab_bank_wrapper.calc_amount(
             &liab_oracle_wrapper,
             max_liquidatable_value,
             BalanceSide::Liabilities,
-            RequirementType::Maintenance,
+            RequirementType::Equity,
         )?;
 
         let dust_liab_threshold = liab_bank_wrapper.calc_amount(

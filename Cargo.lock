@@ -7401,7 +7401,7 @@ dependencies = [
 [[package]]
 name = "switchboard-on-demand-client"
 version = "0.5.1"
-source = "git+https://github.com/switchboard-xyz/switchboard-sdk?branch=main#7fce771e8af381058e69d8911c777e93dc20c81c"
+source = "git+https://github.com/switchboard-xyz/switchboard-sdk?rev=f1a570a65476d6d040bee1bd2d223c2c775ac2b6#f1a570a65476d6d040bee1bd2d223c2c775ac2b6"
 dependencies = [
  "anyhow_ext",
  "arrayref",
