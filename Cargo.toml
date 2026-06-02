@@ -54,6 +54,7 @@ yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", 
 # Includes a fix to the way results are parsed.
 switchboard-on-demand-client = { git = "https://github.com/switchboard-xyz/switchboard-sdk", branch = "main" }
 solana-dex-superagg = { git = "https://github.com/0dotxyz/solana-dex-superagg", rev = "3ab0b4f4de424a0044e983576d113e3b349b3d94" }
+rust_decimal = "1.42.0"
 
 [dependencies.marginfi_type_crate]
 git = "https://github.com/mrgnlabs/marginfi-v2"

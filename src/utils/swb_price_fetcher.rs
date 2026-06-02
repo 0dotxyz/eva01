@@ -14,6 +14,7 @@ use fixed::types::I80F48;
 use log::{debug, info, warn};
 use marginfi_type_crate::types::OracleSetup;
 use reqwest::blocking::Client;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Deserializer};
 use solana_sdk::{account::Account, genesis_config::ClusterType, pubkey, pubkey::Pubkey};
 use switchboard_on_demand_client::{CrossbarClient, PullFeedAccountData};
@@ -218,14 +219,16 @@ impl SwbPriceFetcher {
                 continue;
             };
 
-            let price: f64 = result.to_string().parse()?;
+            let price: f64 = result
+                .to_f64()
+                .ok_or_else(|| anyhow::anyhow!("Decimal overflow converting price to f64"))?;
 
             // Half-range across oracle submissions as confidence interval
             let valid: Vec<f64> = response
                 .results
                 .iter()
-                .filter_map(|opt| opt.as_ref())
-                .filter_map(|d| d.to_string().parse::<f64>().ok())
+                .filter_map(|opt| *opt)
+                .filter_map(|d| d.to_f64())
                 .collect();
             let conf = if valid.len() > 1 {
                 let max = valid.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
