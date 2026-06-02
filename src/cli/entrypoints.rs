@@ -4,7 +4,6 @@ use crate::{
     clock_manager::{self, ClockManager},
     config::Eva01Config,
     geyser::{GeyserService, GeyserUpdate},
-    geyser_processor::GeyserProcessor,
     liquidator::Liquidator,
     metrics::{FAILED_LIQUIDATIONS, LIQUIDATION_ATTEMPTS},
     utils::{
@@ -55,7 +54,6 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     info!("Initializing services...");
 
     let (geyser_tx, geyser_rx) = crossbeam::channel::unbounded::<GeyserUpdate>();
-    let run_liquidation = Arc::new(AtomicBool::new(false));
     let cache = Arc::new(cache);
 
     let liquidator_account = Arc::new(LiquidatorAccount::new(
@@ -68,7 +66,7 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     let mut liquidator = Liquidator::new(
         config.clone(),
         liquidator_account.clone(),
-        run_liquidation.clone(),
+        geyser_rx,
         stop_liquidator.clone(),
         cache.clone(),
     )?;
@@ -84,13 +82,6 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     let swb_fetcher_stop = stop_liquidator.clone();
     let integration_fetcher_cache = cache.clone();
     let integration_fetcher_stop = stop_liquidator.clone();
-
-    let geyser_processor = GeyserProcessor::new(
-        geyser_rx.clone(),
-        run_liquidation.clone(),
-        stop_liquidator.clone(),
-        cache,
-    )?;
 
     info!("Starting services...");
 
@@ -120,13 +111,6 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         if let Err(e) = liquidator.start() {
             error!("The Liquidator service failed! {:?}", e);
             panic!("Fatal error in the Liquidator service!");
-        }
-    });
-
-    thread::spawn(move || {
-        if let Err(e) = geyser_processor.start() {
-            error!("GeyserProcessor failed! {:?}", e);
-            panic!("Fatal error in GeyserProcessor!");
         }
     });
 

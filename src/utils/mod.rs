@@ -236,6 +236,7 @@ pub fn log_genuine_error(prefix: &str, error: Error) {
     }
 }
 
+// TODO: do not require marginfi_account?
 pub fn marginfi_account_by_authority(
     authority: Pubkey,
     rpc_client: &RpcClient,

@@ -5,6 +5,7 @@ use prometheus::{
     TextEncoder,
 };
 
+// TODO: revisit metrics, some of them are not that useful anymore
 lazy_static! {
     pub static ref REGISTRY: Registry =
         Registry::new_custom(Some("eva01".to_string()), None).expect("init registry");
@@ -31,10 +32,6 @@ lazy_static! {
     pub static ref GEYSER_UPDATES_TOTAL: Counter = register_counter(Opts::new(
         "eva01_geyser_updates_total",
         "Total number of Yellowstone Geyser updates processed"
-    ));
-    pub static ref GEYSER_TRIGGERED_SCANS_TOTAL: Counter = register_counter(Opts::new(
-        "eva01_geyser_triggered_scans_total",
-        "Total number of Geyser updates that triggered a liquidation scan"
     ));
     pub static ref LIQUIDATION_SUCCESSES: Counter = register_counter(Opts::new(
         "eva01_liquidations_succeeded_total",

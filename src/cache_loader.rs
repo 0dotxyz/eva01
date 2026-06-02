@@ -260,7 +260,7 @@ impl CacheLoader {
             let mut data = bank_account.data.as_slice();
             let bank = Bank::try_deserialize(&mut data)
                 .map_err(|e| anyhow!("Failed to deserialize Bank {}: {:?}", bank_address, e))?;
-            cache.banks.insert(bank_address, bank, bank_account)?;
+            cache.banks.try_insert(bank_address, bank, bank_account)?;
             debug!("Loaded the Bank {:?}.", bank_address);
         }
 

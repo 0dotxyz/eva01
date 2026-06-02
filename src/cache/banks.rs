@@ -25,7 +25,7 @@ pub struct BanksCache {
 }
 
 impl BanksCache {
-    pub fn insert(&self, bank_address: Pubkey, bank: Bank, account: Account) -> Result<()> {
+    pub fn try_insert(&self, bank_address: Pubkey, bank: Bank, account: Account) -> Result<()> {
         let mut inner = self
             .inner
             .write()
