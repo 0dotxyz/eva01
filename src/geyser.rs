@@ -4,7 +4,7 @@ use anyhow::Result;
 use crossbeam::channel::Sender;
 use futures::StreamExt;
 use log::{error, info, warn};
-use marginfi_type_crate::types::MarginfiAccount;
+use marginfi_type_crate::types::{Bank, MarginfiAccount};
 use solana_program::pubkey::Pubkey;
 use solana_sdk::account::Account;
 use std::{
@@ -31,15 +31,11 @@ pub struct GeyserUpdate {
     pub account: Account,
 }
 
-/// Types of subscribed accounts, easier to distribute
-/// OracleAccount -> Rebalancer and liquidator
-/// MarginfiAccount -> Rebalaner and liquidator (Should be moved, so the only account
-///                    sended to rebalancer is the liquidator account)
-/// TokenAccount -> Rebalancer
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum AccountType {
     Oracle,
     Marginfi,
+    Bank,
     Token,
 }
 
@@ -214,19 +210,25 @@ impl GeyserService {
                             if account.owner == marginfi_type_crate::ID
                                 && account_update.data.len() == MARGIN_ACCOUNT_SIZE
                             {
-                                let marginfi_account = ward!(
-                                    MarginfiAccount::try_deserialize(&mut account.data.as_slice())
-                                        .ok(),
-                                    continue
-                                );
-
-                                if marginfi_account.group != self.marginfi_group_pk {
-                                    continue;
+                                if let Ok(marginfi_account) = MarginfiAccount::try_deserialize(
+                                    &mut account.data.clone().as_slice(),
+                                ) {
+                                    if marginfi_account.group != self.marginfi_group_pk {
+                                        continue;
+                                    }
+                                    self.send_update(AccountType::Marginfi, address, &account);
                                 }
 
-                                self.send_update(AccountType::Marginfi, address, &account);
+                                if let Ok(bank) =
+                                    Bank::try_deserialize(&mut account.data.as_slice())
+                                {
+                                    if bank.group != self.marginfi_group_pk {
+                                        continue;
+                                    }
+                                    self.send_update(AccountType::Bank, address, &account);
+                                }
                             } else if let Some(account_type) = self.tracked_accounts.get(&address) {
-                                self.send_update(account_type.clone(), address, &account);
+                                self.send_update(*account_type, address, &account);
                             }
                         }
                     }
