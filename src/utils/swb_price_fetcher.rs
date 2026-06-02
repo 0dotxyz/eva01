@@ -67,6 +67,20 @@ struct ViewPriceEntry {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OraclePriceDto {
+    /// Integration-adjusted final price (raw feed price * integration ratio). For banks that share
+    /// a Switchboard feed across multiple LSTs (KaminoSwitchboardPull / JuplendSwitchboardPull),
+    /// this differs per-bank and must NOT be written into the shared oracle account.
+    price_realtime: PriceWithConfidenceDto,
+    /// Raw underlying feed price BEFORE the integration ratio is applied. Present only for
+    /// integration banks. This is what the on-chain Switchboard feed account actually holds; the
+    /// program re-applies the per-bank exchange rate on read. All banks sharing a feed report the
+    /// same `sourcePrice`, so writing it is collision-free.
+    source_price: Option<SourcePriceDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourcePriceDto {
     price_realtime: PriceWithConfidenceDto,
 }
 
@@ -163,8 +177,19 @@ impl SwbPriceFetcher {
                 anyhow::anyhow!("Invalid bank pubkey '{bank_addr_str}' in /v0/realprice: {e}")
             })?;
 
-            let price_rt = I80F48::from_num(entry.oracle_price.price_realtime.price);
-            let conf_rt = I80F48::from_num(entry.oracle_price.price_realtime.confidence);
+            // Write the RAW underlying feed price to the (potentially shared) Switchboard oracle
+            // account. For integration banks (KaminoSwitchboardPull / JuplendSwitchboardPull) the
+            // program re-applies the per-bank exchange rate on read, so writing the integration-
+            // adjusted `price_realtime` here would both double-count and clobber every other bank
+            // that shares the same feed. `source_price` is identical across all banks on a feed.
+            let raw = entry
+                .oracle_price
+                .source_price
+                .as_ref()
+                .map(|sp| &sp.price_realtime)
+                .unwrap_or(&entry.oracle_price.price_realtime);
+            let price_rt = I80F48::from_num(raw.price);
+            let conf_rt = I80F48::from_num(raw.confidence);
             if let Ok(bank) = self.cache.banks.try_get_bank(&bank_address) {
                 if matches!(
                     bank.bank.config.oracle_setup,
