@@ -531,7 +531,7 @@ impl LiquidatorAccount {
             Err(err) => {
                 if is_tx_too_large_client(&err) {
                     warn!("The liquidation tx was too large: adding the observation accounts to a LUT and retrying");
-                    match self.retry_with_new_luts(ixs) {
+                    match self.retry_with_targeted_lut(ixs) {
                         Ok(signature) => {
                             info!(
                                 "Liquidation tx for the Account {} was confirmed. Signature: {}",
@@ -560,7 +560,7 @@ impl LiquidatorAccount {
         }
     }
 
-    fn retry_with_new_luts(&self, ixs: Vec<Instruction>) -> Result<Signature> {
+    fn retry_with_targeted_lut(&self, ixs: Vec<Instruction>) -> Result<Signature> {
         self.cache
             .try_close_deactivated_luts(&self.rpc_client, &self.signer);
 
@@ -571,14 +571,13 @@ impl LiquidatorAccount {
             .into_iter()
             .collect();
 
-        let targeted_lut =
-            self.cache
-                .create_targeted_lut(&self.rpc_client, &self.signer, all_accounts)?;
-        let lut_key = targeted_lut.key;
-        let luts = vec![targeted_lut];
+        let lut = self
+            .cache
+            .get_targeted_lut(&self.rpc_client, &self.signer, all_accounts)?;
+        let lut_key = lut.key;
 
         let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
-        let msg = Message::try_compile(&self.signer.pubkey(), &ixs, &luts, recent_blockhash)?;
+        let msg = Message::try_compile(&self.signer.pubkey(), &ixs, &[lut], recent_blockhash)?;
         let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])?;
 
         let result = self
@@ -595,7 +594,7 @@ impl LiquidatorAccount {
 
         if let Err(e) = self
             .cache
-            .deactivate_targeted_lut(&self.rpc_client, &self.signer, lut_key)
+            .deactivate_targeted_lut(&self.rpc_client, &self.signer)
         {
             warn!("Failed to deactivate targeted LUT {lut_key}: {e}");
         }
@@ -844,14 +843,9 @@ mod tests {
     use super::*;
 
     fn contains_stale_oracles(stale_oracles: &HashSet<Pubkey>, account_oracles: &[Pubkey]) -> bool {
-        if let Some(oracle) = account_oracles
+        account_oracles
             .iter()
-            .find(|oracle| stale_oracles.contains(*oracle))
-        {
-            true
-        } else {
-            false
-        }
+            .any(|oracle| stale_oracles.contains(oracle))
     }
 
     #[test]

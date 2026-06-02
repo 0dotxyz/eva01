@@ -44,9 +44,8 @@ pub struct GroupedLuts {
     pub group1: Vec<AddressLookupTableAccount>,
     pub group2: Vec<AddressLookupTableAccount>,
     pub group3: Vec<AddressLookupTableAccount>,
-    /// On-the-fly LUTs created during retry_with_new_luts for edge-case liquidations.
-    /// Persists across liquidations so the same edge case doesn't re-trigger creation.
-    pub overflow: Vec<AddressLookupTableAccount>,
+    /// On-the-fly LUT created during retry_with_targeted_lut for edge-case liquidations.
+    pub targeted: Option<AddressLookupTableAccount>,
     /// LUTs pending closure: (address, slot at which deactivation was sent).
     /// Closeable after 512-slot cooldown.
     pub deactivating: Vec<(Pubkey, u64)>,
@@ -57,7 +56,6 @@ impl GroupedLuts {
     /// - group1 included if any tag is DEFAULT(0) or SOL(1)
     /// - group2 included if any tag is SOL(1) or STAKED(2)
     /// - group3 included if any tag >= 3 (integration protocol)
-    /// - overflow always included
     pub fn select_for_tags(&self, tags: &[u8]) -> Vec<AddressLookupTableAccount> {
         let has_staked = tags.iter().any(|&t| t == ASSET_TAG_STAKED);
         let needs_group1 = !has_staked
@@ -79,7 +77,6 @@ impl GroupedLuts {
         if needs_group3 {
             result.extend_from_slice(&self.group3);
         }
-        result.extend_from_slice(&self.overflow);
         result
     }
 }
@@ -207,17 +204,26 @@ impl Cache {
         })
     }
 
-    /// Creates a single targeted LUT containing exactly `accounts`, adds it to overflow,
+    /// Creates (or re-uses the pre-existing one, if, for some reason, it was not deactivated)
+    /// a single targeted LUT containing exactly `accounts`, adds it to overflow,
     /// and returns it. Used by the tx-too-large retry path so the retry uses only this
     /// one tight LUT with no unrelated group-LUT header overhead.
-    pub fn create_targeted_lut(
+    pub fn get_targeted_lut(
         &self,
         rpc_client: &RpcClient,
         signer_keypair: &Keypair,
         accounts: Vec<Pubkey>,
     ) -> anyhow::Result<AddressLookupTableAccount> {
-        let lut = create_lut(rpc_client, signer_keypair, accounts)?;
-        self.luts.lock().unwrap().overflow.push(lut.clone());
+        let lut = if let Some(lut) = self.luts.lock().unwrap().targeted.take() {
+            let updated_addresses = extend_lut(rpc_client, signer_keypair, lut.key, accounts)?;
+            AddressLookupTableAccount {
+                key: lut.key,
+                addresses: updated_addresses,
+            }
+        } else {
+            create_lut(rpc_client, signer_keypair, accounts)?
+        };
+        let _ = self.luts.lock().unwrap().targeted.insert(lut.clone());
         Ok(lut)
     }
 
@@ -227,8 +233,9 @@ impl Cache {
         &self,
         rpc_client: &RpcClient,
         signer_keypair: &Keypair,
-        lut_key: Pubkey,
     ) -> anyhow::Result<()> {
+        let lut_key = self.luts.lock().unwrap().targeted.as_ref().unwrap().key;
+
         let ix = address_lookup_table::instruction::deactivate_lookup_table(
             lut_key,
             signer_keypair.pubkey(),
@@ -251,7 +258,7 @@ impl Cache {
 
         let slot = rpc_client.get_slot_with_commitment(CommitmentConfig::confirmed())?;
         let mut luts = self.luts.lock().unwrap();
-        luts.overflow.retain(|l| l.key != lut_key);
+        luts.targeted.take().unwrap();
         luts.deactivating.push((lut_key, slot));
         Ok(())
     }

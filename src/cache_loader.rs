@@ -101,7 +101,7 @@ impl CacheLoader {
             group1,
             group2,
             group3,
-            overflow: vec![],
+            targeted: None,
             deactivating: vec![],
         };
 
