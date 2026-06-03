@@ -1,4 +1,4 @@
-use crate::{config::Eva01Config, metrics::ERROR_COUNT, utils::account_update_to_account, ward};
+use crate::{config::Eva01Config, utils::account_update_to_account, ward};
 use anchor_lang::AccountDeserialize;
 use anyhow::Result;
 use crossbeam::channel::Sender;
@@ -13,14 +13,13 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::runtime::{Builder, Runtime};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::prelude::*;
 
 const RATE_LIMIT_LOG_INTERVAL_SECS: u64 = 60;
-const MAX_ERRORS_PER_MINUTE: u64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct GeyserUpdate {
@@ -37,82 +36,33 @@ pub enum AccountType {
     Token,
 }
 
-/// Rate-limited logger that logs messages at most once per minute.
-/// Tracks error count per minute and returns true if the error rate exceeds the threshold.
+/// Rate-limited logger that logs messages at most once per interval.
 struct RateLimitedLogger {
-    // Tracks the last minute bucket we logged for (None = never logged)
-    last_logged_minute: Arc<Mutex<Option<u64>>>,
-    // Tracks errors per minute bucket: (minute_bucket, error_count)
-    error_tracker: Arc<Mutex<(u64, u64)>>,
+    last_logged_at: Mutex<Option<Instant>>,
 }
 
 impl RateLimitedLogger {
     fn new() -> Self {
         Self {
-            last_logged_minute: Arc::new(Mutex::new(None)),
-            error_tracker: Arc::new(Mutex::new((0, 0))),
+            last_logged_at: Mutex::new(None),
         }
     }
 
-    /// Logs the error message if enough time has passed since the last log.
-    /// Tracks errors per minute and returns true if we should break the connection
-    /// (more than MAX_ERRORS_PER_MINUTE errors in a minute).
-    fn log_error_and_check_break(&self, message: &str) -> bool {
-        // Increment error counter for metrics
-        ERROR_COUNT.inc();
-
-        // Calculate current minute bucket (seconds since epoch / 60)
-        let current_minute_bucket = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            / RATE_LIMIT_LOG_INTERVAL_SECS;
-
-        // Update error count for current minute and check threshold
-        let (should_break, error_count) = {
-            let mut tracker = self.error_tracker.lock().unwrap();
-            let (minute_bucket, error_count) = *tracker;
-
-            // If we're in a new minute, reset the counter
-            let error_count = if minute_bucket != current_minute_bucket {
-                *tracker = (current_minute_bucket, 1);
-                1
-            } else {
-                *tracker = (minute_bucket, error_count + 1);
-                error_count + 1
-            };
-
-            let should_break = error_count > MAX_ERRORS_PER_MINUTE;
-            (should_break, error_count)
-        };
-
-        // Check if we should log (rate-limited to once per minute bucket)
-        // Log when we enter a new minute bucket, or immediately on first error
-        let should_log = {
-            let mut last_logged_minute = self.last_logged_minute.lock().unwrap();
-
-            let should_log = match *last_logged_minute {
-                Some(last_minute) => current_minute_bucket != last_minute,
-                None => true, // First log: log immediately
-            };
-
-            if should_log {
-                *last_logged_minute = Some(current_minute_bucket);
-                true
-            } else {
-                false
+    fn warn(&self, message: &str) {
+        let now = Instant::now();
+        let mut last_logged_at = self.last_logged_at.lock().unwrap();
+        let should_log = match *last_logged_at {
+            Some(last_logged_at) => {
+                now.duration_since(last_logged_at)
+                    >= Duration::from_secs(RATE_LIMIT_LOG_INTERVAL_SECS)
             }
+            None => true,
         };
 
         if should_log {
-            if error_count > 1 {
-                warn!("{} ({} errors in the current minute)", message, error_count);
-            } else {
-                warn!("{}", message);
-            }
+            warn!("{}", message);
+            *last_logged_at = Some(now);
         }
-
-        should_break
     }
 }
 
@@ -225,20 +175,12 @@ impl GeyserService {
                         }
                     }
                     Err(error) => {
-                        // Log with rate limiting and check if we should break
-                        let should_break = self.error_logger.log_error_and_check_break(&format!(
+                        self.error_logger.warn(&format!(
                             "Received error message from Geyser, reconnecting: {:?}",
                             error
                         ));
 
-                        // Break the inner loop to force reconnection
-                        // The outer loop will reconnect automatically
-                        if should_break {
-                            warn!(
-                                "Too many errors (>{}) in one minute, forcing reconnection",
-                                MAX_ERRORS_PER_MINUTE
-                            );
-                        }
+                        // Break the inner loop so the outer loop reconnects.
                         break;
                     }
                 }

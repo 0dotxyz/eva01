@@ -5,10 +5,8 @@ use std::{
 
 use crate::{
     config::Eva01Config,
-    metrics::server::MetricsServer,
     utils::healthcheck::{HealthCheckServer, HealthState},
 };
-use log::error;
 
 pub mod entrypoints;
 
@@ -24,17 +22,6 @@ pub fn main_entry(stop: Arc<AtomicBool>) -> anyhow::Result<()> {
     let healthcheck_server =
         HealthCheckServer::new(config.healthcheck_port, health_state.clone(), stop.clone());
     thread::spawn(move || healthcheck_server.start());
-
-    let metrics_server = MetricsServer::new(
-        config.metrics_bind_addr.clone(),
-        config.metrics_port,
-        stop.clone(),
-    );
-    thread::spawn(move || {
-        if let Err(err) = metrics_server.start() {
-            error!("Metrics server stopped unexpectedly: {:?}", err);
-        }
-    });
 
     *health_state
         .lock()

@@ -21,8 +21,6 @@ pub struct Eva01Config {
     pub luts_group3: Vec<Pubkey>,
     pub min_profit: f64,
     pub healthcheck_port: u16,
-    pub metrics_bind_addr: String,
-    pub metrics_port: u16,
     pub swb_program_id: Pubkey,
     pub crossbar_api_url: Option<String>,
     pub project0_api_url: Option<String>,
@@ -77,13 +75,6 @@ impl Eva01Config {
             .unwrap_or("3000".to_string())
             .parse()
             .expect("Invalid PORT number");
-
-        let metrics_bind_addr =
-            std::env::var("METRICS_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0".to_string());
-        let metrics_port: u16 = std::env::var("METRICS_PORT")
-            .expect("METRICS_PORT environment variable is not set")
-            .parse()
-            .expect("Invalid METRICS_PORT number");
 
         let swb_program_id = Pubkey::from_str(
             &std::env::var("SWB_PROGRAM_ID")
@@ -145,8 +136,6 @@ impl Eva01Config {
             luts_group3,
             min_profit,
             healthcheck_port,
-            metrics_bind_addr,
-            metrics_port,
             swb_program_id,
             crossbar_api_url,
             project0_api_url,
@@ -246,7 +235,6 @@ mod tests {
         let min_profit = "0.01";
         let default_token_max_threshold = "10.0";
         let token_dust_threshold = "0.01";
-        let metrics_port = "9898";
         let healthcheck_port = "3000";
 
         jail.set_env("YELLOWSTONE_ENDPOINT", yellowstone_endpoint);
@@ -262,8 +250,6 @@ mod tests {
         jail.set_env("ADDRESS_LOOKUP_TABLES_GROUP3", &lut_group3);
         jail.set_env("MIN_PROFIT", min_profit);
         jail.set_env("PORT", healthcheck_port);
-        jail.set_env("METRICS_BIND_ADDR", "127.0.0.1");
-        jail.set_env("METRICS_PORT", metrics_port);
         jail.set_env("DEFAULT_TOKEN_MAX_THRESHOLD", default_token_max_threshold);
         jail.set_env("TOKEN_DUST_THRESHOLD", token_dust_threshold);
     }
