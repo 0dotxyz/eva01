@@ -12,12 +12,13 @@ use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{debug, error, info, warn};
 use solana_client::client_error::ClientError;
+use solana_commitment_config::CommitmentLevel;
 use solana_dex_superagg::{
     client::DexSuperAggClient,
     config::{ClientConfig, JupiterConfig, RoutingStrategy, SharedConfig, TitanConfig},
 };
 use solana_program::pubkey::Pubkey;
-use solana_sdk::{account::ReadableAccount, commitment_config::CommitmentLevel};
+use solana_sdk::account::ReadableAccount;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,

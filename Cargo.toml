@@ -8,58 +8,67 @@ default = ["network-mainnet"]
 pretty_logs = []
 network-mainnet = ["marginfi/mainnet-beta", "marginfi_type_crate/mainnet-beta"]
 network-staging = ["marginfi/staging", "marginfi_type_crate/staging"]
+idl-build = []
 
 [dependencies]
-solana-account-decoder = "=2.1.20"
-solana-client = "=2.1.20"
-solana-program = "=2.1.20"
-solana-sdk = "=2.1.20"
-spl-associated-token-account = "6.0.0"
-solana-cli-output = "=2.1.20"
-spl-token = "7.0.0"
+solana-account-decoder = "=3.1.11"
+solana-address-lookup-table-interface = { version = "3.1.0", features = ["bincode", "bytemuck"] }
+solana-client = "=3.1.11"
+solana-cli-output = "=3.1.11"
+solana-cluster-type = "3.1.0"
+solana-commitment-config = "3.1.1"
+solana-compute-budget-interface = "3.0.0"
+solana-program = "=3.0.0"
+solana-sdk = "=3.0.0"
+solana-sdk-ids = "3.1.0"
+solana-system-interface = "3.2.0"
+spl-associated-token-account = { version = "8.0.0", default-features = false, features = ["no-entrypoint"] }
+spl-token = "9.0.0"
 
-anchor-lang = { version = "0.31.1" }
-anchor-spl = { version = "0.31.1", features = ["token_2022"] }
-anchor-client = { version = "0.31.1" }
+anchor-lang = { version = "1.0.2" }
+anchor-spl = { version = "1.0.2", default-features = false, features = ["associated_token", "token", "token_2022"] }
+anchor-client = { version = "1.0.2" }
 
 anyhow = "1.0.102"
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
-dotenv = "0.15.0"
+base64 = "0.22.1"
+base64ct = "=1.7.3"
+bincode = "1.3.3"
 bytemuck = "1.22.0"
+bytemuck_derive = "1.10.2"
+chrono = "0.4.44"
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+ctrlc = "3.5.2"
+dotenv = "0.15.0"
 env_logger = "0.11.9"
 fixed = "1.28.0"
 fixed-macro = "1.2.0"
 futures = "0.3.32"
 futures-sink = "0.3.32"
+indexmap = "2.13.0"
 lazy_static = "1.5.0"
 log = "0.4.29"
 rayon = "1.11.0"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+rust_decimal = "1.42.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
-bincode = "1.3.3"
-base64 = "0.22.1"
+signal-hook = "0.4.3"
+tiny_http = "0.12.0"
 tokio = { version = "1.50.0", features = ["rt", "macros"] }
-chrono = "0.4.44"
 warp = "0.4.2"
 prometheus = "0.14.0"
-indexmap = "2.13.0"
-tiny_http = "0.12.0"
-signal-hook = "0.4.3"
-ctrlc = "3.5.2"
 
-yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", branch = "v2.1" }
-yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", branch = "v2.1" }
-# Includes a fix to the way results are parsed.
-switchboard-on-demand-client = { git = "https://github.com/switchboard-xyz/switchboard-sdk", rev = "f1a570a65476d6d040bee1bd2d223c2c775ac2b6" }
-solana-dex-superagg = { git = "https://github.com/0dotxyz/solana-dex-superagg", rev = "3ab0b4f4de424a0044e983576d113e3b349b3d94" }
-rust_decimal = "1.42.0"
+yellowstone-grpc-client = "10.2.0"
+yellowstone-grpc-proto = "10.1.1"
+
+solana-dex-superagg = { git = "https://github.com/0dotxyz/solana-dex-superagg", rev = "0f2d02701233b82cb819661e875c406b9f522c3b" }
+switchboard-on-demand-client = { git = "https://github.com/switchboard-xyz/switchboard-sdk", rev = "3ed155e6c6a1f4fc912dc60388e099f02cb651ce" }
 
 [dependencies.marginfi_type_crate]
 git = "https://github.com/mrgnlabs/marginfi-v2"
 # tag = "mrgn-0.1.8-rc3"
-rev = "4ce8a15e70b4108059b74e1aedbfde1e3e564ace"
+rev = "878fab5bd8898dec866630e2f58f90d9c2dee055"
 package = "marginfi-type-crate"
 default-features = false
 features = ["client"]
@@ -67,13 +76,9 @@ features = ["client"]
 [dependencies.marginfi]
 git = "https://github.com/mrgnlabs/marginfi-v2"
 # tag = "mrgn-0.1.8-rc3"
-rev = "4ce8a15e70b4108059b74e1aedbfde1e3e564ace"
+rev = "878fab5bd8898dec866630e2f58f90d9c2dee055"
 default-features = false
 features = ["client", "no-entrypoint", "custom-heap"]
-
-[dependencies.jupiter-swap-api-client]
-git = "https://github.com/IliaZyrin/jupiter-swap-api-client"
-rev = "6e209786084a4344538a1aa695f126169fa95022"
 
 [dev-dependencies]
 serial_test = "3.2.0"
@@ -82,3 +87,8 @@ figment = { version = "0.10", features = ["test"] }
 [profile.release]
 opt-level = 3
 lto = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(target_os, values("solana"))',
+] }

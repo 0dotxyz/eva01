@@ -186,17 +186,13 @@ impl GeyserService {
             let (_, mut stream) = self
                 .tokio_rt
                 .block_on(client.subscribe_with_request(Some(sub_req.clone())))?;
-
+            // TODO: use IndexerFlags
             info!("Entering the GeyserService loop");
             while let Some(msg) = self.tokio_rt.block_on(stream.next()) {
                 match msg {
                     Ok(msg) => {
                         let update_oneof = ward!(msg.update_oneof, continue);
                         if let subscribe_update::UpdateOneof::Account(account) = update_oneof {
-                            if from_slot == Some(account.slot) {
-                                // Skip the first update after reconnect since we already processed it.
-                                continue;
-                            }
                             from_slot = Some(account.slot);
 
                             let account_update = ward!(&account.account, continue);

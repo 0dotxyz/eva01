@@ -16,7 +16,8 @@ use marginfi_type_crate::types::OracleSetup;
 use reqwest::blocking::Client;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Deserializer};
-use solana_sdk::{account::Account, genesis_config::ClusterType, pubkey, pubkey::Pubkey};
+use solana_cluster_type::ClusterType;
+use solana_sdk::{account::Account, pubkey, pubkey::Pubkey};
 use switchboard_on_demand_client::{CrossbarClient, PullFeedAccountData};
 use tokio::runtime::{Builder, Runtime};
 

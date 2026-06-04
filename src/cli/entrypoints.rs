@@ -25,7 +25,7 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         config.marginfi_group_key
     );
 
-    let wallet_pubkey = Keypair::from_bytes(&config.wallet_keypair)?.pubkey();
+    let wallet_pubkey = Keypair::try_from(config.wallet_keypair.as_slice())?.pubkey();
     info!("Liquidator public key: {}", wallet_pubkey);
 
     let clock = {

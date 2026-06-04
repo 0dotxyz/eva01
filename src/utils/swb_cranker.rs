@@ -7,9 +7,9 @@ use solana_client::{
     rpc_config::RpcSendTransactionConfig,
     rpc_request::RpcError,
 };
+use solana_cluster_type::ClusterType;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::{
-    commitment_config::{CommitmentConfig, CommitmentLevel},
-    genesis_config::ClusterType,
     message::{v0, VersionedMessage},
     pubkey::Pubkey,
     signature::Keypair,
@@ -47,7 +47,7 @@ pub struct SwbCranker {
 
 impl SwbCranker {
     pub fn new(config: &Eva01Config, cache: &crate::cache::Cache) -> Result<Self> {
-        let payer = Keypair::from_bytes(&config.wallet_keypair)?;
+        let payer = Keypair::try_from(config.wallet_keypair.as_slice())?;
 
         let tokio_rt = Builder::new_multi_thread()
             .thread_name("SwbCranker")
@@ -301,11 +301,11 @@ mod tests {
     fn test_is_stale_swb_price_true_transaction_error() {
         let err = ClientError {
             request: None,
-            kind: ClientErrorKind::RpcError(RpcError::RpcResponseError {
+            kind: Box::new(ClientErrorKind::RpcError(RpcError::RpcResponseError {
                 code: -32000,
                 message: SWB_STALE_PRICE_ERROR_CODE.to_string(),
                 data: RpcResponseErrorData::Empty,
-            }),
+            })),
         };
         assert!(is_stale_swb_price_error(&err));
     }
@@ -314,11 +314,11 @@ mod tests {
     fn test_is_stale_swb_price_false_wrong_custom_code() {
         let err = ClientError {
             request: None,
-            kind: ClientErrorKind::RpcError(RpcError::RpcResponseError {
+            kind: Box::new(ClientErrorKind::RpcError(RpcError::RpcResponseError {
                 code: -32000,
                 message: "12a4".to_string(),
                 data: RpcResponseErrorData::Empty,
-            }),
+            })),
         };
         assert!(!is_stale_swb_price_error(&err));
     }
@@ -327,7 +327,9 @@ mod tests {
     fn test_is_stale_swb_price_false_other_instruction_error() {
         let err = ClientError {
             request: None,
-            kind: ClientErrorKind::RpcError(RpcError::ParseError("Test error".to_string())),
+            kind: Box::new(ClientErrorKind::RpcError(RpcError::ParseError(
+                "Test error".to_string(),
+            ))),
         };
         assert!(!is_stale_swb_price_error(&err));
     }
@@ -336,7 +338,7 @@ mod tests {
     fn test_is_stale_swb_price_false_wrong_code() {
         let err = ClientError {
             request: None,
-            kind: ClientErrorKind::Custom("Some other error".to_string()),
+            kind: Box::new(ClientErrorKind::Custom("Some other error".to_string())),
         };
         assert!(!is_stale_swb_price_error(&err));
     }
@@ -345,7 +347,10 @@ mod tests {
     fn test_is_stale_swb_price_false_other_kind() {
         let err = ClientError {
             request: None,
-            kind: ClientErrorKind::Io(std::io::Error::new(std::io::ErrorKind::Other, "io error")),
+            kind: Box::new(ClientErrorKind::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "io error",
+            ))),
         };
         assert!(!is_stale_swb_price_error(&err));
     }

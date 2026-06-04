@@ -6,20 +6,16 @@ use anyhow::Ok;
 use log::{debug, error, info, warn};
 use marginfi_type_crate::types::{Bank, MarginfiAccount, MarginfiGroup};
 use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig};
+use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_client::{
     rpc_client::RpcClient,
     rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSendTransactionConfig},
     rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType},
 };
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::{
-    account::Account,
-    address_lookup_table::{state::AddressLookupTable, AddressLookupTableAccount},
-    bs58,
-    commitment_config::{CommitmentConfig, CommitmentLevel},
-    instruction::Instruction,
-    pubkey::Pubkey,
-    signature::Keypair,
-    signer::Signer,
+    account::Account, bs58, instruction::Instruction, message::AddressLookupTableAccount,
+    pubkey::Pubkey, signature::Keypair, signer::Signer,
 };
 
 use crate::{
@@ -53,7 +49,7 @@ impl CacheLoader {
         lut_addresses_group2: Vec<Pubkey>,
         lut_addresses_group3: Vec<Pubkey>,
     ) -> Result<Self> {
-        let signer = Keypair::from_bytes(wallet_keypair)?;
+        let signer = Keypair::try_from(wallet_keypair)?;
         let rpc_client = RpcClient::new(&rpc_url);
 
         Ok(Self {
@@ -185,6 +181,7 @@ impl CacheLoader {
         marginfi_group_address: &Pubkey,
     ) -> anyhow::Result<Vec<Pubkey>> {
         info!("Loading marginfi account addresses...");
+        #[allow(deprecated)]
         let marginfi_account_addresses = &self.rpc_client.get_program_accounts_with_config(
             &marginfi_type_crate::ID,
             RpcProgramAccountsConfig {
@@ -234,6 +231,7 @@ impl CacheLoader {
         let program: Program<Arc<Keypair>> = anchor_client.program(marginfi_type_crate::ID)?;
 
         info!("Loading banks...");
+        #[allow(deprecated)]
         let bank_accounts = program.rpc().get_program_accounts_with_config(
             &marginfi_type_crate::ID,
             RpcProgramAccountsConfig {

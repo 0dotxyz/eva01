@@ -6,9 +6,8 @@ use crate::{
     metrics::{
         record_liquidation_failure, ACCOUNTS_SCANNED_TOTAL, ACCOUNT_SCAN_DURATION_SECONDS,
         ERROR_COUNT, FAILURE_REASON_INTERNAL, FAILURE_REASON_NOT_ENOUGH_FUNDS,
-        FAILURE_REASON_RPC_ERROR, FAILURE_REASON_STALE_ORACLES, GEYSER_TRIGGERED_SCANS_TOTAL,
-        GEYSER_UPDATES_TOTAL, LIQUIDATABLE_ACCOUNTS_FOUND, LIQUIDATABLE_ACCOUNTS_FOUND_TOTAL,
-        LIQUIDATION_SCAN_IN_PROGRESS,
+        FAILURE_REASON_RPC_ERROR, FAILURE_REASON_STALE_ORACLES, LIQUIDATABLE_ACCOUNTS_FOUND,
+        LIQUIDATABLE_ACCOUNTS_FOUND_TOTAL, LIQUIDATION_SCAN_IN_PROGRESS,
     },
     rebalancer::Rebalancer,
     utils::{
@@ -34,7 +33,8 @@ use marginfi::state::{bank::BankImpl, marginfi_account::get_health_components};
 use marginfi_type_crate::{
     constants::BANKRUPT_THRESHOLD,
     types::{
-        BalanceSide, Bank, BankOperationalState, HealthPriceMode, MarginfiAccount, RequirementType,
+        reconcile_emode_configs, BalanceSide, Bank, BankOperationalState, EmodeConfig,
+        HealthPriceMode, MarginfiAccount, OnRampTransition, RequirementType,
     },
 };
 use solana_client::client_error::ClientError;
@@ -122,8 +122,7 @@ impl Liquidator {
 
             let mut missing_tokens: HashMap<Pubkey, I80F48> = HashMap::new();
             let mut stale_swb_oracles: HashSet<Pubkey> = HashSet::new();
-            let checked_accounts =
-                self.check_accounts(accounts_to_check, &mut stale_swb_oracles);
+            let checked_accounts = self.check_accounts(accounts_to_check, &mut stale_swb_oracles);
 
             if let Ok(mut accounts) = checked_accounts {
                 // Accounts are sorted from the highest profit to the lowest
@@ -478,10 +477,14 @@ impl Liquidator {
         liab_bank_wrapper: &BankWrapper,
     ) -> Result<LiquidationAmounts> {
         let mut accounts: Vec<_> = vec![];
+        let mut bank_to_emode_config = HashMap::<Pubkey, EmodeConfig>::new();
         for pk in banks_and_oracles.iter() {
             let bank_account = cache.banks.try_get_bank(pk);
             let account = match bank_account {
-                Ok(wrapper) => wrapper.account,
+                Ok(wrapper) => {
+                    bank_to_emode_config.insert(*pk, wrapper.bank.emode.emode_config);
+                    wrapper.account
+                }
                 Err(_) => cache.oracles.try_get_account(pk)?,
             };
             accounts.push(account);
@@ -499,7 +502,16 @@ impl Liquidator {
             RequirementType::Maintenance,
             &mut None,
             HealthPriceMode::Client(clock.clone()),
+            OnRampTransition::PreTransition,
         )?;
+
+        let emode_configs = account
+            .account
+            .lending_account
+            .get_active_balances_iter()
+            .filter(|b| !b.is_empty(BalanceSide::Liabilities))
+            .map(|b| bank_to_emode_config.remove(&b.bank_pk).unwrap());
+        let reconciled_emode_config = reconcile_emode_configs(emode_configs);
 
         let maintenance_health = total_weighted_assets - total_weighted_liabilities;
         debug!(
@@ -516,7 +528,9 @@ impl Liquidator {
         let liab_oracle_wrapper =
             OracleWrapper::build(&self.cache, &clock, &liab_bank_wrapper.address)?;
 
-        let asset_weight_maint: I80F48 = asset_bank_wrapper.bank.config.asset_weight_maint.into();
+        let asset_weight_maint: I80F48 = asset_bank_wrapper
+            .bank
+            .get_asset_weight(RequirementType::Maintenance, &reconciled_emode_config);
         let liab_weight_maint: I80F48 = liab_bank_wrapper.bank.config.liability_weight_maint.into();
 
         let liquidation_discount = fixed_macro::types::I80F48!(0.95);

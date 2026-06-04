@@ -35,20 +35,20 @@ use solana_client::{
     client_error::ClientError, rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig,
 };
 
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::{
     account::ReadableAccount,
-    address_lookup_table::AddressLookupTableAccount,
-    commitment_config::{CommitmentConfig, CommitmentLevel},
-    compute_budget::ComputeBudgetInstruction,
     instruction::Instruction,
+    message::AddressLookupTableAccount,
     message::{v0::Message, CompileError, VersionedMessage},
     pubkey,
     signature::{Keypair, Signature},
     signer::{Signer, SignerError},
-    system_instruction::transfer,
     transaction::VersionedTransaction,
 };
+use solana_system_interface::instruction::transfer;
 use std::{collections::HashSet, sync::Arc, thread, time::Duration};
 
 pub const PROFIT_SHARE: f64 = 0.085;
@@ -106,7 +106,7 @@ impl LiquidatorAccount {
         preferred_mint: Pubkey,
         cache: Arc<Cache>,
     ) -> Result<Self> {
-        let signer = Keypair::from_bytes(&config.wallet_keypair)?;
+        let signer = Keypair::try_from(config.wallet_keypair.as_slice())?;
         let rpc_client =
             RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
 
@@ -165,7 +165,7 @@ impl LiquidatorAccount {
             .get_latest_blockhash()
             .map_err(|e| anyhow!(e))?;
 
-        let msg = Message::try_compile(&signer_pk, &[init_ix.clone()], &[], recent_blockhash)
+        let msg = Message::try_compile(&signer_pk, &[init_ix], &[], recent_blockhash)
             .map_err(|e| anyhow!(e))?;
 
         let txn = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
@@ -324,6 +324,7 @@ impl LiquidatorAccount {
         // TODO: think about posting an swb_crank ix here
 
         let start_ix = make_start_liquidate_ix(
+            self.group,
             liquidatee_account_address,
             signer_pk,
             liquidation_record,
@@ -479,6 +480,7 @@ impl LiquidatorAccount {
         ixs.push(repay_ix);
 
         let end_ix = make_end_liquidate_ix(
+            self.group,
             liquidatee_account_address,
             signer_pk,
             liquidation_record,

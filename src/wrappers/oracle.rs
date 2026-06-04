@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
 use log::error;
 use marginfi::state::price::{OraclePriceFeedAdapter, PriceAdapter};
-use marginfi_type_crate::types::{OraclePriceType, OracleSetup, PriceBias};
+use marginfi_type_crate::types::{OnRampTransition, OraclePriceType, OracleSetup, PriceBias};
 use solana_program::pubkey::Pubkey;
 use solana_sdk::{account_info::IntoAccountInfo, clock::Clock};
 
@@ -73,6 +73,7 @@ impl OracleWrapper {
                     bank,
                     &[bank_oracle_account_info],
                     clock,
+                    OnRampTransition::PreTransition,
                 )?;
 
                 result = Some(Self {
@@ -112,6 +113,7 @@ impl OracleWrapper {
                         sol_pool_account_info,
                     ],
                     clock,
+                    OnRampTransition::PreTransition,
                 )?;
                 result = Some(Self {
                     addresses: vec![
@@ -123,7 +125,12 @@ impl OracleWrapper {
                 });
             }
             OracleSetup::Fixed => {
-                let price_adapter = OraclePriceFeedAdapter::try_from_bank(bank, &[], clock)?;
+                let price_adapter = OraclePriceFeedAdapter::try_from_bank(
+                    bank,
+                    &[],
+                    clock,
+                    OnRampTransition::PreTransition,
+                )?;
                 result = Some(Self {
                     addresses: vec![],
                     source: price_adapter,
@@ -157,6 +164,7 @@ impl OracleWrapper {
                     bank,
                     &[bank_oracle_account_info, integration_oracle_account_info],
                     clock,
+                    OnRampTransition::PreTransition,
                 )?;
                 result = Some(Self {
                     addresses: [bank_oracle_address, integration_oracle_address].to_vec(),
@@ -181,6 +189,7 @@ impl OracleWrapper {
                     bank,
                     &[integration_oracle_account_info],
                     clock,
+                    OnRampTransition::PreTransition,
                 )?;
                 result = Some(Self {
                     addresses: vec![integration_oracle_address],
