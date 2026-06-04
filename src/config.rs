@@ -1,6 +1,9 @@
 use fixed::types::I80F48;
 use solana_sdk::pubkey::Pubkey;
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 
 #[derive(Clone, Debug)]
 pub struct TokenThresholds {
@@ -30,6 +33,7 @@ pub struct Eva01Config {
     pub swap_mint: Pubkey,
     pub slippage_bps: u16,
     pub token_thresholds: HashMap<Pubkey, TokenThresholds>,
+    pub excluded_liquidation_mints: HashSet<Pubkey>,
     pub default_token_max_threshold: I80F48,
     pub token_dust_threshold: I80F48,
     pub titan_ws_endpoint: String,
@@ -108,6 +112,10 @@ impl Eva01Config {
 
         let token_thresholds = load_token_thresholds_from_env()?;
 
+        let excluded_liquidation_mints = parse_pubkey_list("EXCLUDED_LIQUIDATION_MINTS")?
+            .into_iter()
+            .collect();
+
         let default_token_max_threshold = I80F48::from_num(
             std::env::var("DEFAULT_TOKEN_MAX_THRESHOLD")
                 .expect("DEFAULT_TOKEN_MAX_THRESHOLD environment variable is not set")
@@ -151,6 +159,7 @@ impl Eva01Config {
             swap_mint,
             slippage_bps,
             token_thresholds,
+            excluded_liquidation_mints,
             default_token_max_threshold,
             token_dust_threshold,
             titan_ws_endpoint,
@@ -266,7 +275,7 @@ mod tests {
 
     fn setup_rebalancer_env(jail: &mut Jail) {
         jail.set_env("TOKEN_ACCOUNT_DUST_THRESHOLD", "0.0001");
-        jail.set_env("SWAP_MINT", &Pubkey::new_unique().to_string());
+        jail.set_env("SWAP_MINT", Pubkey::new_unique().to_string());
         jail.set_env("JUP_SWAP_API_URL", "https://dummy/swap");
         jail.set_env("JUP_SWAP_API_KEY", "dummy_jupiter_api_key");
         jail.set_env("TITAN_WS_ENDPOINT", "dummy.titan.exchange");
@@ -318,9 +327,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_eva01_config_new_success() {
-        Jail::expect_with(|mut jail| {
-            setup_general_env(&mut jail);
-            setup_rebalancer_env(&mut jail);
+        Jail::expect_with(|jail| {
+            setup_general_env(jail);
+            setup_rebalancer_env(jail);
             let config = Eva01Config::new();
             assert!(config.is_ok());
             Ok(())
@@ -329,10 +338,43 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_eva01_config_excluded_liquidation_mints_default_empty() {
+        Jail::expect_with(|jail| {
+            setup_general_env(jail);
+            setup_rebalancer_env(jail);
+            // EXCLUDED_LIQUIDATION_MINTS is not set -> empty set
+            let config = Eva01Config::new().unwrap();
+            assert!(config.excluded_liquidation_mints.is_empty());
+            Ok(())
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_eva01_config_excluded_liquidation_mints_parsed() {
+        Jail::expect_with(|jail| {
+            setup_general_env(jail);
+            setup_rebalancer_env(jail);
+            let mint_a = Pubkey::new_unique();
+            let mint_b = Pubkey::new_unique();
+            jail.set_env(
+                "EXCLUDED_LIQUIDATION_MINTS",
+                format!("{}, {}", mint_a, mint_b).as_str(),
+            );
+            let config = Eva01Config::new().unwrap();
+            assert_eq!(config.excluded_liquidation_mints.len(), 2);
+            assert!(config.excluded_liquidation_mints.contains(&mint_a));
+            assert!(config.excluded_liquidation_mints.contains(&mint_b));
+            Ok(())
+        });
+    }
+
+    #[test]
+    #[serial]
     fn test_eva01_config_new_derives_rpc_url_from_yellowstone() {
-        Jail::expect_with(|mut jail| {
-            setup_general_env(&mut jail);
-            setup_rebalancer_env(&mut jail);
+        Jail::expect_with(|jail| {
+            setup_general_env(jail);
+            setup_rebalancer_env(jail);
             let config = Eva01Config::new().unwrap();
             assert_eq!(config.rpc_url, "https://dummy/token");
             Ok(())
@@ -342,9 +384,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_eva01_config_new_prefers_explicit_rpc_url_override() {
-        Jail::expect_with(|mut jail| {
-            setup_general_env(&mut jail);
-            setup_rebalancer_env(&mut jail);
+        Jail::expect_with(|jail| {
+            setup_general_env(jail);
+            setup_rebalancer_env(jail);
             jail.set_env("RPC_URL", "https://explicit-rpc.example");
             let config = Eva01Config::new().unwrap();
             assert_eq!(config.rpc_url, "https://explicit-rpc.example");
@@ -367,9 +409,9 @@ mod tests {
     #[serial]
     #[should_panic(expected = "Invalid COMPUTE_UNIT_PRICE_MICRO_LAMPORTS number")]
     fn test_eva01_config_new_invalid_compute_unit_price() {
-        Jail::expect_with(|mut jail| {
-            setup_general_env(&mut jail);
-            setup_rebalancer_env(&mut jail);
+        Jail::expect_with(|jail| {
+            setup_general_env(jail);
+            setup_rebalancer_env(jail);
             jail.set_env("COMPUTE_UNIT_PRICE_MICRO_LAMPORTS", "not_a_number");
             Eva01Config::new().unwrap();
             Ok(())

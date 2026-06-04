@@ -91,39 +91,6 @@ pub fn make_start_liquidate_ix(
     }
 }
 
-pub fn make_deposit_ix(
-    marginfi_group: Pubkey,
-    marginfi_account: Pubkey,
-    signer: Pubkey,
-    bank: &BankWrapper,
-    signer_token_account: Pubkey,
-    token_program: Pubkey,
-    amount: u64,
-) -> Instruction {
-    let mut accounts = marginfi::accounts::LendingAccountDeposit {
-        marginfi_account,
-        authority: signer,
-        signer_token_account,
-        liquidity_vault: bank.bank.liquidity_vault,
-        token_program,
-        bank: bank.address,
-        group: marginfi_group,
-    }
-    .to_account_metas(None);
-    maybe_add_bank_mint(&mut accounts, bank.bank.mint, &token_program);
-    mark_signer(&mut accounts, signer);
-
-    Instruction {
-        program_id: marginfi_type_crate::ID,
-        accounts,
-        data: marginfi::instruction::LendingAccountDeposit {
-            amount,
-            deposit_up_to_limit: None,
-        }
-        .data(),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn make_repay_ix(
     marginfi_group: Pubkey,
