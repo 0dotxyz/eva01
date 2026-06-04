@@ -50,6 +50,7 @@ pub struct Liquidator {
     cache: Arc<Cache>,
     swb_cranker: SwbCranker,
     token_dust_threshold: I80F48,
+    excluded_mints: HashSet<Pubkey>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,8 +86,7 @@ impl Liquidator {
     ) -> Result<Self> {
         let swb_cranker = SwbCranker::new(&config, cache.as_ref())?;
 
-        let rebalancer =
-            Rebalancer::new(config.clone(), liquidator_account.clone(), cache.clone())?;
+        let rebalancer = Rebalancer::new(config.clone(), cache.clone())?;
 
         Ok(Liquidator {
             liquidator_account,
@@ -97,6 +97,7 @@ impl Liquidator {
             cache,
             swb_cranker,
             token_dust_threshold: config.token_dust_threshold,
+            excluded_mints: config.excluded_liquidation_mints,
         })
     }
 
@@ -352,6 +353,24 @@ impl Liquidator {
         deposit_values: Vec<(I80F48, Pubkey)>,
         liab_values: Vec<(I80F48, Pubkey)>,
     ) -> Result<Option<(Pubkey, Pubkey)>> {
+        // Drop any bank whose mint is on the exclusion list, so excluded mints
+        // (e.g. UXD) are never seized as collateral nor repaid as a liability.
+        let is_excluded = |bank_pk: &Pubkey| -> bool {
+            self.cache
+                .banks
+                .try_get_bank(bank_pk)
+                .map(|bank| self.excluded_mints.contains(&bank.bank.mint))
+                .unwrap_or(false)
+        };
+        let deposit_values: Vec<(I80F48, Pubkey)> = deposit_values
+            .into_iter()
+            .filter(|(_, bank_pk)| !is_excluded(bank_pk))
+            .collect();
+        let liab_values: Vec<(I80F48, Pubkey)> = liab_values
+            .into_iter()
+            .filter(|(_, bank_pk)| !is_excluded(bank_pk))
+            .collect();
+
         if deposit_values.is_empty() || liab_values.is_empty() {
             return Ok(None);
         }

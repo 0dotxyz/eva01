@@ -1,23 +1,17 @@
 use crate::{
     cache::Cache,
     config::{Eva01Config, TokenThresholds},
-    metrics::{record_liquidation_failure, FAILURE_REASON_STALE_ORACLES},
-    utils::{self, swb_cranker::is_stale_swb_price_error},
-    wrappers::{
-        liquidator_account::LiquidatorAccount, oracle::OracleWrapper,
-        token_account::TokenAccountWrapper,
-    },
+    wrappers::{oracle::OracleWrapper, token_account::TokenAccountWrapper},
 };
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{debug, error, info, warn};
-use solana_client::client_error::ClientError;
 use solana_dex_superagg::{
     client::DexSuperAggClient,
     config::{ClientConfig, JupiterConfig, RoutingStrategy, SharedConfig, TitanConfig},
 };
 use solana_program::pubkey::Pubkey;
-use solana_sdk::{account::ReadableAccount, commitment_config::CommitmentLevel};
+use solana_sdk::commitment_config::CommitmentLevel;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -29,9 +23,7 @@ const SLIPPAGE_MULTIPLIER: I80F48 = I80F48!(1.05);
 /// The rebalancer is responsible to maintain the appropriate amounts of tokens on token accounts.
 /// Guided primarily by token_thresholds and specific requests from the liquidator.
 pub struct Rebalancer {
-    liquidator_account: Arc<LiquidatorAccount>,
     swap_mint: Pubkey,
-    swap_mint_bank: Pubkey,
     tokio_rt: Runtime,
     cache: Arc<Cache>,
     default_token_max_threshold: I80F48,
@@ -41,13 +33,8 @@ pub struct Rebalancer {
 }
 
 impl Rebalancer {
-    pub fn new(
-        config: Eva01Config,
-        liquidator_account: Arc<LiquidatorAccount>,
-        cache: Arc<Cache>,
-    ) -> anyhow::Result<Self> {
+    pub fn new(config: Eva01Config, cache: Arc<Cache>) -> anyhow::Result<Self> {
         let swap_mint = config.swap_mint;
-        let swap_mint_bank = cache.banks.try_get_account_for_mint(&config.swap_mint)?;
 
         let tokio_rt = Builder::new_multi_thread()
             .thread_name("rebalancer")
@@ -92,9 +79,7 @@ impl Rebalancer {
         let dex_client = Arc::new(DexSuperAggClient::new(client_config)?);
 
         Ok(Self {
-            liquidator_account,
             swap_mint,
-            swap_mint_bank,
             tokio_rt,
             cache,
             default_token_max_threshold,
@@ -114,19 +99,6 @@ impl Rebalancer {
 
         if let Err(e) = self.handle_token_accounts(missing_tokens, &swap_wrapper) {
             error!("Failed to handle the Liquidator's tokens: {}", e);
-            // Note: Stale oracle errors from withdraw operations are now handled
-            // inside handle_token_accounts where we have access to the bank context
-        }
-
-        if let Err(error) = self.deposit_preferred_token(&swap_wrapper) {
-            error!("Failed to deposit preferred token: {}", error);
-            // Check if this is a stale oracle error and record it in metrics
-            if let Some(client_err) = error.downcast_ref::<ClientError>() {
-                if is_stale_swb_price_error(client_err) {
-                    error!("MUST NEVER HAPPEN");
-                    record_liquidation_failure(FAILURE_REASON_STALE_ORACLES, None, None);
-                }
-            }
         }
 
         info!("The Rebalancing process is complete.");
@@ -139,57 +111,17 @@ impl Rebalancer {
         missing_tokens: HashMap<Pubkey, I80F48>,
         swap_wrapper: &TokenAccountWrapper<OracleWrapper>,
     ) -> anyhow::Result<()> {
-        let (necessary_swap_value, missing_mint_to_value) =
-            self.sell_excessive_tokens_and_calculate_necessary_swap_value(missing_tokens)?;
-
-        let existing_swap_value = swap_wrapper.get_value()?;
-
-        if necessary_swap_value > existing_swap_value {
-            let swap_bank_wrapper = self.cache.banks.try_get_bank(&self.swap_mint_bank)?;
-
-            // Get the oracle address for this bank in case we need it for error tracking
-            let oracle = swap_bank_wrapper.bank.config.oracle_keys[0];
-
-            // Withdraw 5% more to account for slippage and price changes
-            let amount = swap_wrapper
-                .get_amount_from_value(necessary_swap_value - existing_swap_value)?
-                .checked_mul(SLIPPAGE_MULTIPLIER)
-                .unwrap();
-
-            if let Err(e) =
-                self.liquidator_account
-                    .withdraw(&swap_bank_wrapper, amount.to_num(), false)
-            {
-                let err_str = e.to_string();
-                // BankAccountNotFound (0x1782): no balance account opened for this bank
-                // (or no deposit). Nothing to withdraw — proceed with wallet balance only.
-                if err_str.contains("0x1782") || err_str.contains("BankAccountNotFound") {
-                    warn!("No swap mint balance in marginfi lending account; proceeding with wallet balance only");
-                } else {
-                    // Check if this is a stale oracle error and record it in metrics
-                    if let Some(client_err) = e.downcast_ref::<ClientError>() {
-                        if is_stale_swb_price_error(client_err) {
-                            record_liquidation_failure(
-                                FAILURE_REASON_STALE_ORACLES,
-                                None,
-                                Some(oracle),
-                            );
-                        }
-                    }
-                    return Err(e);
-                }
-            }
-        }
+        let missing_mint_to_value =
+            self.sell_excessive_tokens_and_collect_missing(missing_tokens)?;
 
         self.buy_missing_tokens(swap_wrapper, missing_mint_to_value)
     }
 
-    fn sell_excessive_tokens_and_calculate_necessary_swap_value(
+    fn sell_excessive_tokens_and_collect_missing(
         &mut self,
         bank_to_amount: HashMap<Pubkey, I80F48>,
-    ) -> anyhow::Result<(I80F48, HashMap<Pubkey, I80F48>)> {
+    ) -> anyhow::Result<HashMap<Pubkey, I80F48>> {
         let mut mint_to_value: HashMap<Pubkey, I80F48> = HashMap::new();
-        let mut necessary_swap_value = I80F48::ZERO;
         for mint in self.cache.mints.get_mints() {
             debug!("Processing token {}...", mint);
             if mint == self.swap_mint || self.empty_stake_banks.contains(&mint) {
@@ -222,7 +154,6 @@ impl Rebalancer {
                         .ok_or_else(|| anyhow::anyhow!("Failed to calculate missing token value"))?
                 };
                 mint_to_value.insert(mint, missing_value);
-                necessary_swap_value += missing_value;
                 continue;
             }
 
@@ -252,10 +183,9 @@ impl Rebalancer {
             } else if value < min_value {
                 info!("The value of {} tokens is lower than set threshold: {} < {}. Will buy ${} worth of tokens.", mint, value.to_num::<f64>(), min_value.to_num::<f64>(), min_value.to_num::<f64>());
                 mint_to_value.insert(mint, min_value);
-                necessary_swap_value += min_value.checked_mul(SLIPPAGE_MULTIPLIER).unwrap();
             }
         }
-        Ok((necessary_swap_value, mint_to_value))
+        Ok(mint_to_value)
     }
 
     fn buy_missing_tokens(
@@ -278,54 +208,6 @@ impl Rebalancer {
         Ok(())
     }
 
-    fn deposit_preferred_token(
-        &self,
-        swap_wrapper: &TokenAccountWrapper<OracleWrapper>,
-    ) -> anyhow::Result<()> {
-        let amount = self
-            .get_token_balance_for_mint(&self.swap_mint)
-            .unwrap_or_default();
-
-        let max_value = self
-            .token_thresholds
-            .get(&self.swap_mint)
-            .map(|t| t.max_value)
-            .unwrap_or(self.default_token_max_threshold);
-
-        let max_amount = swap_wrapper.get_amount_from_value(max_value)?;
-        if amount < max_amount {
-            return Ok(());
-        }
-
-        // Leave the half of the max value on token acc
-        let amount = (amount - max_amount.checked_mul(I80F48::from_num(0.5)).unwrap()).to_num();
-
-        info!(
-            "Depositing {} of preferred token to the Swap mint bank {:?}.",
-            amount, &self.swap_mint_bank
-        );
-
-        let bank_wrapper = self.cache.banks.try_get_bank(&self.swap_mint_bank)?;
-
-        // Get the oracle address for this bank in case we need it for error tracking
-        let oracle = bank_wrapper.bank.config.oracle_keys[0];
-
-        if let Err(error) = self.liquidator_account.deposit(&bank_wrapper, amount) {
-            error!(
-                "Failed to deposit to the Bank ({:?}): {:?}",
-                &self.swap_mint_bank, error
-            );
-            // Check if this is a stale oracle error and record it in metrics
-            if let Some(client_err) = error.downcast_ref::<ClientError>() {
-                if is_stale_swb_price_error(client_err) {
-                    record_liquidation_failure(FAILURE_REASON_STALE_ORACLES, None, Some(oracle));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Execute a swap using the unified DEX aggregator client with best price strategy
     fn swap(&self, amount: u64, input_mint: Pubkey, output_mint: Pubkey) -> anyhow::Result<u64> {
         if input_mint == output_mint {
@@ -343,14 +225,14 @@ impl Rebalancer {
             amount, input_mint, output_mint
         );
 
-        const WSOL: Pubkey = Pubkey::from_str_const("So11111111111111111111111111111111111111112");
-        let wrap_and_unwrap_sol = input_mint == WSOL || output_mint == WSOL;
-
+        // Keep WSOL as a plain SPL token in the ATA: never auto-wrap/unwrap. Otherwise a
+        // USDT -> WSOL buy would unwrap the output to native SOL, leaving the WSOL ATA
+        // empty and the rebalancer buying WSOL again every cycle.
         let result = self.tokio_rt.block_on(self.dex_client.swap(
             &input_mint.to_string(),
             &output_mint.to_string(),
             amount,
-            wrap_and_unwrap_sol,
+            false,
         ))?;
 
         info!(
@@ -363,28 +245,5 @@ impl Rebalancer {
         }
 
         Ok(result.swap_result.out_amount)
-    }
-
-    fn get_token_balance_for_mint(&self, mint_address: &Pubkey) -> Option<I80F48> {
-        let token_account_address = self.cache.tokens.get_token_for_mint(mint_address)?;
-        match self.cache.tokens.try_get_account(&token_account_address) {
-            Ok(account) => match utils::accessor::amount(account.data()) {
-                Ok(amount) => Some(I80F48::from_num(amount)),
-                Err(error) => {
-                    error!(
-                        "Failed to obtain balance amount for the Token {}: {}",
-                        token_account_address, error
-                    );
-                    None
-                }
-            },
-            Err(error) => {
-                error!(
-                    "Failed to get the Token account {}: {}",
-                    token_account_address, error
-                );
-                None
-            }
-        }
     }
 }
