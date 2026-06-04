@@ -181,8 +181,10 @@ impl Rebalancer {
                     }
                 }
             } else if value < min_value {
-                info!("The value of {} tokens is lower than set threshold: {} < {}. Will buy ${} worth of tokens.", mint, value.to_num::<f64>(), min_value.to_num::<f64>(), min_value.to_num::<f64>());
-                mint_to_value.insert(mint, min_value);
+                // Buy only the shortfall to reach min, not the full min_value.
+                let needed_value = min_value - value;
+                info!("The value of {} tokens is lower than set threshold: {} < {}. Will buy ${} worth of tokens.", mint, value.to_num::<f64>(), min_value.to_num::<f64>(), needed_value.to_num::<f64>());
+                mint_to_value.insert(mint, needed_value);
             }
         }
         Ok(mint_to_value)
@@ -193,15 +195,30 @@ impl Rebalancer {
         swap_token_wrapper: &TokenAccountWrapper<OracleWrapper>,
         mint_to_value: HashMap<Pubkey, I80F48>,
     ) -> anyhow::Result<()> {
+        // We only spend swap_mint that is actually in the wallet (no MarginFi withdraw).
+        // Cap each buy to the remaining wallet balance and stop once it is spent, instead of
+        // sending swaps that revert on-chain with "insufficient funds".
+        let mut available = I80F48::from_num(swap_token_wrapper.balance);
         for mint in self.cache.mints.get_mints() {
             if mint == self.swap_mint {
                 continue;
             }
 
             if let Some(&value_to_swap) = mint_to_value.get(&mint) {
-                let amount_to_swap = swap_token_wrapper.get_amount_from_value(value_to_swap)?;
-                if let Err(e) = self.swap(amount_to_swap.to_num(), self.swap_mint, mint) {
-                    error!("Swap failed: {}", e);
+                if available <= I80F48::ZERO {
+                    warn!(
+                        "No {} left in the wallet to fund buys; skipping remaining tokens.",
+                        self.swap_mint
+                    );
+                    break;
+                }
+                let desired = swap_token_wrapper.get_amount_from_value(value_to_swap)?;
+                let amount_to_swap = desired.min(available);
+                match self.swap(amount_to_swap.to_num(), self.swap_mint, mint) {
+                    Ok(_) => {
+                        available -= amount_to_swap;
+                    }
+                    Err(e) => error!("Swap failed: {}", e),
                 }
             }
         }
