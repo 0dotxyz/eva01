@@ -45,6 +45,9 @@ use std::{collections::HashSet, sync::Arc, thread, time::Duration};
 
 pub const PROFIT_SHARE: f64 = 0.085;
 
+/// Max serialized Solana transaction size on the wire.
+const MAX_TX_SIZE: usize = 1232;
+
 #[derive(Debug)]
 pub enum LiquidationError {
     Anyhow(anyhow::Error),
@@ -264,7 +267,7 @@ impl LiquidatorAccount {
             )
         };
 
-        let (tx, ixs) = self
+        let (tx, ixs, temp_lut) = self
             .build_liquidate_tx(&account, asset_amount, liab_amount)
             .map_err(LiquidationError::from_anyhow)?;
 
@@ -278,7 +281,7 @@ impl LiquidatorAccount {
 
         let _liquidation_timer = LIQUIDATION_LATENCY_SECONDS.start_timer();
 
-        match self
+        let result = match self
             .rpc_client
             .send_and_confirm_transaction_with_spinner_and_config(
                 &tx,
@@ -330,18 +333,31 @@ impl LiquidatorAccount {
                     Err(LiquidationError::from_client(err))
                 }
             }
+        };
+
+        // Clean up any temporary LUT created to fit an oversized tx.
+        if let Some(lut_key) = temp_lut {
+            if let Err(e) =
+                self.cache
+                    .deactivate_targeted_lut(&self.rpc_client, &self.signer, lut_key)
+            {
+                warn!("Failed to deactivate temporary LUT {lut_key}: {e}");
+            }
         }
+
+        result
     }
 
     /// Assemble (compile + sign) the liquidation transaction for the given account and amounts.
     /// Pure tx construction shared by the legacy `liquidate` path and the execution-layer
-    /// `InventoryStrategy`; returns the signed tx plus its instructions (for the LUT-retry path).
+    /// `InventoryStrategy`. Returns the signed tx, its instructions (for the LUT-retry path),
+    /// and an optional temporary-LUT key created to fit an oversized tx (caller must deactivate).
     pub fn build_liquidate_tx(
         &self,
         account: &PreparedLiquidatableAccount,
         asset_amount: I80F48,
         liab_amount: I80F48,
-    ) -> Result<(VersionedTransaction, Vec<Instruction>)> {
+    ) -> Result<(VersionedTransaction, Vec<Instruction>, Option<Pubkey>)> {
         let liquidatee_account_address = account.liquidatee_account.address;
         let signer_pk = self.signer.pubkey();
 
@@ -529,9 +545,32 @@ impl LiquidatorAccount {
 
         let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
         let msg = Message::try_compile(&signer_pk, &ixs, &luts, recent_blockhash)?;
-        let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])?;
+        let mut tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])?;
 
-        Ok((tx, ixs))
+        // Proactive LUT fit: if the tx exceeds the wire-size limit, pack its accounts into a
+        // freshly-created targeted LUT and recompile. The caller deactivates the temp LUT once
+        // the tx lands. (The 64-account-lock cap can't be fixed by a LUT, so that still fails.)
+        let mut temp_lut: Option<Pubkey> = None;
+        if bincode::serialize(&tx)?.len() > MAX_TX_SIZE {
+            let all_accounts: Vec<Pubkey> = ixs
+                .iter()
+                .flat_map(|ix| ix.accounts.iter().map(|a| a.pubkey))
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let targeted_lut =
+                self.cache
+                    .create_targeted_lut(&self.rpc_client, &self.signer, all_accounts)?;
+            temp_lut = Some(targeted_lut.key);
+
+            let mut fitted_luts = luts;
+            fitted_luts.push(targeted_lut);
+            let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
+            let msg = Message::try_compile(&signer_pk, &ixs, &fitted_luts, recent_blockhash)?;
+            tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])?;
+        }
+
+        Ok((tx, ixs, temp_lut))
     }
 
     fn retry_with_new_luts(&self, ixs: Vec<Instruction>) -> Result<Signature> {

@@ -39,6 +39,9 @@ pub struct Eva01Config {
     pub titan_ws_endpoint: String,
     pub titan_api_key: String,
     pub jupiter_api_key: String,
+    pub jito_block_engine_url: Option<String>,
+    pub jito_tip_max_lamports: u64,
+    pub bundle_api_key: Option<String>,
 }
 
 impl Eva01Config {
@@ -138,6 +141,14 @@ impl Eva01Config {
         let jupiter_api_key = std::env::var("JUP_SWAP_API_KEY")
             .expect("JUP_SWAP_API_KEY environment variable is not set");
 
+        let jito_block_engine_url = std::env::var("JITO_BLOCK_ENGINE_URL").ok();
+        // Default cap 0.001 SOL (matches Jito's typical max tip floor).
+        let jito_tip_max_lamports: u64 = std::env::var("JITO_TIP_MAX_LAMPORTS")
+            .unwrap_or_else(|_| "1000000".to_string())
+            .parse()
+            .expect("Invalid JITO_TIP_MAX_LAMPORTS number");
+        let bundle_api_key = std::env::var("BUNDLE_API_KEY").ok();
+
         Ok(Eva01Config {
             rpc_url,
             yellowstone_endpoint,
@@ -165,6 +176,9 @@ impl Eva01Config {
             titan_ws_endpoint,
             titan_api_key,
             jupiter_api_key,
+            jito_block_engine_url,
+            jito_tip_max_lamports,
+            bundle_api_key,
         })
     }
 }

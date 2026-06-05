@@ -7,8 +7,9 @@
 
 use std::{
     str::FromStr,
+    sync::Mutex,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
@@ -21,6 +22,7 @@ use solana_sdk::transaction::VersionedTransaction;
 
 const DEFAULT_BUNDLE_ENDPOINT: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
 const TIP_ACCOUNTS_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_accounts";
+const TIP_FLOOR_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_floor";
 
 /// How long to wait after submission before the first status poll, and between polls.
 const POLL_INITIAL_DELAY: Duration = Duration::from_millis(500);
@@ -278,6 +280,88 @@ fn parse_simulate_bundle(resp: &Value) -> Result<BundleSimulation> {
     })
 }
 
+const TIP_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const TIP_FALLBACK_LAMPORTS: u64 = 10_000;
+const LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.0;
+
+/// Dynamic Jito tip estimator with a max cap and TTL cache.
+///
+/// Reads the EMA 50th-percentile landed tip from Jito's `tip_floor` endpoint, converts SOL ->
+/// lamports, and clamps to `max_lamports`. The value is cached for `TIP_REFRESH_INTERVAL`, so it
+/// is not refetched on every execution.
+pub struct TipEstimator {
+    http: Client,
+    max_lamports: u64,
+    cached: Mutex<Option<(u64, Instant)>>,
+}
+
+impl TipEstimator {
+    pub fn new(max_lamports: u64) -> Self {
+        let http = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self {
+            http,
+            max_lamports,
+            cached: Mutex::new(None),
+        }
+    }
+
+    /// Current tip in lamports (EMA-50th landed tip, clamped to the max cap), cached on a TTL so
+    /// repeated executions reuse the same value instead of refetching.
+    pub fn current_tip(&self) -> u64 {
+        let now = Instant::now();
+        if let Ok(guard) = self.cached.lock() {
+            if let Some((tip, at)) = *guard {
+                if now.duration_since(at) < TIP_REFRESH_INTERVAL {
+                    return tip;
+                }
+            }
+        }
+
+        let tip = match self.fetch_tip_lamports() {
+            Ok(lamports) => lamports.min(self.max_lamports),
+            Err(e) => {
+                // Back off to the last good value (or the fallback), capped, and reuse it for the
+                // refresh interval so a flaky endpoint doesn't add latency to every execution.
+                let last = self
+                    .cached
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.map(|(t, _)| t))
+                    .unwrap_or(TIP_FALLBACK_LAMPORTS)
+                    .min(self.max_lamports);
+                warn!("Tip floor fetch failed ({e}); using {last} lamports");
+                last
+            }
+        };
+
+        if let Ok(mut guard) = self.cached.lock() {
+            *guard = Some((tip, now));
+        }
+        tip
+    }
+
+    fn fetch_tip_lamports(&self) -> Result<u64> {
+        let resp: Value = self.http.get(TIP_FLOOR_URL).send()?.json()?;
+        parse_tip_floor_lamports(&resp)
+    }
+}
+
+/// Parse `ema_landed_tips_50th_percentile` (SOL) from the tip_floor response into lamports.
+fn parse_tip_floor_lamports(resp: &Value) -> Result<u64> {
+    let sol = resp
+        .get(0)
+        .and_then(|d| d.get("ema_landed_tips_50th_percentile"))
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| anyhow!("tip_floor missing ema_landed_tips_50th_percentile: {resp}"))?;
+    if sol < 0.0 {
+        return Err(anyhow!("negative tip floor: {sol}"));
+    }
+    Ok((sol * LAMPORTS_PER_SOL_F64) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +477,24 @@ mod tests {
     fn test_parse_simulate_bundle_rpc_error() {
         let resp = json!({ "error": { "code": -32601, "message": "method not found" } });
         assert!(parse_simulate_bundle(&resp).is_err());
+    }
+
+    #[test]
+    fn test_parse_tip_floor_lamports() {
+        let resp = json!([{ "ema_landed_tips_50th_percentile": 0.00005 }]);
+        assert_eq!(parse_tip_floor_lamports(&resp).unwrap(), 50_000);
+    }
+
+    #[test]
+    fn test_parse_tip_floor_lamports_missing_field() {
+        let resp = json!([{ "landed_tips_50th_percentile": 0.00005 }]);
+        assert!(parse_tip_floor_lamports(&resp).is_err());
+    }
+
+    #[test]
+    fn test_parse_tip_floor_lamports_empty() {
+        let resp = json!([]);
+        assert!(parse_tip_floor_lamports(&resp).is_err());
     }
 
     #[test]

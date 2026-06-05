@@ -27,7 +27,11 @@ use solana_sdk::{
     transaction::VersionedTransaction,
 };
 
-use crate::utils::{jito::JitoClient, swb_cranker::SwbCranker};
+use crate::cache::Cache;
+use crate::utils::{
+    jito::{JitoClient, TipEstimator},
+    swb_cranker::SwbCranker,
+};
 
 use super::{LiquidationIntent, LiquidationStrategy};
 
@@ -40,12 +44,14 @@ const CRANK_DEDUP_COOLDOWN: Duration = Duration::from_secs(30);
 pub struct Executor {
     jito: JitoClient,
     rpc_client: RpcClient,
+    cache: Arc<Cache>,
     swb_cranker: Arc<SwbCranker>,
     signer: Keypair,
     /// RPC URL that supports `simulateBundle` (used for simulate-first crank detection).
     rpc_url: String,
-    sim_api_key: Option<String>,
-    tip_lamports: u64,
+    /// Single key for both `sendBundle` (uuid) and `simulateBundle` (Bearer).
+    bundle_api_key: Option<String>,
+    tip_estimator: TipEstimator,
     tip_accounts: Vec<Pubkey>,
     /// Minimum estimated profit (USD) to bother executing.
     min_profit_usd: u64,
@@ -58,11 +64,12 @@ impl Executor {
     pub fn new(
         jito: JitoClient,
         rpc_client: RpcClient,
+        cache: Arc<Cache>,
         swb_cranker: Arc<SwbCranker>,
         signer: Keypair,
         rpc_url: String,
-        sim_api_key: Option<String>,
-        tip_lamports: u64,
+        bundle_api_key: Option<String>,
+        tip_max_lamports: u64,
         min_profit_usd: u64,
     ) -> Self {
         // Fetch tip accounts once; if unavailable, bundles can't be tipped and we fall back to
@@ -82,11 +89,12 @@ impl Executor {
         Self {
             jito,
             rpc_client,
+            cache,
             swb_cranker,
             signer,
             rpc_url,
-            sim_api_key,
-            tip_lamports,
+            bundle_api_key,
+            tip_estimator: TipEstimator::new(tip_max_lamports),
             tip_accounts,
             min_profit_usd,
             recently_cranked: Mutex::new(HashMap::new()),
@@ -101,6 +109,16 @@ impl Executor {
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
 
+        // Gate on profit *before* assembling, so we don't run swap quotes or create LUTs for
+        // sub-profit targets. (Full lamport-cost-aware gating via SOL price is a follow-up.)
+        if intent.profit < self.min_profit_usd {
+            info!(
+                "Skipping {}: est profit ${} < min ${}",
+                liquidatee, intent.profit, self.min_profit_usd
+            );
+            return Ok(());
+        }
+
         let Some(plan) = strategy.assemble(intent)? else {
             debug!(
                 "Strategy '{}' cannot handle {}; skipping",
@@ -110,38 +128,60 @@ impl Executor {
             return Ok(());
         };
 
-        // Profit gate (USD). Full lamport-cost-aware gating (convert est_cost via SOL price) is a
-        // follow-up; for now we gate on profit and log the estimated cost.
-        if plan.est_profit < self.min_profit_usd {
-            info!(
-                "Skipping {}: est profit ${} < min ${} (est cost {} lamports)",
-                liquidatee, plan.est_profit, self.min_profit_usd, plan.est_cost_lamports
-            );
-            return Ok(());
-        }
-
-        // Simulate-first: only pay for a crank if the program actually reports a stale oracle.
+        // Simulate-first crank detection. The outcome dispatches four ways:
+        //  - ran & ok                 -> bundle send, no crank
+        //  - ran & stale (0x17a1)     -> prepend crank, bundle send
+        //  - ran & other prog error   -> skip (doomed on-chain; don't burn tip+fees)
+        //  - couldn't run (infra err) -> crank all feeds + sequential RPC send (no bundle)
+        // Temp LUTs created during assembly are always cleaned up afterwards, whatever the path.
+        let temp_luts = plan.temp_luts;
         let mut txs = plan.txs;
-        let sim = self
+        let result = match self
             .jito
-            .simulate_bundle(&self.rpc_url, self.sim_api_key.as_deref(), &txs, &[])?;
-        if !sim.succeeded {
-            if sim.is_stale_price_failure() {
+            .simulate_bundle(&self.rpc_url, self.bundle_api_key.as_deref(), &txs, &[])
+        {
+            Ok(sim) if sim.succeeded => self.submit(&txs),
+            Ok(sim) if sim.is_stale_price_failure() => {
                 if let Some(crank_tx) = self.build_crank_if_needed(intent)? {
                     info!("Prepending SWB crank to bundle for {}", liquidatee);
                     txs.insert(0, crank_tx);
                 }
-            } else {
+                self.submit(&txs)
+            }
+            Ok(sim) => {
                 warn!(
-                    "Skipping {}: simulation failed: {}",
+                    "Skipping {}: simulation reports the liquidation would fail: {}",
                     liquidatee,
                     sim.error_message.unwrap_or_default()
                 );
-                return Ok(());
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    "simulateBundle unavailable for {} ({}); cranking all feeds and sending sequentially",
+                    liquidatee, e
+                );
+                if let Some(crank_tx) = self.build_crank_if_needed(intent)? {
+                    txs.insert(0, crank_tx);
+                }
+                self.submit_sequential(&txs)
+            }
+        };
+
+        self.deactivate_temp_luts(&temp_luts);
+        result
+    }
+
+    /// Deactivate any temporary LUTs created during assembly (best-effort; logs on failure).
+    fn deactivate_temp_luts(&self, temp_luts: &[Pubkey]) {
+        for lut_key in temp_luts {
+            if let Err(e) =
+                self.cache
+                    .deactivate_targeted_lut(&self.rpc_client, &self.signer, *lut_key)
+            {
+                warn!("Failed to deactivate temporary LUT {lut_key}: {e}");
             }
         }
-
-        self.submit(&txs)
     }
 
     /// Build a crank tx for the intent's stale feeds, unless they were all cranked very recently.
@@ -210,8 +250,8 @@ impl Executor {
             .tip_accounts
             .first()
             .ok_or_else(|| anyhow!("No Jito tip account available"))?;
-        let ix =
-            system_instruction::transfer(&self.signer.pubkey(), tip_account, self.tip_lamports);
+        let tip_lamports = self.tip_estimator.current_tip();
+        let ix = system_instruction::transfer(&self.signer.pubkey(), tip_account, tip_lamports);
         let blockhash = self.rpc_client.get_latest_blockhash()?;
         let msg = v0::Message::try_compile(&self.signer.pubkey(), &[ix], &[], blockhash)?;
         let tip_tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])?;

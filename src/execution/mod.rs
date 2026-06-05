@@ -11,6 +11,7 @@ pub mod executor;
 pub mod inventory;
 
 use anyhow::Result;
+use solana_program::pubkey::Pubkey;
 use solana_sdk::transaction::VersionedTransaction;
 
 /// What the scan loop emits for the execution layer to act on. Today this is exactly the
@@ -29,6 +30,9 @@ pub struct ExecutionPlan {
     pub est_profit: u64,
     /// Estimated execution cost in lamports (crank updates + Jito tip + priority/tx fees).
     pub est_cost_lamports: u64,
+    /// Temporary LUTs created while assembling (e.g. to fit an oversized tx). The executor
+    /// deactivates these after submission.
+    pub temp_luts: Vec<Pubkey>,
 }
 
 /// A way of funding and assembling a liquidation. Each implementation is a fully-configured

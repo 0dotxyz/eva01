@@ -132,6 +132,7 @@ impl LiquidationStrategy for InventoryStrategy {
         let shortfall = buy_shortfall(repay_amount, wallet_liab);
 
         let mut txs = Vec::new();
+        let mut temp_luts = Vec::new();
         if shortfall > 0 {
             info!(
                 "InventoryStrategy: buying shortfall of {} {} (have {}, need {})",
@@ -149,10 +150,13 @@ impl LiquidationStrategy for InventoryStrategy {
             );
         }
 
-        let (liquidate_tx, _ixs) =
+        let (liquidate_tx, _ixs, temp_lut) =
             self.liquidator_account
                 .build_liquidate_tx(intent, asset_amount, repay_amount)?;
         txs.push(liquidate_tx);
+        if let Some(lut_key) = temp_lut {
+            temp_luts.push(lut_key);
+        }
 
         Ok(Some(ExecutionPlan {
             txs,
@@ -160,6 +164,7 @@ impl LiquidationStrategy for InventoryStrategy {
             // Full lamport cost (crank + tip + fees) is owned by the executor / a follow-up;
             // the executor currently gates on est_profit.
             est_cost_lamports: 0,
+            temp_luts,
         }))
     }
 }

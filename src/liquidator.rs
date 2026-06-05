@@ -2,19 +2,19 @@ use crate::{
     cache::Cache,
     clock_manager,
     config::Eva01Config,
+    execution::{executor::Executor, inventory::InventoryStrategy},
     metrics::{
-        record_liquidation_failure, ACCOUNTS_SCANNED_TOTAL, ACCOUNT_SCAN_DURATION_SECONDS,
-        ERROR_COUNT, FAILURE_REASON_INTERNAL, FAILURE_REASON_NOT_ENOUGH_FUNDS,
-        FAILURE_REASON_RPC_ERROR, FAILURE_REASON_STALE_ORACLES, LIQUIDATABLE_ACCOUNTS_FOUND,
-        LIQUIDATABLE_ACCOUNTS_FOUND_TOTAL, LIQUIDATION_SCAN_IN_PROGRESS,
+        ACCOUNTS_SCANNED_TOTAL, ACCOUNT_SCAN_DURATION_SECONDS, ERROR_COUNT,
+        LIQUIDATABLE_ACCOUNTS_FOUND, LIQUIDATABLE_ACCOUNTS_FOUND_TOTAL, LIQUIDATION_SCAN_IN_PROGRESS,
     },
     rebalancer::Rebalancer,
-    utils::swb_cranker::{SwbCranker, SWB_STALE_HANDLED_ERROR, SWB_STALE_PRICE_ERROR_CODE_NUMBER},
+    utils::{
+        jito::JitoClient,
+        swb_cranker::{SwbCranker, SWB_STALE_HANDLED_ERROR, SWB_STALE_PRICE_ERROR_CODE_NUMBER},
+    },
     wrappers::{
         bank::BankWrapper,
-        liquidator_account::{
-            LiquidationError, LiquidatorAccount, PreparedLiquidatableAccount, PROFIT_SHARE,
-        },
+        liquidator_account::{LiquidatorAccount, PreparedLiquidatableAccount, PROFIT_SHARE},
         marginfi_account::MarginfiAccountWrapper,
         oracle::{OracleWrapper, OracleWrapperTrait},
     },
@@ -22,15 +22,18 @@ use crate::{
 use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use marginfi::state::{bank::BankImpl, marginfi_account::get_health_components};
 use marginfi_type_crate::{
     constants::BANKRUPT_THRESHOLD,
     types::{BalanceSide, BankOperationalState, HealthPriceMode, RequirementType},
 };
-use solana_client::client_error::ClientError;
+use solana_client::rpc_client::RpcClient;
 use solana_program::pubkey::Pubkey;
-use solana_sdk::{account_info::IntoAccountInfo, clock::Clock};
+use solana_sdk::{
+    account_info::IntoAccountInfo, clock::Clock, commitment_config::CommitmentConfig,
+    signature::Keypair,
+};
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},
@@ -48,7 +51,8 @@ pub struct Liquidator {
     run_liquidation: Arc<AtomicBool>,
     stop_liquidator: Arc<AtomicBool>,
     cache: Arc<Cache>,
-    swb_cranker: SwbCranker,
+    executor: Executor,
+    strategy: InventoryStrategy,
     token_dust_threshold: I80F48,
     excluded_mints: HashSet<Pubkey>,
 }
@@ -84,9 +88,33 @@ impl Liquidator {
         stop_liquidator: Arc<AtomicBool>,
         cache: Arc<Cache>,
     ) -> Result<Self> {
-        let swb_cranker = SwbCranker::new(&config, cache.as_ref())?;
+        let swb_cranker = Arc::new(SwbCranker::new(&config, cache.as_ref())?);
 
         let rebalancer = Rebalancer::new(config.clone(), cache.clone())?;
+
+        // Execution layer: bundle-based executor + inventory funding strategy.
+        let jito = JitoClient::new(
+            config.jito_block_engine_url.clone(),
+            config.bundle_api_key.clone(),
+        );
+        let executor = Executor::new(
+            jito,
+            RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed()),
+            cache.clone(),
+            swb_cranker,
+            Keypair::from_bytes(&config.wallet_keypair)?,
+            config.rpc_url.clone(),
+            config.bundle_api_key.clone(),
+            config.jito_tip_max_lamports,
+            config.min_profit as u64,
+        );
+        let strategy = InventoryStrategy::new(
+            liquidator_account.clone(),
+            config.swap_mint,
+            config.jup_swap_api_url.clone(),
+            config.jupiter_api_key.clone(),
+            config.slippage_bps,
+        )?;
 
         Ok(Liquidator {
             liquidator_account,
@@ -95,7 +123,8 @@ impl Liquidator {
             run_liquidation,
             stop_liquidator,
             cache,
-            swb_cranker,
+            executor,
+            strategy,
             token_dust_threshold: config.token_dust_threshold,
             excluded_mints: config.excluded_liquidation_mints,
         })
@@ -115,7 +144,6 @@ impl Liquidator {
             info!("Running the Liquidation process...");
             self.run_liquidation.store(false, Ordering::Relaxed);
 
-            let mut missing_tokens: HashMap<Pubkey, I80F48> = HashMap::new();
             let mut stale_swb_oracles: HashSet<Pubkey> = HashSet::new();
             let evaluated_accounts = self.evaluate_all_accounts(&mut stale_swb_oracles);
 
@@ -124,62 +152,13 @@ impl Liquidator {
                 accounts.sort_by(|a, b| a.profit.cmp(&b.profit));
                 accounts.reverse();
 
-                let mut tokens_in_shortage: HashSet<Pubkey> = HashSet::new();
                 for acc in accounts {
                     let liquidatee = acc.liquidatee_account.address;
-                    let liab_bank = acc.liab_bank;
-                    let liab_amount = acc.liab_amount;
-                    let liab_mint = self
-                        .cache
-                        .banks
-                        .try_get_bank(&liab_bank)
-                        .ok()
-                        .map(|bank| bank.bank.mint);
-
-                    if let Err(e) = self
-                        .liquidator_account
-                        .liquidate(acc, &mut tokens_in_shortage)
-                    {
-                        match e {
-                            LiquidationError::Anyhow(e) => {
-                                error!("Failed to liquidate account {:?}", liquidatee);
-                                let reason = if e.downcast_ref::<ClientError>().is_some() {
-                                    FAILURE_REASON_RPC_ERROR
-                                } else {
-                                    FAILURE_REASON_INTERNAL
-                                };
-                                record_liquidation_failure(reason, liab_mint, None);
-                                ERROR_COUNT.inc();
-                            }
-                            LiquidationError::StaleOracles(swb_oracles) => {
-                                info!(
-                                    "Cranking stale SWB oracles for next cycle: {:?}",
-                                    swb_oracles
-                                );
-                                if let Err(crank_err) =
-                                    self.swb_cranker.crank_oracles(swb_oracles.clone())
-                                {
-                                    warn!("Failed to crank stale SWB oracles: {}", crank_err);
-                                }
-                                let oracle = swb_oracles.first().copied();
-                                record_liquidation_failure(
-                                    FAILURE_REASON_STALE_ORACLES,
-                                    None,
-                                    oracle,
-                                );
-                            }
-                            LiquidationError::NotEnoughFunds => {
-                                missing_tokens
-                                    .entry(liab_bank)
-                                    .and_modify(|m| *m += liab_amount)
-                                    .or_insert(liab_amount);
-                                record_liquidation_failure(
-                                    FAILURE_REASON_NOT_ENOUGH_FUNDS,
-                                    liab_mint,
-                                    None,
-                                );
-                            }
-                        }
+                    // The executor assembles, simulate-first cranks, and lands each liquidation
+                    // (bundle with sequential fallback); funding is just-in-time via the strategy.
+                    if let Err(e) = self.executor.execute(&self.strategy, &acc) {
+                        error!("Failed to execute liquidation for {:?}: {:?}", liquidatee, e);
+                        ERROR_COUNT.inc();
                     }
                 }
             } else if let Err(err) = evaluated_accounts {
@@ -189,7 +168,7 @@ impl Liquidator {
 
             info!("The Liquidation process is complete.");
 
-            if let Err(error) = self.rebalancer.run(missing_tokens) {
+            if let Err(error) = self.rebalancer.run(HashMap::new()) {
                 error!("Rebalancing failed: {:?}", error);
                 ERROR_COUNT.inc();
             }
