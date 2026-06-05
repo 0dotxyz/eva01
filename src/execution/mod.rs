@@ -8,6 +8,7 @@
 //! later) plug in behind the same trait.
 
 pub mod executor;
+pub mod inventory;
 
 use anyhow::Result;
 use solana_sdk::transaction::VersionedTransaction;

@@ -577,7 +577,7 @@ impl LiquidatorAccount {
         Ok(result?)
     }
 
-    fn get_token_balance_for_mint(&self, mint_address: &Pubkey) -> Option<u64> {
+    pub fn get_token_balance_for_mint(&self, mint_address: &Pubkey) -> Option<u64> {
         let token_account_address = self.cache.tokens.get_token_for_mint(mint_address)?;
         match self.cache.tokens.try_get_account(&token_account_address) {
             Ok(account) => match utils::accessor::amount(account.data()) {
