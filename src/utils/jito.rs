@@ -28,6 +28,16 @@ const TIP_FLOOR_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_floor";
 const POLL_INITIAL_DELAY: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Outcome of a bundle that the block engine *accepted*. (Rejection / infra failure is an `Err`.)
+#[derive(Debug, Clone)]
+pub enum BundleOutcome {
+    /// Landed on-chain (confirmed or finalized).
+    Confirmed(String),
+    /// Accepted but not confirmed within the poll window; it may still land, so the caller must
+    /// not re-send (no sequential fallback) to avoid double execution.
+    Unconfirmed(String),
+}
+
 pub struct JitoClient {
     http: Client,
     endpoint: String,
@@ -80,16 +90,19 @@ impl JitoClient {
         parse_bundle_status(&resp)
     }
 
-    /// Submit a bundle and poll until it is `confirmed`/`finalized` or `max_attempts` elapse.
+    /// Submit a bundle and poll for confirmation. Returns `Err` only when the bundle was never
+    /// accepted (infra error / rejection) — safe to retry via another path. A bundle that is
+    /// accepted but doesn't confirm within `max_attempts` returns `Ok(Unconfirmed)`, since it may
+    /// still land and must not be re-sent.
     pub fn send_bundle_and_confirm(
         &self,
         txs: &[VersionedTransaction],
         max_attempts: usize,
-    ) -> Result<String> {
+    ) -> Result<BundleOutcome> {
         let bundle_id = self.send_bundle(txs)?;
         // "0x0" is the block engine's "already processed" sentinel — nothing to poll.
         if bundle_id == "0x0" {
-            return Ok(bundle_id);
+            return Ok(BundleOutcome::Confirmed(bundle_id));
         }
 
         thread::sleep(POLL_INITIAL_DELAY);
@@ -97,14 +110,14 @@ impl JitoClient {
             match self.get_bundle_status(&bundle_id) {
                 Ok(Some(status)) if status == "confirmed" || status == "finalized" => {
                     debug!("Bundle {} {} after {} poll(s)", bundle_id, status, attempt + 1);
-                    return Ok(bundle_id);
+                    return Ok(BundleOutcome::Confirmed(bundle_id));
                 }
                 Ok(_) => {}
                 Err(e) => warn!("Bundle {} status poll failed: {}", bundle_id, e),
             }
             thread::sleep(POLL_INTERVAL);
         }
-        Err(anyhow!("Bundle {} did not confirm in time", bundle_id))
+        Ok(BundleOutcome::Unconfirmed(bundle_id))
     }
 
     /// Fetch the current set of Jito tip accounts (one must receive the tip ix in a bundle).

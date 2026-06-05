@@ -29,7 +29,7 @@ use solana_sdk::{
 
 use crate::cache::Cache;
 use crate::utils::{
-    jito::{JitoClient, TipEstimator},
+    jito::{BundleOutcome, JitoClient, TipEstimator},
     swb_cranker::SwbCranker,
 };
 
@@ -216,20 +216,29 @@ impl Executor {
         Ok(Some(crank_tx))
     }
 
-    /// Land the ordered transactions: try as one atomic Jito bundle (with a tip), and if that
-    /// fails to land, fall back to sending them sequentially over RPC (no tip, non-atomic).
+    /// Land the ordered transactions as an atomic Jito bundle (with a tip). Only fall back to
+    /// sequential RPC when the bundle was *never accepted* (infra error / rejection). If it was
+    /// accepted but didn't confirm in time, leave it in-flight (no resend) to avoid double
+    /// execution — the next cycle re-evaluates and retries if it didn't land.
     pub fn submit(&self, txs: &[VersionedTransaction]) -> Result<()> {
         if txs.is_empty() {
             return Err(anyhow!("Executor::submit called with no transactions"));
         }
         match self.try_bundle(txs) {
-            Ok(bundle_id) => {
+            Ok(BundleOutcome::Confirmed(bundle_id)) => {
                 info!("Bundle landed: {} ({} txs)", bundle_id, txs.len());
+                Ok(())
+            }
+            Ok(BundleOutcome::Unconfirmed(bundle_id)) => {
+                warn!(
+                    "Bundle {} accepted but unconfirmed; leaving in-flight (will retry next cycle if it didn't land)",
+                    bundle_id
+                );
                 Ok(())
             }
             Err(e) => {
                 warn!(
-                    "Bundle submission failed ({}); falling back to sequential send",
+                    "Bundle was not accepted ({}); falling back to sequential send",
                     e
                 );
                 self.submit_sequential(txs)
@@ -238,7 +247,7 @@ impl Executor {
     }
 
     /// Append a tip tx and submit the bundle to the block engine.
-    fn try_bundle(&self, txs: &[VersionedTransaction]) -> Result<String> {
+    fn try_bundle(&self, txs: &[VersionedTransaction]) -> Result<BundleOutcome> {
         let bundle_txs = self.with_tip(txs)?;
         self.jito
             .send_bundle_and_confirm(&bundle_txs, BUNDLE_CONFIRM_ATTEMPTS)
