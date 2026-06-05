@@ -176,6 +176,12 @@ impl SwbCranker {
             .block_on(self.build_crank_transaction_async(swb_oracles))
     }
 
+    /// Build a signed, ready-to-send crank transaction for the given feeds. Used by the executor
+    /// to prepend a crank to a liquidation bundle so the feeds are fresh in the same block.
+    pub fn build_crank_tx(&self, swb_oracles: Vec<Pubkey>) -> Result<VersionedTransaction> {
+        self.build_crank_transaction(swb_oracles)
+    }
+
     async fn build_crank_transaction_async(
         &self,
         swb_oracles: Vec<Pubkey>,
