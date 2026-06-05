@@ -26,10 +26,6 @@ pub type LiquidationIntent = crate::wrappers::liquidator_account::PreparedLiquid
 pub struct ExecutionPlan {
     /// Transactions in execution order. Earlier txs' state is visible to later ones.
     pub txs: Vec<VersionedTransaction>,
-    /// Estimated liquidator profit in USD micro-units (matches `PreparedLiquidatableAccount::profit`).
-    pub est_profit: u64,
-    /// Estimated execution cost in lamports (crank updates + Jito tip + priority/tx fees).
-    pub est_cost_lamports: u64,
     /// Temporary LUTs created while assembling (e.g. to fit an oversized tx). The executor
     /// deactivates these after submission.
     pub temp_luts: Vec<Pubkey>,

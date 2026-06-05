@@ -158,14 +158,7 @@ impl LiquidationStrategy for InventoryStrategy {
             temp_luts.push(lut_key);
         }
 
-        Ok(Some(ExecutionPlan {
-            txs,
-            est_profit: intent.profit,
-            // Full lamport cost (crank + tip + fees) is owned by the executor / a follow-up;
-            // the executor currently gates on est_profit.
-            est_cost_lamports: 0,
-            temp_luts,
-        }))
+        Ok(Some(ExecutionPlan { txs, temp_luts }))
     }
 }
 

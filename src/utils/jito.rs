@@ -109,7 +109,12 @@ impl JitoClient {
         for attempt in 0..max_attempts {
             match self.get_bundle_status(&bundle_id) {
                 Ok(Some(status)) if status == "confirmed" || status == "finalized" => {
-                    debug!("Bundle {} {} after {} poll(s)", bundle_id, status, attempt + 1);
+                    debug!(
+                        "Bundle {} {} after {} poll(s)",
+                        bundle_id,
+                        status,
+                        attempt + 1
+                    );
                     return Ok(BundleOutcome::Confirmed(bundle_id));
                 }
                 Ok(_) => {}
@@ -408,7 +413,10 @@ mod tests {
         let resp = json!({
             "result": { "context": { "slot": 1 }, "value": [ { "confirmation_status": "confirmed" } ] }
         });
-        assert_eq!(parse_bundle_status(&resp).unwrap().as_deref(), Some("confirmed"));
+        assert_eq!(
+            parse_bundle_status(&resp).unwrap().as_deref(),
+            Some("confirmed")
+        );
     }
 
     #[test]

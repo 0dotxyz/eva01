@@ -10,25 +10,19 @@ use crate::{
         make_init_liquidation_record_ix, make_juplend_withdraw_ix, make_kamino_withdraw_ix,
         make_repay_ix, make_start_liquidate_ix, make_withdraw_ix,
     },
-    metrics::{LIQUIDATION_ATTEMPTS, LIQUIDATION_LATENCY_SECONDS, LIQUIDATION_SUCCESSES},
-    utils::{
-        self, marginfi_account_by_authority, simulation_cache::is_tx_too_large_client,
-        swb_cranker::is_stale_swb_price_error,
-    },
+    utils::{self, marginfi_account_by_authority},
 };
 use anyhow::{anyhow, Context, Result};
 use fixed::types::I80F48;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use marginfi_type_crate::{
     constants::{
         ASSET_TAG_DEFAULT, ASSET_TAG_DRIFT, ASSET_TAG_JUPLEND, ASSET_TAG_KAMINO, ASSET_TAG_SOL,
     },
     pdas::derive_drift_spot_market,
-    types::{validate_asset_tags, Bank},
+    types::Bank,
 };
-use solana_client::{
-    client_error::ClientError, rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig,
-};
+use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 
 use solana_program::pubkey::Pubkey;
 use solana_sdk::{
@@ -36,9 +30,9 @@ use solana_sdk::{
     commitment_config::{CommitmentConfig, CommitmentLevel},
     compute_budget::ComputeBudgetInstruction,
     instruction::Instruction,
-    message::{v0::Message, CompileError, VersionedMessage},
-    signature::{Keypair, Signature},
-    signer::{Signer, SignerError},
+    message::{v0::Message, VersionedMessage},
+    signature::Keypair,
+    signer::Signer,
     transaction::VersionedTransaction,
 };
 use std::{collections::HashSet, sync::Arc, thread, time::Duration};
@@ -48,31 +42,6 @@ pub const PROFIT_SHARE: f64 = 0.085;
 /// Max serialized Solana transaction size on the wire.
 const MAX_TX_SIZE: usize = 1232;
 
-#[derive(Debug)]
-pub enum LiquidationError {
-    Anyhow(anyhow::Error),
-    StaleOracles(Vec<Pubkey>),
-    NotEnoughFunds,
-}
-
-impl LiquidationError {
-    fn from_anyhow(e: anyhow::Error) -> Self {
-        Self::Anyhow(e)
-    }
-
-    fn from_compile(e: CompileError) -> Self {
-        Self::Anyhow(e.into())
-    }
-
-    fn from_signer(e: SignerError) -> Self {
-        Self::Anyhow(e.into())
-    }
-
-    fn from_client(e: ClientError) -> Self {
-        Self::Anyhow(e.into())
-    }
-}
-
 pub struct PreparedLiquidatableAccount {
     pub liquidatee_account: MarginfiAccountWrapper,
     pub observation_accounts: ObservationAccounts,
@@ -81,7 +50,6 @@ pub struct PreparedLiquidatableAccount {
     pub asset_amount: I80F48,
     pub liab_amount: I80F48,
     pub profit: u64,
-    pub dust_liab_threshold: I80F48,
 }
 
 pub struct LiquidatorAccount {
@@ -187,167 +155,6 @@ impl LiquidatorAccount {
         }
     }
 
-    pub fn liquidate(
-        &self,
-        account: PreparedLiquidatableAccount,
-        tokens_in_shortage: &mut HashSet<Pubkey>,
-    ) -> Result<(), LiquidationError> {
-        LIQUIDATION_ATTEMPTS.inc();
-
-        // Borrow fields off `account` so it stays whole for `build_liquidate_tx(&account, ..)`.
-        let liquidatee_account = &account.liquidatee_account;
-        let asset_amount = account.asset_amount;
-        let liab_amount = account.liab_amount;
-        let dust_liab_threshold = account.dust_liab_threshold;
-
-        let liquidatee_account_address = liquidatee_account.address;
-        let asset_bank_wrapper = self
-            .cache
-            .banks
-            .try_get_bank(&account.asset_bank)
-            .map_err(LiquidationError::from_anyhow)?;
-
-        let liab_bank_wrapper = self
-            .cache
-            .banks
-            .try_get_bank(&account.liab_bank)
-            .map_err(LiquidationError::from_anyhow)?;
-
-        let liab_mint = liab_bank_wrapper.bank.mint;
-        if tokens_in_shortage.contains(&liab_mint) {
-            debug!(
-                "Skipping liquidation since the liab token is in shortage: {}",
-                liab_mint
-            );
-            return Ok(());
-        }
-
-        let liquidator_account = &self
-            .cache
-            .marginfi_accounts
-            .try_get_account(&self.liquidator_address)
-            .map_err(LiquidationError::from_anyhow)?;
-
-        for bank_to_validate_against in [&asset_bank_wrapper, &liab_bank_wrapper] {
-            if !validate_asset_tags(&bank_to_validate_against.bank, &liquidator_account.account) {
-                // This is a precaution to not attempt to liquidate staked collateral positions when liquidator has non-SOL positions open.
-                // Expected to happen quite often for now. Later on, we can add a more sophisticated filtering logic on the higher level.
-                debug!("Bank {:?} does not match the asset tags of the lending account -> skipping liquidation attempt", bank_to_validate_against.address);
-                return Ok(());
-            }
-        }
-
-        let liab_token_balance =
-            I80F48::from_num(self.get_token_balance_for_mint(&liab_mint).unwrap_or(0));
-
-        if liab_token_balance < dust_liab_threshold {
-            if tokens_in_shortage.insert(liab_mint) {
-                warn!("No tokens: {}", liab_mint);
-            }
-            return Err(LiquidationError::NotEnoughFunds);
-        }
-
-        let (asset_amount, liab_amount) = if liab_token_balance < liab_amount {
-            tokens_in_shortage.insert(liab_mint);
-            info!(
-                "Not enough {} tokens: liquidating for: {} (of {})",
-                liab_mint, liab_token_balance, liab_amount
-            );
-            let proportion = liab_token_balance.checked_div(liab_amount).unwrap();
-            (
-                asset_amount.checked_mul(proportion).unwrap(),
-                liab_token_balance,
-            )
-        } else {
-            (
-                asset_amount,
-                liab_amount
-                    .checked_mul(I80F48::from_num(1.0 - PROFIT_SHARE))
-                    .unwrap(),
-            )
-        };
-
-        let (tx, ixs, temp_lut) = self
-            .build_liquidate_tx(&account, asset_amount, liab_amount)
-            .map_err(LiquidationError::from_anyhow)?;
-
-        info!(
-            "Liquidating account {:?} with liquidator account {:?}. Amount: {} (liab amount: {})",
-            liquidatee_account_address,
-            self.liquidator_address,
-            asset_amount.to_num::<u64>(),
-            liab_amount.to_num::<u64>()
-        );
-
-        let _liquidation_timer = LIQUIDATION_LATENCY_SECONDS.start_timer();
-
-        let result = match self
-            .rpc_client
-            .send_and_confirm_transaction_with_spinner_and_config(
-                &tx,
-                CommitmentConfig::confirmed(),
-                RpcSendTransactionConfig {
-                    skip_preflight: false,
-                    preflight_commitment: Some(CommitmentLevel::Processed),
-                    ..Default::default()
-                },
-            ) {
-            Ok(signature) => {
-                info!(
-                    "Liquidation tx for the Account {} was confirmed. Signature: {}",
-                    liquidatee_account_address, signature,
-                );
-                LIQUIDATION_SUCCESSES.inc();
-                Ok(())
-            }
-            Err(err) => {
-                if is_tx_too_large_client(&err) {
-                    warn!("The liquidation tx was too large: adding the observation accounts to a LUT and retrying");
-                    match self.retry_with_new_luts(ixs) {
-                        Ok(signature) => {
-                            info!(
-                                "Liquidation tx for the Account {} was confirmed. Signature: {}",
-                                liquidatee_account_address, signature,
-                            );
-                            LIQUIDATION_SUCCESSES.inc();
-                            Ok(())
-                        }
-                        Err(err) => {
-                            if err
-                                .downcast_ref::<ClientError>()
-                                .is_some_and(is_stale_swb_price_error)
-                            {
-                                Err(LiquidationError::StaleOracles(
-                                    account.observation_accounts.swb_oracles.clone(),
-                                ))
-                            } else {
-                                Err(LiquidationError::Anyhow(err))
-                            }
-                        }
-                    }
-                } else if is_stale_swb_price_error(&err) {
-                    Err(LiquidationError::StaleOracles(
-                        account.observation_accounts.swb_oracles.clone(),
-                    ))
-                } else {
-                    Err(LiquidationError::from_client(err))
-                }
-            }
-        };
-
-        // Clean up any temporary LUT created to fit an oversized tx.
-        if let Some(lut_key) = temp_lut {
-            if let Err(e) =
-                self.cache
-                    .deactivate_targeted_lut(&self.rpc_client, &self.signer, lut_key)
-            {
-                warn!("Failed to deactivate temporary LUT {lut_key}: {e}");
-            }
-        }
-
-        result
-    }
-
     /// Assemble (compile + sign) the liquidation transaction for the given account and amounts.
     /// Pure tx construction shared by the legacy `liquidate` path and the execution-layer
     /// `InventoryStrategy`. Returns the signed tx, its instructions (for the LUT-retry path),
@@ -430,7 +237,9 @@ impl LiquidatorAccount {
         }
 
         for lending_state_address in juplend_states {
-            let lending_state = self.cache.try_get_juplend_lending_state(lending_state_address)?;
+            let lending_state = self
+                .cache
+                .try_get_juplend_lending_state(lending_state_address)?;
 
             let update_lending_rate_ix =
                 make_update_lending_rate_ix(*lending_state_address, &lending_state);
@@ -571,49 +380,6 @@ impl LiquidatorAccount {
         }
 
         Ok((tx, ixs, temp_lut))
-    }
-
-    fn retry_with_new_luts(&self, ixs: Vec<Instruction>) -> Result<Signature> {
-        self.cache
-            .try_close_deactivated_luts(&self.rpc_client, &self.signer);
-
-        let all_accounts: Vec<Pubkey> = ixs
-            .iter()
-            .flat_map(|ix| ix.accounts.iter().map(|a| a.pubkey))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        let targeted_lut =
-            self.cache
-                .create_targeted_lut(&self.rpc_client, &self.signer, all_accounts)?;
-        let lut_key = targeted_lut.key;
-        let luts = vec![targeted_lut];
-
-        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
-        let msg = Message::try_compile(&self.signer.pubkey(), &ixs, &luts, recent_blockhash)?;
-        let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])?;
-
-        let result = self
-            .rpc_client
-            .send_and_confirm_transaction_with_spinner_and_config(
-                &tx,
-                CommitmentConfig::confirmed(),
-                RpcSendTransactionConfig {
-                    skip_preflight: false,
-                    preflight_commitment: Some(CommitmentLevel::Processed),
-                    ..Default::default()
-                },
-            );
-
-        if let Err(e) = self
-            .cache
-            .deactivate_targeted_lut(&self.rpc_client, &self.signer, lut_key)
-        {
-            warn!("Failed to deactivate targeted LUT {lut_key}: {e}");
-        }
-
-        Ok(result?)
     }
 
     pub fn get_token_balance_for_mint(&self, mint_address: &Pubkey) -> Option<u64> {

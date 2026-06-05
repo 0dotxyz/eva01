@@ -4,8 +4,9 @@ use crate::{
     config::Eva01Config,
     execution::{executor::Executor, inventory::InventoryStrategy},
     metrics::{
-        ACCOUNTS_SCANNED_TOTAL, ACCOUNT_SCAN_DURATION_SECONDS, ERROR_COUNT,
-        LIQUIDATABLE_ACCOUNTS_FOUND, LIQUIDATABLE_ACCOUNTS_FOUND_TOTAL, LIQUIDATION_SCAN_IN_PROGRESS,
+        ACCOUNTS_SCANNED_TOTAL, ACCOUNT_SCAN_DURATION_SECONDS, ERROR_COUNT, FAILED_LIQUIDATIONS,
+        LIQUIDATABLE_ACCOUNTS_FOUND, LIQUIDATABLE_ACCOUNTS_FOUND_TOTAL,
+        LIQUIDATION_SCAN_IN_PROGRESS,
     },
     rebalancer::Rebalancer,
     utils::{
@@ -53,7 +54,6 @@ pub struct Liquidator {
     cache: Arc<Cache>,
     executor: Executor,
     strategy: InventoryStrategy,
-    token_dust_threshold: I80F48,
     excluded_mints: HashSet<Pubkey>,
 }
 
@@ -62,7 +62,6 @@ struct LiquidationAmounts {
     max_liquidatable_asset_amount: I80F48,
     max_liquidatable_liab_amount: I80F48,
     liquidator_profit: I80F48,
-    dust_liab_threshold: I80F48,
 }
 
 impl LiquidationAmounts {
@@ -71,7 +70,6 @@ impl LiquidationAmounts {
             max_liquidatable_asset_amount: I80F48::ZERO,
             max_liquidatable_liab_amount: I80F48::ZERO,
             liquidator_profit: I80F48::ZERO,
-            dust_liab_threshold: I80F48::ZERO,
         }
     }
 
@@ -125,7 +123,6 @@ impl Liquidator {
             cache,
             executor,
             strategy,
-            token_dust_threshold: config.token_dust_threshold,
             excluded_mints: config.excluded_liquidation_mints,
         })
     }
@@ -157,7 +154,11 @@ impl Liquidator {
                     // The executor assembles, simulate-first cranks, and lands each liquidation
                     // (bundle with sequential fallback); funding is just-in-time via the strategy.
                     if let Err(e) = self.executor.execute(&self.strategy, &acc) {
-                        error!("Failed to execute liquidation for {:?}: {:?}", liquidatee, e);
+                        error!(
+                            "Failed to execute liquidation for {:?}: {:?}",
+                            liquidatee, e
+                        );
+                        FAILED_LIQUIDATIONS.inc();
                         ERROR_COUNT.inc();
                     }
                 }
@@ -323,7 +324,6 @@ impl Liquidator {
             asset_amount: slippage_adjusted_asset_amount,
             liab_amount: slippage_adjusted_liab_amount,
             profit: liquidation_amounts.liquidator_profit.to_num(),
-            dust_liab_threshold: liquidation_amounts.dust_liab_threshold,
         }))
     }
 
@@ -485,13 +485,6 @@ impl Liquidator {
             RequirementType::Maintenance,
         )?;
 
-        let dust_liab_threshold = liab_bank_wrapper.calc_amount(
-            &liab_oracle_wrapper,
-            self.token_dust_threshold, // in USD
-            BalanceSide::Liabilities,
-            RequirementType::Equity,
-        )?;
-
         debug!("Account {:?} liquidability evaluation:\nTotal weighted Assets {:?}\nTotal weighted Liabilities {:?}\nMaintenance health {:?}\n\
             Asset Bank {:?}\nAsset maint weight: {:?}\nAsset Amount {:?}\nAsset Value (USD) {:?}\n\
             Liab Bank {:?}\nLiab maint weight: {:?}\nLiab Amount {:?}\nLiab Value (USD) {:?}\n\
@@ -505,7 +498,6 @@ impl Liquidator {
             max_liquidatable_asset_amount,
             max_liquidatable_liab_amount,
             liquidator_profit,
-            dust_liab_threshold,
         })
     }
 

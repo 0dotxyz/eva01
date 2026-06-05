@@ -35,7 +35,6 @@ pub struct Eva01Config {
     pub token_thresholds: HashMap<Pubkey, TokenThresholds>,
     pub excluded_liquidation_mints: HashSet<Pubkey>,
     pub default_token_max_threshold: I80F48,
-    pub token_dust_threshold: I80F48,
     pub titan_ws_endpoint: String,
     pub titan_api_key: String,
     pub jupiter_api_key: String,
@@ -126,13 +125,6 @@ impl Eva01Config {
                 .expect("Invalid DEFAULT_TOKEN_MAX_THRESHOLD number"),
         );
 
-        let token_dust_threshold = I80F48::from_num(
-            std::env::var("TOKEN_DUST_THRESHOLD")
-                .unwrap_or("0.001".to_string())
-                .parse::<f64>()
-                .expect("Invalid TOKEN_DUST_THRESHOLD number"),
-        );
-
         let titan_ws_endpoint = std::env::var("TITAN_WS_ENDPOINT")
             .expect("TITAN_WS_ENDPOINT environment variable is not set");
         let titan_api_key =
@@ -172,7 +164,6 @@ impl Eva01Config {
             token_thresholds,
             excluded_liquidation_mints,
             default_token_max_threshold,
-            token_dust_threshold,
             titan_ws_endpoint,
             titan_api_key,
             jupiter_api_key,
@@ -264,7 +255,6 @@ mod tests {
         let lut_group3 = Pubkey::new_unique().to_string();
         let min_profit = "0.01";
         let default_token_max_threshold = "10.0";
-        let token_dust_threshold = "0.01";
         let metrics_port = "9898";
         let healthcheck_port = "3000";
 
@@ -284,7 +274,6 @@ mod tests {
         jail.set_env("METRICS_BIND_ADDR", "127.0.0.1");
         jail.set_env("METRICS_PORT", metrics_port);
         jail.set_env("DEFAULT_TOKEN_MAX_THRESHOLD", default_token_max_threshold);
-        jail.set_env("TOKEN_DUST_THRESHOLD", token_dust_threshold);
     }
 
     fn setup_rebalancer_env(jail: &mut Jail) {

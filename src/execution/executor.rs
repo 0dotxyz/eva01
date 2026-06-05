@@ -28,6 +28,9 @@ use solana_sdk::{
 };
 
 use crate::cache::Cache;
+use crate::metrics::{
+    FAILED_LIQUIDATIONS, LIQUIDATION_ATTEMPTS, LIQUIDATION_LATENCY_SECONDS, LIQUIDATION_SUCCESSES,
+};
 use crate::utils::{
     jito::{BundleOutcome, JitoClient, TipEstimator},
     swb_cranker::SwbCranker,
@@ -119,6 +122,9 @@ impl Executor {
             return Ok(());
         }
 
+        LIQUIDATION_ATTEMPTS.inc();
+        let _latency = LIQUIDATION_LATENCY_SECONDS.start_timer();
+
         let Some(plan) = strategy.assemble(intent)? else {
             debug!(
                 "Strategy '{}' cannot handle {}; skipping",
@@ -136,10 +142,12 @@ impl Executor {
         // Temp LUTs created during assembly are always cleaned up afterwards, whatever the path.
         let temp_luts = plan.temp_luts;
         let mut txs = plan.txs;
-        let result = match self
-            .jito
-            .simulate_bundle(&self.rpc_url, self.bundle_api_key.as_deref(), &txs, &[])
-        {
+        let result = match self.jito.simulate_bundle(
+            &self.rpc_url,
+            self.bundle_api_key.as_deref(),
+            &txs,
+            &[],
+        ) {
             Ok(sim) if sim.succeeded => self.submit(&txs),
             Ok(sim) if sim.is_stale_price_failure() => {
                 if let Some(crank_tx) = self.build_crank_if_needed(intent)? {
@@ -149,9 +157,11 @@ impl Executor {
                 self.submit(&txs)
             }
             Ok(sim) => {
+                FAILED_LIQUIDATIONS.inc();
                 warn!(
-                    "Skipping {}: simulation reports the liquidation would fail: {}",
+                    "Skipping {}: simulation reports the liquidation would fail (tx index {:?}): {}",
                     liquidatee,
+                    sim.failed_tx_index,
                     sim.error_message.unwrap_or_default()
                 );
                 Ok(())
@@ -172,8 +182,14 @@ impl Executor {
         result
     }
 
-    /// Deactivate any temporary LUTs created during assembly (best-effort; logs on failure).
+    /// Deactivate any temporary LUTs created during assembly (best-effort; logs on failure), and
+    /// close earlier deactivated LUTs whose cooldown has elapsed to reclaim their rent.
     fn deactivate_temp_luts(&self, temp_luts: &[Pubkey]) {
+        if temp_luts.is_empty() {
+            return;
+        }
+        self.cache
+            .try_close_deactivated_luts(&self.rpc_client, &self.signer);
         for lut_key in temp_luts {
             if let Err(e) =
                 self.cache
@@ -226,6 +242,7 @@ impl Executor {
         }
         match self.try_bundle(txs) {
             Ok(BundleOutcome::Confirmed(bundle_id)) => {
+                LIQUIDATION_SUCCESSES.inc();
                 info!("Bundle landed: {} ({} txs)", bundle_id, txs.len());
                 Ok(())
             }
@@ -286,10 +303,16 @@ impl Executor {
                     },
                 )
                 .map_err(|e| {
-                    anyhow!("Sequential send failed at tx {}/{}: {}", i + 1, txs.len(), e)
+                    anyhow!(
+                        "Sequential send failed at tx {}/{}: {}",
+                        i + 1,
+                        txs.len(),
+                        e
+                    )
                 })?;
             info!("Sequential tx {}/{} confirmed: {}", i + 1, txs.len(), sig);
         }
+        LIQUIDATION_SUCCESSES.inc();
         Ok(())
     }
 }

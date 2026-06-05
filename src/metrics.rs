@@ -1,8 +1,7 @@
 use anyhow::Context;
 use lazy_static::lazy_static;
 use prometheus::{
-    CounterVec, Encoder, Histogram, HistogramOpts, IntCounter as Counter, IntGauge, Opts, Registry,
-    TextEncoder,
+    Encoder, Histogram, HistogramOpts, IntCounter as Counter, IntGauge, Opts, Registry, TextEncoder,
 };
 
 lazy_static! {
@@ -48,13 +47,6 @@ lazy_static! {
         "eva01_liquidation_scan_in_progress",
         "Flag indicating whether the liquidator is scanning accounts"
     ));
-    pub static ref LIQUIDATION_FAILURES: CounterVec = register_counter_vec(
-        Opts::new(
-            "eva01_liquidation_failures_total",
-            "Total number of liquidation failures grouped by reason, liability mint, and oracle"
-        ),
-        &["reason", "liab_mint", "oracle"]
-    );
     pub static ref ACCOUNT_SCAN_DURATION_SECONDS: Histogram = register_histogram(
         HistogramOpts::new(
             "eva01_account_scan_duration_seconds",
@@ -73,41 +65,11 @@ lazy_static! {
     );
 }
 
-pub const FAILURE_REASON_INTERNAL: &str = "internal";
-pub const FAILURE_REASON_RPC_ERROR: &str = "rpc_error";
-pub const FAILURE_REASON_STALE_ORACLES: &str = "stale_oracles";
-pub const FAILURE_REASON_NOT_ENOUGH_FUNDS: &str = "not_enough_funds";
-
-pub fn record_liquidation_failure(
-    reason: &str,
-    liab_mint: Option<solana_program::pubkey::Pubkey>,
-    oracle: Option<solana_program::pubkey::Pubkey>,
-) {
-    FAILED_LIQUIDATIONS.inc();
-    let mint_str = liab_mint
-        .map(|m| m.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let oracle_str = oracle
-        .map(|o| o.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    LIQUIDATION_FAILURES
-        .with_label_values(&[reason, &mint_str, &oracle_str])
-        .inc();
-}
-
 fn register_counter(opts: Opts) -> Counter {
     let counter = Counter::with_opts(opts).expect("create counter");
     REGISTRY
         .register(Box::new(counter.clone()))
         .expect("register counter");
-    counter
-}
-
-fn register_counter_vec(opts: Opts, labels: &[&str]) -> CounterVec {
-    let counter = CounterVec::new(opts, labels).expect("create counter vec");
-    REGISTRY
-        .register(Box::new(counter.clone()))
-        .expect("register counter vec");
     counter
 }
 
