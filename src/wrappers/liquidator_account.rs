@@ -189,34 +189,27 @@ impl LiquidatorAccount {
         account: PreparedLiquidatableAccount,
         tokens_in_shortage: &mut HashSet<Pubkey>,
     ) -> Result<(), LiquidationError> {
-        let PreparedLiquidatableAccount {
-            liquidatee_account,
-            observation_accounts,
-            asset_bank,
-            liab_bank,
-            asset_amount,
-            liab_amount,
-            dust_liab_threshold,
-            ..
-        } = account;
-
         LIQUIDATION_ATTEMPTS.inc();
+
+        // Borrow fields off `account` so it stays whole for `build_liquidate_tx(&account, ..)`.
+        let liquidatee_account = &account.liquidatee_account;
+        let asset_amount = account.asset_amount;
+        let liab_amount = account.liab_amount;
+        let dust_liab_threshold = account.dust_liab_threshold;
 
         let liquidatee_account_address = liquidatee_account.address;
         let asset_bank_wrapper = self
             .cache
             .banks
-            .try_get_bank(&asset_bank)
+            .try_get_bank(&account.asset_bank)
             .map_err(LiquidationError::from_anyhow)?;
 
         let liab_bank_wrapper = self
             .cache
             .banks
-            .try_get_bank(&liab_bank)
+            .try_get_bank(&account.liab_bank)
             .map_err(LiquidationError::from_anyhow)?;
 
-        let signer_pk = self.signer.pubkey();
-        let asset_mint = asset_bank_wrapper.bank.mint;
         let liab_mint = liab_bank_wrapper.bank.mint;
         if tokens_in_shortage.contains(&liab_mint) {
             debug!(
@@ -271,216 +264,9 @@ impl LiquidatorAccount {
             )
         };
 
-        let ObservationAccounts {
-            observation_accounts: liquidatee_observation_accounts,
-            swb_oracles: liquidatee_swb_oracles,
-            bank_pks: liquidatee_banks,
-            kamino_reserves,
-            drift_spot_markets,
-            juplend_states,
-        } = observation_accounts;
-
-        debug!(
-            "The Liquidatee {:?} observation accounts: {:?}",
-            liquidatee_account_address, liquidatee_observation_accounts
-        );
-
-        let liquidation_record =
-            if liquidatee_account.account.liquidation_record == Pubkey::default() {
-                // warn!("IGNORING UNINITIALIZED LIQ RECORD");
-                // return Ok(());
-                self.init_liq_record(&liquidatee_account)
-                    .map_err(LiquidationError::from_anyhow)?
-            } else {
-                liquidatee_account.account.liquidation_record
-            };
-        let all_tags: Vec<u8> = liquidatee_banks
-            .iter()
-            .filter_map(|pk| self.cache.banks.try_get_bank(pk).ok())
-            .map(|b| b.bank.config.asset_tag)
-            .collect();
-        let luts = self.cache.luts.lock().unwrap().select_for_tags(&all_tags);
-        let mut ixs = Vec::new();
-
-        ixs.push(self.cu_limit_ix.clone());
-
-        // TODO: think about posting an swb_crank ix here
-
-        let start_ix = make_start_liquidate_ix(
-            liquidatee_account_address,
-            signer_pk,
-            liquidation_record,
-            liquidatee_observation_accounts.as_ref(),
-            &liquidatee_banks,
-        );
-
-        for kamino_reserve_address in kamino_reserves {
-            let kamino_reserve = self
-                .cache
-                .try_get_kamino_reserve(&kamino_reserve_address)
-                .map_err(LiquidationError::from_anyhow)?;
-
-            debug!(
-                "Putting a refresh ix for Kamino Reserve: {}",
-                kamino_reserve_address
-            );
-
-            let refresh_reserve_ix =
-                make_refresh_reserve_ix(kamino_reserve_address, &kamino_reserve);
-            ixs.push(refresh_reserve_ix);
-        }
-
-        for spot_market_address in drift_spot_markets {
-            let spot_market = self
-                .cache
-                .try_get_drift_market(&spot_market_address)
-                .map_err(LiquidationError::from_anyhow)?;
-
-            let refresh_spot_market_ix = make_refresh_spot_market_ix(
-                spot_market_address,
-                spot_market.market.vault,
-                spot_market.market.oracle,
-            );
-            ixs.push(refresh_spot_market_ix);
-        }
-
-        for lending_state_address in juplend_states {
-            let lending_state = self
-                .cache
-                .try_get_juplend_lending_state(&lending_state_address)
-                .map_err(LiquidationError::from_anyhow)?;
-
-            let update_lending_rate_ix =
-                make_update_lending_rate_ix(lending_state_address, &lending_state);
-            ixs.push(update_lending_rate_ix);
-        }
-
-        let asset_mint_wrapper = self
-            .cache
-            .mints
-            .try_get_account(&asset_mint)
+        let (tx, ixs) = self
+            .build_liquidate_tx(&account, asset_amount, liab_amount)
             .map_err(LiquidationError::from_anyhow)?;
-
-        let withdraw_ix = match asset_bank_wrapper.bank.config.asset_tag {
-            ASSET_TAG_DEFAULT | ASSET_TAG_SOL => make_withdraw_ix(
-                self.group,
-                liquidatee_account_address,
-                signer_pk,
-                &asset_bank_wrapper,
-                &asset_mint_wrapper,
-                liquidatee_observation_accounts.as_ref(),
-                asset_amount.to_num(),
-                false,
-            ),
-            ASSET_TAG_KAMINO => {
-                let kamino_reserve = self
-                    .cache
-                    .try_get_kamino_reserve(&asset_bank_wrapper.bank.integration_acc_1)
-                    .map_err(LiquidationError::from_anyhow)?;
-
-                let refresh_obligation_ix = make_refresh_obligation_ix(
-                    asset_bank_wrapper.bank.integration_acc_2,
-                    kamino_reserve.reserve.lending_market,
-                    &[asset_bank_wrapper.bank.integration_acc_1],
-                );
-                ixs.push(refresh_obligation_ix);
-
-                make_kamino_withdraw_ix(
-                    self.group,
-                    liquidatee_account_address,
-                    signer_pk,
-                    &asset_bank_wrapper,
-                    &asset_mint_wrapper,
-                    asset_bank_wrapper.bank.integration_acc_2,
-                    &kamino_reserve,
-                    liquidatee_observation_accounts.as_ref(),
-                    asset_amount.to_num(),
-                    false,
-                )
-            }
-            ASSET_TAG_DRIFT => {
-                let (drift_spot_market, reward_spot_market, reward_spot_market_2) = self
-                    .get_drift_spot_markets_for_bank(&asset_bank_wrapper.bank)
-                    .map_err(LiquidationError::from_anyhow)?;
-
-                make_drift_withdraw_ix(
-                    self.group,
-                    liquidatee_account_address,
-                    signer_pk,
-                    &asset_bank_wrapper,
-                    &asset_mint_wrapper,
-                    &drift_spot_market,
-                    reward_spot_market.as_ref(),
-                    reward_spot_market_2.as_ref(),
-                    liquidatee_observation_accounts.as_ref(),
-                    asset_amount.to_num(),
-                    false,
-                )
-            }
-            ASSET_TAG_JUPLEND => {
-                let lending_state = self
-                    .cache
-                    .try_get_juplend_lending_state(&asset_bank_wrapper.bank.integration_acc_1)
-                    .map_err(LiquidationError::from_anyhow)?;
-
-                make_juplend_withdraw_ix(
-                    self.group,
-                    liquidatee_account_address,
-                    signer_pk,
-                    &asset_bank_wrapper,
-                    &asset_mint_wrapper,
-                    &lending_state,
-                    liquidatee_observation_accounts.as_ref(),
-                    asset_amount.to_num(),
-                    false,
-                )
-            }
-            _ => {
-                return Err(LiquidationError::Anyhow(anyhow!(
-                    "Unsupported asset tag: {}",
-                    asset_bank_wrapper.bank.config.asset_tag
-                )));
-            }
-        };
-        ixs.push(start_ix);
-        ixs.push(withdraw_ix);
-
-        let liab_mint_wrapper = self
-            .cache
-            .mints
-            .try_get_account(&liab_mint)
-            .map_err(LiquidationError::from_anyhow)?;
-        let repay_ix = make_repay_ix(
-            self.group,
-            liquidatee_account_address,
-            signer_pk,
-            &liab_bank_wrapper,
-            &liab_mint_wrapper,
-            liab_amount.to_num(),
-            false,
-        );
-        ixs.push(repay_ix);
-
-        let end_ix = make_end_liquidate_ix(
-            liquidatee_account_address,
-            signer_pk,
-            liquidation_record,
-            self.cache.global_fee_state_key,
-            self.cache.global_fee_wallet,
-            &liquidatee_banks,
-        );
-        ixs.push(end_ix);
-
-        let recent_blockhash = self
-            .rpc_client
-            .get_latest_blockhash()
-            .map_err(LiquidationError::from_client)?;
-
-        let msg = Message::try_compile(&signer_pk, &ixs, &luts, recent_blockhash)
-            .map_err(LiquidationError::from_compile)?;
-
-        let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
-            .map_err(LiquidationError::from_signer)?;
 
         info!(
             "Liquidating account {:?} with liquidator account {:?}. Amount: {} (liab amount: {})",
@@ -528,19 +314,224 @@ impl LiquidatorAccount {
                                 .downcast_ref::<ClientError>()
                                 .is_some_and(is_stale_swb_price_error)
                             {
-                                Err(LiquidationError::StaleOracles(liquidatee_swb_oracles))
+                                Err(LiquidationError::StaleOracles(
+                                    account.observation_accounts.swb_oracles.clone(),
+                                ))
                             } else {
                                 Err(LiquidationError::Anyhow(err))
                             }
                         }
                     }
                 } else if is_stale_swb_price_error(&err) {
-                    Err(LiquidationError::StaleOracles(liquidatee_swb_oracles))
+                    Err(LiquidationError::StaleOracles(
+                        account.observation_accounts.swb_oracles.clone(),
+                    ))
                 } else {
                     Err(LiquidationError::from_client(err))
                 }
             }
         }
+    }
+
+    /// Assemble (compile + sign) the liquidation transaction for the given account and amounts.
+    /// Pure tx construction shared by the legacy `liquidate` path and the execution-layer
+    /// `InventoryStrategy`; returns the signed tx plus its instructions (for the LUT-retry path).
+    pub fn build_liquidate_tx(
+        &self,
+        account: &PreparedLiquidatableAccount,
+        asset_amount: I80F48,
+        liab_amount: I80F48,
+    ) -> Result<(VersionedTransaction, Vec<Instruction>)> {
+        let liquidatee_account_address = account.liquidatee_account.address;
+        let signer_pk = self.signer.pubkey();
+
+        let asset_bank_wrapper = self.cache.banks.try_get_bank(&account.asset_bank)?;
+        let liab_bank_wrapper = self.cache.banks.try_get_bank(&account.liab_bank)?;
+        let asset_mint = asset_bank_wrapper.bank.mint;
+        let liab_mint = liab_bank_wrapper.bank.mint;
+
+        let ObservationAccounts {
+            observation_accounts: liquidatee_observation_accounts,
+            bank_pks: liquidatee_banks,
+            kamino_reserves,
+            drift_spot_markets,
+            juplend_states,
+            ..
+        } = &account.observation_accounts;
+
+        debug!(
+            "The Liquidatee {:?} observation accounts: {:?}",
+            liquidatee_account_address, liquidatee_observation_accounts
+        );
+
+        let liquidation_record =
+            if account.liquidatee_account.account.liquidation_record == Pubkey::default() {
+                self.init_liq_record(&account.liquidatee_account)?
+            } else {
+                account.liquidatee_account.account.liquidation_record
+            };
+
+        let all_tags: Vec<u8> = liquidatee_banks
+            .iter()
+            .filter_map(|pk| self.cache.banks.try_get_bank(pk).ok())
+            .map(|b| b.bank.config.asset_tag)
+            .collect();
+        let luts = self.cache.luts.lock().unwrap().select_for_tags(&all_tags);
+
+        let mut ixs = Vec::new();
+        ixs.push(self.cu_limit_ix.clone());
+
+        let start_ix = make_start_liquidate_ix(
+            liquidatee_account_address,
+            signer_pk,
+            liquidation_record,
+            liquidatee_observation_accounts.as_ref(),
+            liquidatee_banks,
+        );
+
+        for kamino_reserve_address in kamino_reserves {
+            let kamino_reserve = self.cache.try_get_kamino_reserve(kamino_reserve_address)?;
+
+            debug!(
+                "Putting a refresh ix for Kamino Reserve: {}",
+                kamino_reserve_address
+            );
+
+            let refresh_reserve_ix =
+                make_refresh_reserve_ix(*kamino_reserve_address, &kamino_reserve);
+            ixs.push(refresh_reserve_ix);
+        }
+
+        for spot_market_address in drift_spot_markets {
+            let spot_market = self.cache.try_get_drift_market(spot_market_address)?;
+
+            let refresh_spot_market_ix = make_refresh_spot_market_ix(
+                *spot_market_address,
+                spot_market.market.vault,
+                spot_market.market.oracle,
+            );
+            ixs.push(refresh_spot_market_ix);
+        }
+
+        for lending_state_address in juplend_states {
+            let lending_state = self.cache.try_get_juplend_lending_state(lending_state_address)?;
+
+            let update_lending_rate_ix =
+                make_update_lending_rate_ix(*lending_state_address, &lending_state);
+            ixs.push(update_lending_rate_ix);
+        }
+
+        let asset_mint_wrapper = self.cache.mints.try_get_account(&asset_mint)?;
+
+        let withdraw_ix = match asset_bank_wrapper.bank.config.asset_tag {
+            ASSET_TAG_DEFAULT | ASSET_TAG_SOL => make_withdraw_ix(
+                self.group,
+                liquidatee_account_address,
+                signer_pk,
+                &asset_bank_wrapper,
+                &asset_mint_wrapper,
+                liquidatee_observation_accounts.as_ref(),
+                asset_amount.to_num(),
+                false,
+            ),
+            ASSET_TAG_KAMINO => {
+                let kamino_reserve = self
+                    .cache
+                    .try_get_kamino_reserve(&asset_bank_wrapper.bank.integration_acc_1)?;
+
+                let refresh_obligation_ix = make_refresh_obligation_ix(
+                    asset_bank_wrapper.bank.integration_acc_2,
+                    kamino_reserve.reserve.lending_market,
+                    &[asset_bank_wrapper.bank.integration_acc_1],
+                );
+                ixs.push(refresh_obligation_ix);
+
+                make_kamino_withdraw_ix(
+                    self.group,
+                    liquidatee_account_address,
+                    signer_pk,
+                    &asset_bank_wrapper,
+                    &asset_mint_wrapper,
+                    asset_bank_wrapper.bank.integration_acc_2,
+                    &kamino_reserve,
+                    liquidatee_observation_accounts.as_ref(),
+                    asset_amount.to_num(),
+                    false,
+                )
+            }
+            ASSET_TAG_DRIFT => {
+                let (drift_spot_market, reward_spot_market, reward_spot_market_2) =
+                    self.get_drift_spot_markets_for_bank(&asset_bank_wrapper.bank)?;
+
+                make_drift_withdraw_ix(
+                    self.group,
+                    liquidatee_account_address,
+                    signer_pk,
+                    &asset_bank_wrapper,
+                    &asset_mint_wrapper,
+                    &drift_spot_market,
+                    reward_spot_market.as_ref(),
+                    reward_spot_market_2.as_ref(),
+                    liquidatee_observation_accounts.as_ref(),
+                    asset_amount.to_num(),
+                    false,
+                )
+            }
+            ASSET_TAG_JUPLEND => {
+                let lending_state = self
+                    .cache
+                    .try_get_juplend_lending_state(&asset_bank_wrapper.bank.integration_acc_1)?;
+
+                make_juplend_withdraw_ix(
+                    self.group,
+                    liquidatee_account_address,
+                    signer_pk,
+                    &asset_bank_wrapper,
+                    &asset_mint_wrapper,
+                    &lending_state,
+                    liquidatee_observation_accounts.as_ref(),
+                    asset_amount.to_num(),
+                    false,
+                )
+            }
+            _ => {
+                return Err(anyhow!(
+                    "Unsupported asset tag: {}",
+                    asset_bank_wrapper.bank.config.asset_tag
+                ));
+            }
+        };
+
+        ixs.push(start_ix);
+        ixs.push(withdraw_ix);
+
+        let liab_mint_wrapper = self.cache.mints.try_get_account(&liab_mint)?;
+        let repay_ix = make_repay_ix(
+            self.group,
+            liquidatee_account_address,
+            signer_pk,
+            &liab_bank_wrapper,
+            &liab_mint_wrapper,
+            liab_amount.to_num(),
+            false,
+        );
+        ixs.push(repay_ix);
+
+        let end_ix = make_end_liquidate_ix(
+            liquidatee_account_address,
+            signer_pk,
+            liquidation_record,
+            self.cache.global_fee_state_key,
+            self.cache.global_fee_wallet,
+            liquidatee_banks,
+        );
+        ixs.push(end_ix);
+
+        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
+        let msg = Message::try_compile(&signer_pk, &ixs, &luts, recent_blockhash)?;
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])?;
+
+        Ok((tx, ixs))
     }
 
     fn retry_with_new_luts(&self, ixs: Vec<Instruction>) -> Result<Signature> {
