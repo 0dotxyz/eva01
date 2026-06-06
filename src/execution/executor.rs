@@ -11,7 +11,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Result};
@@ -32,7 +32,7 @@ use crate::metrics::{
     FAILED_LIQUIDATIONS, LIQUIDATION_ATTEMPTS, LIQUIDATION_LATENCY_SECONDS, LIQUIDATION_SUCCESSES,
 };
 use crate::utils::{
-    jito::{BundleOutcome, JitoClient, TipEstimator},
+    jito::{default_tip_accounts, BundleOutcome, JitoClient, TipEstimator},
     swb_cranker::SwbCranker,
 };
 
@@ -75,19 +75,9 @@ impl Executor {
         tip_max_lamports: u64,
         min_profit_usd: u64,
     ) -> Self {
-        // Fetch tip accounts once; if unavailable, bundles can't be tipped and we fall back to
-        // sequential sends, so degrade gracefully rather than failing startup.
-        let tip_accounts = match jito.get_tip_accounts() {
-            Ok(accounts) if !accounts.is_empty() => accounts,
-            Ok(_) => {
-                warn!("Jito returned no tip accounts; bundles will fall back to sequential sends");
-                Vec::new()
-            }
-            Err(e) => {
-                warn!("Failed to fetch Jito tip accounts ({e}); bundles will fall back to sequential sends");
-                Vec::new()
-            }
-        };
+        // The Jito tip accounts are static and well-known; use the hardcoded set rather than a
+        // network fetch (the REST tip_accounts endpoint is unreliable).
+        let tip_accounts = default_tip_accounts();
 
         Self {
             jito,
@@ -272,10 +262,16 @@ impl Executor {
 
     /// Clone the core txs and append a tip transfer tx (required for Jito bundles).
     fn with_tip(&self, txs: &[VersionedTransaction]) -> Result<Vec<VersionedTransaction>> {
-        let tip_account = self
-            .tip_accounts
-            .first()
-            .ok_or_else(|| anyhow!("No Jito tip account available"))?;
+        if self.tip_accounts.is_empty() {
+            return Err(anyhow!("No Jito tip account available"));
+        }
+        // Pick a tip account pseudo-randomly to spread tip load across them (Jito's guidance).
+        let idx = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0)
+            % self.tip_accounts.len();
+        let tip_account = &self.tip_accounts[idx];
         let tip_lamports = self.tip_estimator.current_tip();
         let ix = system_instruction::transfer(&self.signer.pubkey(), tip_account, tip_lamports);
         let blockhash = self.rpc_client.get_latest_blockhash()?;

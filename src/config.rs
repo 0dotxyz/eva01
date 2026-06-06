@@ -7,7 +7,6 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub struct TokenThresholds {
-    pub min_value: I80F48,
     pub max_value: I80F48,
 }
 
@@ -139,7 +138,8 @@ impl Eva01Config {
             .unwrap_or_else(|_| "1000000".to_string())
             .parse()
             .expect("Invalid JITO_TIP_MAX_LAMPORTS number");
-        let bundle_api_key = std::env::var("BUNDLE_API_KEY").ok();
+        // Single key for both bundle sending (`sendBundle` uuid) and simulation (`simulateBundle`).
+        let bundle_api_key = std::env::var("JITO_API_KEY").ok();
 
         Ok(Eva01Config {
             rpc_url,
@@ -203,7 +203,6 @@ pub fn load_token_thresholds_from_env() -> anyhow::Result<HashMap<Pubkey, TokenT
                 out.insert(
                     pk,
                     TokenThresholds {
-                        min_value: I80F48::from_num(min_threshold),
                         max_value: I80F48::from_num(max_threshold),
                     },
                 );

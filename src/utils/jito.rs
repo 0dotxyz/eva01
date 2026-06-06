@@ -21,7 +21,17 @@ use solana_program::pubkey::Pubkey;
 use solana_sdk::transaction::VersionedTransaction;
 
 const DEFAULT_BUNDLE_ENDPOINT: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
-const TIP_ACCOUNTS_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_accounts";
+/// The well-known static Jito tip accounts. These rarely change; a bundle must tip one of them.
+const JITO_TIP_ACCOUNTS: [&str; 8] = [
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+];
 const TIP_FLOOR_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_floor";
 
 /// How long to wait after submission before the first status poll, and between polls.
@@ -125,12 +135,6 @@ impl JitoClient {
         Ok(BundleOutcome::Unconfirmed(bundle_id))
     }
 
-    /// Fetch the current set of Jito tip accounts (one must receive the tip ix in a bundle).
-    pub fn get_tip_accounts(&self) -> Result<Vec<Pubkey>> {
-        let resp: Value = self.http.get(TIP_ACCOUNTS_URL).send()?.json()?;
-        parse_tip_accounts(&resp)
-    }
-
     /// Simulate a bundle atomically against a `simulateBundle`-capable RPC endpoint.
     ///
     /// Uses `skipSigVerify` + `replaceRecentBlockhash` so unsigned, blockhash-less txs can be
@@ -223,14 +227,11 @@ fn parse_bundle_status(resp: &Value) -> Result<Option<String>> {
         .map(|s| s.to_string()))
 }
 
-/// Parse the tip-accounts REST response (a plain JSON array of base58 pubkeys).
-fn parse_tip_accounts(resp: &Value) -> Result<Vec<Pubkey>> {
-    let arr = resp
-        .as_array()
-        .ok_or_else(|| anyhow!("Unexpected tip_accounts response: {}", resp))?;
-    arr.iter()
-        .filter_map(|v| v.as_str())
-        .map(|s| Pubkey::from_str(s).map_err(|e| anyhow!("Invalid tip account {s}: {e}")))
+/// The static Jito tip accounts as `Pubkey`s (parsed from the hardcoded constants).
+pub fn default_tip_accounts() -> Vec<Pubkey> {
+    JITO_TIP_ACCOUNTS
+        .iter()
+        .map(|s| Pubkey::from_str(s).expect("hardcoded Jito tip account must be valid"))
         .collect()
 }
 
@@ -432,19 +433,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_tip_accounts() {
-        let a = Pubkey::new_unique().to_string();
-        let b = Pubkey::new_unique().to_string();
-        let resp = json!([a, b]);
-        let parsed = parse_tip_accounts(&resp).unwrap();
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].to_string(), a);
-    }
-
-    #[test]
-    fn test_parse_tip_accounts_bad_shape() {
-        let resp = json!({ "not": "an array" });
-        assert!(parse_tip_accounts(&resp).is_err());
+    fn test_default_tip_accounts() {
+        let accts = default_tip_accounts();
+        assert_eq!(accts.len(), 8);
+        // Sanity: all distinct and parse as valid pubkeys (parsing happens in the fn).
+        let unique: std::collections::HashSet<_> = accts.iter().collect();
+        assert_eq!(unique.len(), 8);
     }
 
     #[test]
