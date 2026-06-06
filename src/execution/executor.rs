@@ -44,6 +44,32 @@ const BUNDLE_CONFIRM_ATTEMPTS: usize = 10;
 /// Don't re-crank a feed cranked more recently than this (dedup across intents in a drain).
 const CRANK_DEDUP_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// Re-check a liability mint that has no swap route only after this long (routes can appear).
+const NO_ROUTE_QUARANTINE_TTL: Duration = Duration::from_secs(3600);
+
+/// Base / cap for the per-target exponential backoff after a transient assemble failure
+/// (e.g. a Jupiter `429`): skip the target for `BASE * 2^(failures-1)`, capped at `MAX`.
+const TARGET_BACKOFF_BASE: Duration = Duration::from_secs(30);
+const TARGET_BACKOFF_MAX: Duration = Duration::from_secs(900);
+
+/// Per-target backoff state after a transient (non-route) assemble failure.
+struct TargetBackoff {
+    /// Consecutive assemble failures (drives the exponential cooldown).
+    failures: u32,
+    /// Don't re-attempt the target before this time.
+    retry_after: Instant,
+}
+
+/// Exponential backoff: `BASE * 2^(failures-1)`, capped at `TARGET_BACKOFF_MAX`.
+fn target_backoff_delay(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(16);
+    let secs = TARGET_BACKOFF_BASE
+        .as_secs()
+        .saturating_mul(1u64 << shift)
+        .min(TARGET_BACKOFF_MAX.as_secs());
+    Duration::from_secs(secs)
+}
+
 pub struct Executor {
     jito: JitoClient,
     rpc_client: RpcClient,
@@ -60,6 +86,10 @@ pub struct Executor {
     min_profit_usd: u64,
     /// Feeds cranked recently, to avoid double-cranking across intents in the same drain.
     recently_cranked: Mutex<HashMap<Pubkey, Instant>>,
+    /// Liability mints with no swap route (NO_ROUTES_FOUND); quarantined to stop re-quoting them.
+    quarantined_mints: Mutex<HashMap<Pubkey, Instant>>,
+    /// Per-liquidatee backoff after a transient assemble failure (rate limits, network, etc.).
+    failed_targets: Mutex<HashMap<Pubkey, TargetBackoff>>,
 }
 
 impl Executor {
@@ -91,6 +121,8 @@ impl Executor {
             tip_accounts,
             min_profit_usd,
             recently_cranked: Mutex::new(HashMap::new()),
+            quarantined_mints: Mutex::new(HashMap::new()),
+            failed_targets: Mutex::new(HashMap::new()),
         }
     }
 
@@ -112,16 +144,50 @@ impl Executor {
             return Ok(());
         }
 
-        LIQUIDATION_ATTEMPTS.inc();
-        let _latency = LIQUIDATION_LATENCY_SECONDS.start_timer();
-
-        let Some(plan) = strategy.assemble(intent)? else {
+        // Skip targets we recently failed to assemble, *before* incurring an attempt or a Jupiter
+        // quote: a liab mint with no swap route is quarantined; a target that hit a transient
+        // error (rate limit, etc.) is backed off. Both expire so recovering targets retry.
+        let liab_mint = self.intent_liab_mint(intent);
+        if let Some(mint) = liab_mint {
+            if self.is_mint_quarantined(&mint) {
+                debug!(
+                    "Skipping {}: liab mint {} has no swap route (quarantined)",
+                    liquidatee, mint
+                );
+                return Ok(());
+            }
+        }
+        if self.is_target_backed_off(&liquidatee) {
             debug!(
-                "Strategy '{}' cannot handle {}; skipping",
-                strategy.name(),
+                "Skipping {}: backing off after a recent execution failure",
                 liquidatee
             );
             return Ok(());
+        }
+
+        LIQUIDATION_ATTEMPTS.inc();
+        let _latency = LIQUIDATION_LATENCY_SECONDS.start_timer();
+
+        let plan = match strategy.assemble(intent) {
+            Ok(Some(plan)) => {
+                // Assembly succeeded (quote went through or no buy was needed): clear any backoff.
+                self.clear_target_backoff(&liquidatee);
+                plan
+            }
+            Ok(None) => {
+                debug!(
+                    "Strategy '{}' cannot handle {}; skipping",
+                    strategy.name(),
+                    liquidatee
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                // Record a quarantine/backoff so we stop hammering this target, then propagate so
+                // the caller logs + counts the failure once (subsequent cycles skip silently).
+                self.note_assemble_failure(&liquidatee, liab_mint, &e);
+                return Err(e);
+            }
         };
 
         // Simulate-first crank detection. The outcome dispatches four ways:
@@ -170,6 +236,81 @@ impl Executor {
 
         self.deactivate_temp_luts(&temp_luts);
         result
+    }
+
+    /// The liability mint for an intent, looked up via the bank cache (`None` if unavailable).
+    fn intent_liab_mint(&self, intent: &LiquidationIntent) -> Option<Pubkey> {
+        self.cache
+            .banks
+            .try_get_bank(&intent.liab_bank)
+            .ok()
+            .map(|b| b.bank.mint)
+    }
+
+    /// Whether a liability mint is currently quarantined (no swap route). Prunes expired entries.
+    fn is_mint_quarantined(&self, mint: &Pubkey) -> bool {
+        let now = Instant::now();
+        let Ok(mut guard) = self.quarantined_mints.lock() else {
+            return false;
+        };
+        guard.retain(|_, until| now < *until);
+        guard.contains_key(mint)
+    }
+
+    /// Whether a target is currently backed off after a transient failure. Prunes expired entries.
+    fn is_target_backed_off(&self, target: &Pubkey) -> bool {
+        let now = Instant::now();
+        let Ok(mut guard) = self.failed_targets.lock() else {
+            return false;
+        };
+        guard.retain(|_, b| now < b.retry_after);
+        guard.contains_key(target)
+    }
+
+    /// Clear a target's backoff once it assembles successfully again.
+    fn clear_target_backoff(&self, target: &Pubkey) {
+        if let Ok(mut guard) = self.failed_targets.lock() {
+            guard.remove(target);
+        }
+    }
+
+    /// Record an assemble failure: quarantine the liab mint when it has no swap route
+    /// (`NO_ROUTES_FOUND`), otherwise apply an exponential per-target backoff.
+    fn note_assemble_failure(
+        &self,
+        target: &Pubkey,
+        liab_mint: Option<Pubkey>,
+        e: &anyhow::Error,
+    ) {
+        if e.to_string().contains("NO_ROUTES_FOUND") {
+            if let Some(mint) = liab_mint {
+                if let Ok(mut guard) = self.quarantined_mints.lock() {
+                    guard.insert(mint, Instant::now() + NO_ROUTE_QUARANTINE_TTL);
+                }
+                warn!(
+                    "Quarantining liab mint {} for {}s: no swap route",
+                    mint,
+                    NO_ROUTE_QUARANTINE_TTL.as_secs()
+                );
+                return;
+            }
+        }
+
+        if let Ok(mut guard) = self.failed_targets.lock() {
+            let entry = guard.entry(*target).or_insert(TargetBackoff {
+                failures: 0,
+                retry_after: Instant::now(),
+            });
+            entry.failures = entry.failures.saturating_add(1);
+            let delay = target_backoff_delay(entry.failures);
+            entry.retry_after = Instant::now() + delay;
+            debug!(
+                "Backing off {} for {}s (consecutive assemble failures: {})",
+                target,
+                delay.as_secs(),
+                entry.failures
+            );
+        }
     }
 
     /// Deactivate any temporary LUTs created during assembly (best-effort; logs on failure), and
