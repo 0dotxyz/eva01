@@ -29,7 +29,6 @@ mod juplend_ixs;
 mod kamino_ixs;
 mod liquidator;
 mod marginfi_ixs;
-mod metrics;
 mod rebalancer;
 mod utils;
 #[warn(clippy::type_complexity)]

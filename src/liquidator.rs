@@ -3,12 +3,6 @@ use crate::{
     clock_manager,
     config::Eva01Config,
     geyser::{AccountType, GeyserUpdate},
-    metrics::{
-        record_liquidation_failure, ACCOUNTS_SCANNED_TOTAL, ACCOUNT_SCAN_DURATION_SECONDS,
-        ERROR_COUNT, FAILURE_REASON_INTERNAL, FAILURE_REASON_NOT_ENOUGH_FUNDS,
-        FAILURE_REASON_RPC_ERROR, FAILURE_REASON_STALE_ORACLES, LIQUIDATABLE_ACCOUNTS_FOUND,
-        LIQUIDATABLE_ACCOUNTS_FOUND_TOTAL, LIQUIDATION_SCAN_IN_PROGRESS,
-    },
     rebalancer::Rebalancer,
     utils::{
         log_genuine_error,
@@ -37,7 +31,6 @@ use marginfi_type_crate::{
         HealthPriceMode, MarginfiAccount, OnRampTransition, RequirementType,
     },
 };
-use solana_client::client_error::ClientError;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::{account_info::IntoAccountInfo, clock::Clock};
 use std::sync::atomic::Ordering;
@@ -45,7 +38,7 @@ use std::{
     cmp::min,
     collections::{HashMap, HashSet},
     sync::{atomic::AtomicBool, Arc},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 pub struct Liquidator {
@@ -134,12 +127,6 @@ impl Liquidator {
                     let liquidatee = acc.liquidatee_account.address;
                     let liab_bank = acc.liab_bank;
                     let liab_amount = acc.liab_amount;
-                    let liab_mint = self
-                        .cache
-                        .banks
-                        .try_get_bank(&liab_bank)
-                        .ok()
-                        .map(|bank| bank.bank.mint);
 
                     if let Err(e) = self
                         .liquidator_account
@@ -147,14 +134,7 @@ impl Liquidator {
                     {
                         match e {
                             LiquidationError::Anyhow(e) => {
-                                error!("Failed to liquidate account {:?}", liquidatee);
-                                let reason = if e.downcast_ref::<ClientError>().is_some() {
-                                    FAILURE_REASON_RPC_ERROR
-                                } else {
-                                    FAILURE_REASON_INTERNAL
-                                };
-                                record_liquidation_failure(reason, liab_mint, None);
-                                ERROR_COUNT.inc();
+                                error!("Failed to liquidate account {:?}: {:?}", liquidatee, e);
                             }
                             LiquidationError::StaleOracles(swb_oracles) => {
                                 info!(
@@ -166,37 +146,24 @@ impl Liquidator {
                                 {
                                     warn!("Failed to crank stale SWB oracles: {}", crank_err);
                                 }
-                                let oracle = swb_oracles.first().copied();
-                                record_liquidation_failure(
-                                    FAILURE_REASON_STALE_ORACLES,
-                                    None,
-                                    oracle,
-                                );
                             }
                             LiquidationError::NotEnoughFunds => {
                                 missing_tokens
                                     .entry(liab_bank)
                                     .and_modify(|m| *m += liab_amount)
                                     .or_insert(liab_amount);
-                                record_liquidation_failure(
-                                    FAILURE_REASON_NOT_ENOUGH_FUNDS,
-                                    liab_mint,
-                                    None,
-                                );
                             }
                         }
                     }
                 }
             } else if let Err(err) = checked_accounts {
                 error!("Failed to evaluate accounts in liquidation: {}", err);
-                ERROR_COUNT.inc();
             }
 
             info!("The Liquidation process is complete.");
 
             if let Err(error) = self.rebalancer.run(missing_tokens) {
                 error!("Rebalancing failed: {:?}", error);
-                ERROR_COUNT.inc();
             }
         }
         info!("The Liquidator loop is stopped.");
@@ -228,7 +195,6 @@ impl Liquidator {
     fn process_geyser_update(&self, update: GeyserUpdate, account_addresses: &mut HashSet<Pubkey>) {
         if let Err(error) = self.handle_geyser_update(update, account_addresses) {
             log_genuine_error("Failed to process Geyser update", error);
-            ERROR_COUNT.inc();
         }
     }
 
@@ -294,58 +260,35 @@ impl Liquidator {
         account_addresses: Vec<Pubkey>,
         stale_swb_oracles: &mut HashSet<Pubkey>,
     ) -> Result<Vec<PreparedLiquidatableAccount>> {
-        LIQUIDATION_SCAN_IN_PROGRESS.set(1);
-        let scan_started = Instant::now();
-        let mut total_scanned: u64 = 0;
         let clock = clock_manager::get_clock(&self.cache.clock)?;
 
-        let evaluation_result = {
-            let mut result: Vec<PreparedLiquidatableAccount> = vec![];
+        let mut result: Vec<PreparedLiquidatableAccount> = vec![];
 
-            for account_address in account_addresses {
-                total_scanned += 1;
-                if account_address == self.liquidator_account.liquidator_address {
-                    continue;
-                }
-
-                let account = self
-                    .cache
-                    .marginfi_accounts
-                    .try_get_account(&account_address)?;
-
-                match self.process_account(&account, clock.clone(), stale_swb_oracles) {
-                    Ok(acc_opt) => {
-                        if let Some(acc) = acc_opt {
-                            result.push(acc);
-                        }
-                    }
-                    Err(err) => {
-                        if !err.to_string().contains(SWB_STALE_HANDLED_ERROR) {
-                            debug!("Failed to process account {:?}: {:?}", account.address, err);
-                            ERROR_COUNT.inc();
-                        }
-                    }
-                }
+        for account_address in account_addresses {
+            if account_address == self.liquidator_account.liquidator_address {
+                continue;
             }
 
-            Ok(result)
-        };
+            let account = self
+                .cache
+                .marginfi_accounts
+                .try_get_account(&account_address)?;
 
-        LIQUIDATION_SCAN_IN_PROGRESS.set(0);
-        ACCOUNT_SCAN_DURATION_SECONDS.observe(scan_started.elapsed().as_secs_f64());
-        ACCOUNTS_SCANNED_TOTAL.inc_by(total_scanned);
-
-        match &evaluation_result {
-            Ok(accounts) => {
-                LIQUIDATABLE_ACCOUNTS_FOUND.set(accounts.len() as i64);
-                LIQUIDATABLE_ACCOUNTS_FOUND_TOTAL.inc_by(accounts.len() as u64);
-            }
-            Err(_) => {
-                LIQUIDATABLE_ACCOUNTS_FOUND.set(0);
+            match self.process_account(&account, clock.clone(), stale_swb_oracles) {
+                Ok(acc_opt) => {
+                    if let Some(acc) = acc_opt {
+                        result.push(acc);
+                    }
+                }
+                Err(err) => {
+                    if !err.to_string().contains(SWB_STALE_HANDLED_ERROR) {
+                        debug!("Failed to process account {:?}: {:?}", account.address, err);
+                    }
+                }
             }
         }
 
-        evaluation_result
+        Ok(result)
     }
 
     fn process_account(

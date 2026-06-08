@@ -1,8 +1,7 @@
 use crate::{
     cache::Cache,
     config::{Eva01Config, TokenThresholds},
-    metrics::{record_liquidation_failure, FAILURE_REASON_STALE_ORACLES},
-    utils::{self, swb_cranker::is_stale_swb_price_error},
+    utils,
     wrappers::{
         liquidator_account::LiquidatorAccount, oracle::OracleWrapper,
         token_account::TokenAccountWrapper,
@@ -11,7 +10,6 @@ use crate::{
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{debug, error, info, warn};
-use solana_client::client_error::ClientError;
 use solana_commitment_config::CommitmentLevel;
 use solana_dex_superagg::{
     client::DexSuperAggClient,
@@ -115,19 +113,10 @@ impl Rebalancer {
 
         if let Err(e) = self.handle_token_accounts(missing_tokens, &swap_wrapper) {
             error!("Failed to handle the Liquidator's tokens: {}", e);
-            // Note: Stale oracle errors from withdraw operations are now handled
-            // inside handle_token_accounts where we have access to the bank context
         }
 
         if let Err(error) = self.deposit_preferred_token(&swap_wrapper) {
             error!("Failed to deposit preferred token: {}", error);
-            // Check if this is a stale oracle error and record it in metrics
-            if let Some(client_err) = error.downcast_ref::<ClientError>() {
-                if is_stale_swb_price_error(client_err) {
-                    error!("MUST NEVER HAPPEN");
-                    record_liquidation_failure(FAILURE_REASON_STALE_ORACLES, None, None);
-                }
-            }
         }
 
         info!("The Rebalancing process is complete.");
@@ -148,9 +137,6 @@ impl Rebalancer {
         if necessary_swap_value > existing_swap_value {
             let swap_bank_wrapper = self.cache.banks.try_get_bank(&self.swap_mint_bank)?;
 
-            // Get the oracle address for this bank in case we need it for error tracking
-            let oracle = swap_bank_wrapper.bank.config.oracle_keys[0];
-
             // Withdraw 5% more to account for slippage and price changes
             let amount = swap_wrapper
                 .get_amount_from_value(necessary_swap_value - existing_swap_value)?
@@ -167,16 +153,6 @@ impl Rebalancer {
                 if err_str.contains("0x1782") || err_str.contains("BankAccountNotFound") {
                     warn!("No swap mint balance in marginfi lending account; proceeding with wallet balance only");
                 } else {
-                    // Check if this is a stale oracle error and record it in metrics
-                    if let Some(client_err) = e.downcast_ref::<ClientError>() {
-                        if is_stale_swb_price_error(client_err) {
-                            record_liquidation_failure(
-                                FAILURE_REASON_STALE_ORACLES,
-                                None,
-                                Some(oracle),
-                            );
-                        }
-                    }
                     return Err(e);
                 }
             }
@@ -308,20 +284,11 @@ impl Rebalancer {
 
         let bank_wrapper = self.cache.banks.try_get_bank(&self.swap_mint_bank)?;
 
-        // Get the oracle address for this bank in case we need it for error tracking
-        let oracle = bank_wrapper.bank.config.oracle_keys[0];
-
         if let Err(error) = self.liquidator_account.deposit(&bank_wrapper, amount) {
             error!(
                 "Failed to deposit to the Bank ({:?}): {:?}",
                 &self.swap_mint_bank, error
             );
-            // Check if this is a stale oracle error and record it in metrics
-            if let Some(client_err) = error.downcast_ref::<ClientError>() {
-                if is_stale_swb_price_error(client_err) {
-                    record_liquidation_failure(FAILURE_REASON_STALE_ORACLES, None, Some(oracle));
-                }
-            }
         }
 
         Ok(())

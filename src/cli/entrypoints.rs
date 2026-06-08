@@ -5,7 +5,6 @@ use crate::{
     config::Eva01Config,
     geyser::{GeyserService, GeyserUpdate},
     liquidator::Liquidator,
-    metrics::{FAILED_LIQUIDATIONS, LIQUIDATION_ATTEMPTS},
     utils::{
         integration_account_fetcher::IntegrationAccountFetcher, swb_price_fetcher::SwbPriceFetcher,
     },
@@ -123,11 +122,6 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
 
     info!("Entering the Main loop.");
     while !stop_liquidator.load(std::sync::atomic::Ordering::SeqCst) {
-        info!(
-            "Stats: Liqudations [attempts, failed] -> [{},{}]",
-            LIQUIDATION_ATTEMPTS.get(),
-            FAILED_LIQUIDATIONS.get()
-        );
         thread::sleep(std::time::Duration::from_secs(30));
     }
     info!("The Main loop stopped.");

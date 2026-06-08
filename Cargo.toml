@@ -46,7 +46,6 @@ fixed-macro = "1.2.0"
 futures = "0.3.32"
 futures-sink = "0.3.32"
 indexmap = "2.13.0"
-lazy_static = "1.5.0"
 log = "0.4.29"
 rayon = "1.11.0"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
@@ -57,7 +56,6 @@ signal-hook = "0.4.3"
 tiny_http = "0.12.0"
 tokio = { version = "1.50.0", features = ["rt", "macros"] }
 warp = "0.4.2"
-prometheus = "0.14.0"
 
 yellowstone-grpc-client = "10.2.0"
 yellowstone-grpc-proto = "10.1.1"

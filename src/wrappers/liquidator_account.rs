@@ -14,7 +14,6 @@ use crate::{
         make_end_liquidate_ix, make_init_liquidation_record_ix, make_juplend_withdraw_ix,
         make_kamino_withdraw_ix, make_repay_ix, make_start_liquidate_ix, make_withdraw_ix,
     },
-    metrics::{LIQUIDATION_ATTEMPTS, LIQUIDATION_LATENCY_SECONDS, LIQUIDATION_SUCCESSES},
     utils::{
         self, marginfi_account_by_authority, simulation_cache::is_tx_too_large_client,
         swb_cranker::is_stale_swb_price_error,
@@ -216,8 +215,6 @@ impl LiquidatorAccount {
             dust_liab_threshold,
             ..
         } = account;
-
-        LIQUIDATION_ATTEMPTS.inc();
 
         let liquidatee_account_address = liquidatee_account.address;
         let asset_bank_wrapper = self
@@ -509,8 +506,6 @@ impl LiquidatorAccount {
             liab_amount.to_num::<u64>()
         );
 
-        let _liquidation_timer = LIQUIDATION_LATENCY_SECONDS.start_timer();
-
         match self
             .rpc_client
             .send_and_confirm_transaction_with_spinner_and_config(
@@ -527,7 +522,6 @@ impl LiquidatorAccount {
                     "Liquidation tx for the Account {} was confirmed. Signature: {}",
                     liquidatee_account_address, signature,
                 );
-                LIQUIDATION_SUCCESSES.inc();
                 Ok(())
             }
             Err(err) => {
@@ -539,7 +533,6 @@ impl LiquidatorAccount {
                                 "Liquidation tx for the Account {} was confirmed. Signature: {}",
                                 liquidatee_account_address, signature,
                             );
-                            LIQUIDATION_SUCCESSES.inc();
                             Ok(())
                         }
                         Err(err) => {
