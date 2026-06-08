@@ -19,13 +19,11 @@ use marginfi_type_crate::{
 };
 use mints::MintsCache;
 use oracles::OraclesCache;
+use solana_address_lookup_table_interface::{instruction::*, state::AddressLookupTable};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
+use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{
-    address_lookup_table::{self, state::AddressLookupTable, AddressLookupTableAccount},
-    clock::Clock,
-    commitment_config::CommitmentConfig,
-    pubkey::Pubkey,
-    signature::Keypair,
+    clock::Clock, message::AddressLookupTableAccount, pubkey::Pubkey, signature::Keypair,
     signer::Signer,
 };
 use tokens::TokensCache;
@@ -44,9 +42,8 @@ pub struct GroupedLuts {
     pub group1: Vec<AddressLookupTableAccount>,
     pub group2: Vec<AddressLookupTableAccount>,
     pub group3: Vec<AddressLookupTableAccount>,
-    /// On-the-fly LUTs created during retry_with_new_luts for edge-case liquidations.
-    /// Persists across liquidations so the same edge case doesn't re-trigger creation.
-    pub overflow: Vec<AddressLookupTableAccount>,
+    /// On-the-fly LUT created during retry_with_targeted_lut for edge-case liquidations.
+    pub targeted: Option<AddressLookupTableAccount>,
     /// LUTs pending closure: (address, slot at which deactivation was sent).
     /// Closeable after 512-slot cooldown.
     pub deactivating: Vec<(Pubkey, u64)>,
@@ -57,9 +54,8 @@ impl GroupedLuts {
     /// - group1 included if any tag is DEFAULT(0) or SOL(1)
     /// - group2 included if any tag is SOL(1) or STAKED(2)
     /// - group3 included if any tag >= 3 (integration protocol)
-    /// - overflow always included
     pub fn select_for_tags(&self, tags: &[u8]) -> Vec<AddressLookupTableAccount> {
-        let has_staked = tags.iter().any(|&t| t == ASSET_TAG_STAKED);
+        let has_staked = tags.contains(&ASSET_TAG_STAKED);
         let needs_group1 = !has_staked
             && tags
                 .iter()
@@ -79,7 +75,6 @@ impl GroupedLuts {
         if needs_group3 {
             result.extend_from_slice(&self.group3);
         }
-        result.extend_from_slice(&self.overflow);
         result
     }
 }
@@ -207,17 +202,26 @@ impl Cache {
         })
     }
 
-    /// Creates a single targeted LUT containing exactly `accounts`, adds it to overflow,
+    /// Creates (or re-uses the pre-existing one, if, for some reason, it was not deactivated)
+    /// a single targeted LUT containing exactly `accounts`, adds it to overflow,
     /// and returns it. Used by the tx-too-large retry path so the retry uses only this
     /// one tight LUT with no unrelated group-LUT header overhead.
-    pub fn create_targeted_lut(
+    pub fn get_targeted_lut(
         &self,
         rpc_client: &RpcClient,
         signer_keypair: &Keypair,
         accounts: Vec<Pubkey>,
     ) -> anyhow::Result<AddressLookupTableAccount> {
-        let lut = create_lut(rpc_client, signer_keypair, accounts)?;
-        self.luts.lock().unwrap().overflow.push(lut.clone());
+        let lut = if let Some(lut) = self.luts.lock().unwrap().targeted.take() {
+            let updated_addresses = extend_lut(rpc_client, signer_keypair, lut.key, accounts)?;
+            AddressLookupTableAccount {
+                key: lut.key,
+                addresses: updated_addresses,
+            }
+        } else {
+            create_lut(rpc_client, signer_keypair, accounts)?
+        };
+        let _ = self.luts.lock().unwrap().targeted.insert(lut.clone());
         Ok(lut)
     }
 
@@ -227,12 +231,10 @@ impl Cache {
         &self,
         rpc_client: &RpcClient,
         signer_keypair: &Keypair,
-        lut_key: Pubkey,
     ) -> anyhow::Result<()> {
-        let ix = address_lookup_table::instruction::deactivate_lookup_table(
-            lut_key,
-            signer_keypair.pubkey(),
-        );
+        let lut_key = self.luts.lock().unwrap().targeted.as_ref().unwrap().key;
+
+        let ix = deactivate_lookup_table(lut_key, signer_keypair.pubkey());
         let recent_blockhash = rpc_client.get_latest_blockhash()?;
         let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
             &[ix],
@@ -251,7 +253,7 @@ impl Cache {
 
         let slot = rpc_client.get_slot_with_commitment(CommitmentConfig::confirmed())?;
         let mut luts = self.luts.lock().unwrap();
-        luts.overflow.retain(|l| l.key != lut_key);
+        luts.targeted.take().unwrap();
         luts.deactivating.push((lut_key, slot));
         Ok(())
     }
@@ -281,11 +283,7 @@ impl Cache {
         };
 
         for lut_key in ready {
-            let ix = address_lookup_table::instruction::close_lookup_table(
-                lut_key,
-                signer_keypair.pubkey(),
-                signer_keypair.pubkey(),
-            );
+            let ix = close_lookup_table(lut_key, signer_keypair.pubkey(), signer_keypair.pubkey());
             let blockhash = match rpc_client.get_latest_blockhash() {
                 Ok(h) => h,
                 Err(e) => {
@@ -329,7 +327,7 @@ fn create_lut(
     addresses: Vec<Pubkey>,
 ) -> anyhow::Result<AddressLookupTableAccount> {
     let recent_slot = rpc_client.get_slot_with_commitment(CommitmentConfig::confirmed())?;
-    let (create_ix, lut_address) = address_lookup_table::instruction::create_lookup_table(
+    let (create_ix, lut_address) = create_lookup_table(
         signer_keypair.pubkey(),
         signer_keypair.pubkey(),
         recent_slot,
@@ -367,7 +365,7 @@ fn extend_lut(
     const NEW_ADDRESSES_MAX: usize = 20;
 
     for chunk in addresses.chunks(NEW_ADDRESSES_MAX) {
-        let ix = address_lookup_table::instruction::extend_lookup_table(
+        let ix = extend_lookup_table(
             lut_address,
             signer_keypair.pubkey(),
             Some(signer_keypair.pubkey()),

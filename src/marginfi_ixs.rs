@@ -11,14 +11,15 @@ use marginfi_type_crate::{
     },
 };
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
+use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::Keypair,
     signer::Signer,
-    system_program, sysvar,
+    sysvar,
 };
+use solana_sdk_ids::system_program;
 
 use crate::{
     cache::{DriftSpotMarket, KaminoReserve},
@@ -61,6 +62,7 @@ pub fn make_init_liquidation_record_ix(
 }
 
 pub fn make_start_liquidate_ix(
+    group: Pubkey,
     liquidatee_account: Pubkey,
     liquidator_account: Pubkey,
     liquidation_record: Pubkey,
@@ -68,6 +70,7 @@ pub fn make_start_liquidate_ix(
     banks: &[Pubkey],
 ) -> Instruction {
     let mut accounts = marginfi::accounts::StartLiquidation {
+        group,
         marginfi_account: liquidatee_account,
         liquidation_receiver: liquidator_account,
         liquidation_record,
@@ -209,6 +212,7 @@ pub fn make_withdraw_ix(
 }
 
 pub fn make_end_liquidate_ix(
+    group: Pubkey,
     liquidatee_account: Pubkey,
     liquidator_account: Pubkey,
     liquidation_record: Pubkey,
@@ -217,6 +221,7 @@ pub fn make_end_liquidate_ix(
     banks: &[Pubkey],
 ) -> Instruction {
     let mut accounts = marginfi::accounts::EndLiquidation {
+        group,
         marginfi_account: liquidatee_account,
         liquidation_receiver: liquidator_account,
         liquidation_record,
@@ -253,7 +258,7 @@ pub fn make_create_ix(
         accounts: marginfi::accounts::MarginfiAccountInitialize {
             marginfi_group,
             marginfi_account,
-            system_program: solana_sdk::system_program::ID,
+            system_program: solana_sdk_ids::system_program::ID,
             authority: signer,
             fee_payer: signer,
         }

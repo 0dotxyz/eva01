@@ -1,4 +1,4 @@
-use anchor_lang::declare_program;
+use anchor_lang::{self, declare_program};
 use env_logger::Builder;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::{
@@ -25,7 +25,6 @@ mod clock_manager;
 mod config;
 mod drift_ixs;
 mod geyser;
-mod geyser_processor;
 mod juplend_ixs;
 mod kamino_ixs;
 mod liquidator;
@@ -43,7 +42,8 @@ declare_program!(liquidity);
 
 #[allow(clippy::too_many_arguments)]
 mod drift_idl {
-    anchor_lang::declare_program!(drift);
+    use anchor_lang::{self, declare_program};
+    declare_program!(drift);
 }
 
 use drift_idl::*;

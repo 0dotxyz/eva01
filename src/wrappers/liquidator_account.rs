@@ -35,20 +35,20 @@ use solana_client::{
     client_error::ClientError, rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig,
 };
 
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::{
     account::ReadableAccount,
-    address_lookup_table::AddressLookupTableAccount,
-    commitment_config::{CommitmentConfig, CommitmentLevel},
-    compute_budget::ComputeBudgetInstruction,
     instruction::Instruction,
+    message::AddressLookupTableAccount,
     message::{v0::Message, CompileError, VersionedMessage},
     pubkey,
     signature::{Keypair, Signature},
     signer::{Signer, SignerError},
-    system_instruction::transfer,
     transaction::VersionedTransaction,
 };
+use solana_system_interface::instruction::transfer;
 use std::{collections::HashSet, sync::Arc, thread, time::Duration};
 
 pub const PROFIT_SHARE: f64 = 0.085;
@@ -106,7 +106,7 @@ impl LiquidatorAccount {
         preferred_mint: Pubkey,
         cache: Arc<Cache>,
     ) -> Result<Self> {
-        let signer = Keypair::from_bytes(&config.wallet_keypair)?;
+        let signer = Keypair::try_from(config.wallet_keypair.as_slice())?;
         let rpc_client =
             RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
 
@@ -165,7 +165,7 @@ impl LiquidatorAccount {
             .get_latest_blockhash()
             .map_err(|e| anyhow!(e))?;
 
-        let msg = Message::try_compile(&signer_pk, &[init_ix.clone()], &[], recent_blockhash)
+        let msg = Message::try_compile(&signer_pk, &[init_ix], &[], recent_blockhash)
             .map_err(|e| anyhow!(e))?;
 
         let txn = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
@@ -324,6 +324,7 @@ impl LiquidatorAccount {
         // TODO: think about posting an swb_crank ix here
 
         let start_ix = make_start_liquidate_ix(
+            self.group,
             liquidatee_account_address,
             signer_pk,
             liquidation_record,
@@ -479,6 +480,7 @@ impl LiquidatorAccount {
         ixs.push(repay_ix);
 
         let end_ix = make_end_liquidate_ix(
+            self.group,
             liquidatee_account_address,
             signer_pk,
             liquidation_record,
@@ -531,7 +533,7 @@ impl LiquidatorAccount {
             Err(err) => {
                 if is_tx_too_large_client(&err) {
                     warn!("The liquidation tx was too large: adding the observation accounts to a LUT and retrying");
-                    match self.retry_with_new_luts(ixs) {
+                    match self.retry_with_targeted_lut(ixs) {
                         Ok(signature) => {
                             info!(
                                 "Liquidation tx for the Account {} was confirmed. Signature: {}",
@@ -560,7 +562,7 @@ impl LiquidatorAccount {
         }
     }
 
-    fn retry_with_new_luts(&self, ixs: Vec<Instruction>) -> Result<Signature> {
+    fn retry_with_targeted_lut(&self, ixs: Vec<Instruction>) -> Result<Signature> {
         self.cache
             .try_close_deactivated_luts(&self.rpc_client, &self.signer);
 
@@ -571,14 +573,13 @@ impl LiquidatorAccount {
             .into_iter()
             .collect();
 
-        let targeted_lut =
-            self.cache
-                .create_targeted_lut(&self.rpc_client, &self.signer, all_accounts)?;
-        let lut_key = targeted_lut.key;
-        let luts = vec![targeted_lut];
+        let lut = self
+            .cache
+            .get_targeted_lut(&self.rpc_client, &self.signer, all_accounts)?;
+        let lut_key = lut.key;
 
         let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
-        let msg = Message::try_compile(&self.signer.pubkey(), &ixs, &luts, recent_blockhash)?;
+        let msg = Message::try_compile(&self.signer.pubkey(), &ixs, &[lut], recent_blockhash)?;
         let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])?;
 
         let result = self
@@ -595,7 +596,7 @@ impl LiquidatorAccount {
 
         if let Err(e) = self
             .cache
-            .deactivate_targeted_lut(&self.rpc_client, &self.signer, lut_key)
+            .deactivate_targeted_lut(&self.rpc_client, &self.signer)
         {
             warn!("Failed to deactivate targeted LUT {lut_key}: {e}");
         }
@@ -844,14 +845,9 @@ mod tests {
     use super::*;
 
     fn contains_stale_oracles(stale_oracles: &HashSet<Pubkey>, account_oracles: &[Pubkey]) -> bool {
-        if let Some(oracle) = account_oracles
+        account_oracles
             .iter()
-            .find(|oracle| stale_oracles.contains(*oracle))
-        {
-            true
-        } else {
-            false
-        }
+            .any(|oracle| stale_oracles.contains(oracle))
     }
 
     #[test]

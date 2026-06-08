@@ -35,6 +35,7 @@ pub struct Eva01Config {
     pub titan_ws_endpoint: String,
     pub titan_api_key: String,
     pub jupiter_api_key: String,
+    pub use_fumarole: bool,
 }
 
 impl Eva01Config {
@@ -130,6 +131,8 @@ impl Eva01Config {
         let jupiter_api_key = std::env::var("JUP_SWAP_API_KEY")
             .expect("JUP_SWAP_API_KEY environment variable is not set");
 
+        let use_fumarole = std::env::var("USE_FUMAROLE").is_ok_and(|x| x == "true");
+
         Ok(Eva01Config {
             rpc_url,
             yellowstone_endpoint,
@@ -156,6 +159,7 @@ impl Eva01Config {
             titan_ws_endpoint,
             titan_api_key,
             jupiter_api_key,
+            use_fumarole,
         })
     }
 }
@@ -174,9 +178,9 @@ fn derive_rpc_url(yellowstone_endpoint: &str, yellowstone_x_token: Option<&str>)
 pub fn load_token_thresholds_from_env() -> anyhow::Result<HashMap<Pubkey, TokenThresholds>> {
     match std::env::var("TOKEN_THRESHOLDS") {
         Ok(s) if !s.trim().is_empty() => {
-            let raw: HashMap<String, (f64, f64, f64)> = serde_json::from_str(&s)?;
+            let raw: HashMap<String, (f64, f64)> = serde_json::from_str(&s)?;
             let mut out = HashMap::with_capacity(raw.len());
-            for (k, (_declared_value, min_threshold, max_threshold)) in raw {
+            for (k, (min_threshold, max_threshold)) in raw {
                 let pk = Pubkey::from_str(&k).map_err(|e| {
                     anyhow::anyhow!("Invalid mint pubkey in TOKEN_THRESHOLDS: {k}: {e}")
                 })?;

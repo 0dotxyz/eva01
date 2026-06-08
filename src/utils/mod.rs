@@ -79,6 +79,7 @@ pub fn batch_get_multiple_accounts(
                 let chunk_res = backoff::retry(ExponentialBackoff::default(), move || {
                     let chunk = chunk.clone();
 
+                    #[allow(deprecated)]
                     rpc_client
                         .get_multiple_accounts_with_config(
                             &chunk,
@@ -236,11 +237,13 @@ pub fn log_genuine_error(prefix: &str, error: Error) {
     }
 }
 
+// TODO: do not require marginfi_account?
 pub fn marginfi_account_by_authority(
     authority: Pubkey,
     rpc_client: &RpcClient,
     marginfi_group_id: Pubkey,
 ) -> anyhow::Result<Vec<Pubkey>> {
+    #[allow(deprecated)]
     let marginfi_account_address = rpc_client.get_program_accounts_with_config(
         &marginfi_type_crate::ID,
         RpcProgramAccountsConfig {

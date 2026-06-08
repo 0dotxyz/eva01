@@ -2,6 +2,7 @@ use crate::{
     cache::Cache,
     clock_manager,
     config::Eva01Config,
+    geyser::{AccountType, GeyserUpdate},
     metrics::{
         record_liquidation_failure, ACCOUNTS_SCANNED_TOTAL, ACCOUNT_SCAN_DURATION_SECONDS,
         ERROR_COUNT, FAILURE_REASON_INTERNAL, FAILURE_REASON_NOT_ENOUGH_FUNDS,
@@ -9,7 +10,10 @@ use crate::{
         LIQUIDATABLE_ACCOUNTS_FOUND_TOTAL, LIQUIDATION_SCAN_IN_PROGRESS,
     },
     rebalancer::Rebalancer,
-    utils::swb_cranker::{SwbCranker, SWB_STALE_HANDLED_ERROR, SWB_STALE_PRICE_ERROR_CODE_NUMBER},
+    utils::{
+        log_genuine_error,
+        swb_cranker::{SwbCranker, SWB_STALE_HANDLED_ERROR, SWB_STALE_PRICE_ERROR_CODE_NUMBER},
+    },
     wrappers::{
         bank::BankWrapper,
         liquidator_account::{
@@ -19,33 +23,36 @@ use crate::{
         oracle::{OracleWrapper, OracleWrapperTrait},
     },
 };
+use anchor_lang::AccountDeserialize;
 use anyhow::{anyhow, Result};
+use crossbeam::channel::{Receiver, RecvTimeoutError};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{debug, error, info, warn};
 use marginfi::state::{bank::BankImpl, marginfi_account::get_health_components};
 use marginfi_type_crate::{
     constants::BANKRUPT_THRESHOLD,
-    types::{BalanceSide, BankOperationalState, HealthPriceMode, RequirementType},
+    types::{
+        reconcile_emode_configs, BalanceSide, Bank, BankOperationalState, EmodeConfig,
+        HealthPriceMode, MarginfiAccount, OnRampTransition, RequirementType,
+    },
 };
 use solana_client::client_error::ClientError;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::{account_info::IntoAccountInfo, clock::Clock};
+use std::sync::atomic::Ordering;
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},
     sync::{atomic::AtomicBool, Arc},
     time::{Duration, Instant},
 };
-use std::{sync::atomic::Ordering, thread};
-
-const ACCOUNT_SCAN_BATCH_SIZE: usize = 4_096;
 
 pub struct Liquidator {
     liquidator_account: Arc<LiquidatorAccount>,
     rebalancer: Rebalancer,
     min_profit: f64,
-    run_liquidation: Arc<AtomicBool>,
+    geyser_rx: Receiver<GeyserUpdate>,
     stop_liquidator: Arc<AtomicBool>,
     cache: Arc<Cache>,
     swb_cranker: SwbCranker,
@@ -79,7 +86,7 @@ impl Liquidator {
     pub fn new(
         config: Eva01Config,
         liquidator_account: Arc<LiquidatorAccount>,
-        run_liquidation: Arc<AtomicBool>,
+        geyser_rx: Receiver<GeyserUpdate>,
         stop_liquidator: Arc<AtomicBool>,
         cache: Arc<Cache>,
     ) -> Result<Self> {
@@ -92,7 +99,7 @@ impl Liquidator {
             liquidator_account,
             rebalancer,
             min_profit: config.min_profit,
-            run_liquidation,
+            geyser_rx,
             stop_liquidator,
             cache,
             swb_cranker,
@@ -106,19 +113,18 @@ impl Liquidator {
         info!("Staring the Liquidator loop.");
         while !self.stop_liquidator.load(Ordering::Relaxed) {
             debug!("Waiting for any data change...");
-            if !self.run_liquidation.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_secs(1));
-                continue;
-            }
+            let accounts_to_check = self.receive_geyser_updates()?;
 
-            info!("Running the Liquidation process...");
-            self.run_liquidation.store(false, Ordering::Relaxed);
+            info!(
+                "Running the Liquidation process for {} account(s)...",
+                accounts_to_check.len()
+            );
 
             let mut missing_tokens: HashMap<Pubkey, I80F48> = HashMap::new();
             let mut stale_swb_oracles: HashSet<Pubkey> = HashSet::new();
-            let evaluated_accounts = self.evaluate_all_accounts(&mut stale_swb_oracles);
+            let checked_accounts = self.check_accounts(accounts_to_check, &mut stale_swb_oracles);
 
-            if let Ok(mut accounts) = evaluated_accounts {
+            if let Ok(mut accounts) = checked_accounts {
                 // Accounts are sorted from the highest profit to the lowest
                 accounts.sort_by(|a, b| a.profit.cmp(&b.profit));
                 accounts.reverse();
@@ -181,7 +187,7 @@ impl Liquidator {
                         }
                     }
                 }
-            } else if let Err(err) = evaluated_accounts {
+            } else if let Err(err) = checked_accounts {
                 error!("Failed to evaluate accounts in liquidation: {}", err);
                 ERROR_COUNT.inc();
             }
@@ -198,9 +204,94 @@ impl Liquidator {
         Ok(())
     }
 
-    /// Checks if liquidation is needed, for each account one by one
-    fn evaluate_all_accounts(
+    fn receive_geyser_updates(&self) -> Result<Vec<Pubkey>> {
+        let first_update = match self.geyser_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(update) => update,
+            Err(RecvTimeoutError::Timeout) => return Ok(vec![]),
+            Err(RecvTimeoutError::Disconnected) if self.stop_liquidator.load(Ordering::Relaxed) => {
+                return Ok(vec![])
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("Geyser update channel disconnected"))
+            }
+        };
+
+        let mut accounts_to_check = HashSet::new();
+        self.process_geyser_update(first_update, &mut accounts_to_check);
+        while let Ok(update) = self.geyser_rx.try_recv() {
+            self.process_geyser_update(update, &mut accounts_to_check);
+        }
+
+        Ok(accounts_to_check.into_iter().collect())
+    }
+
+    fn process_geyser_update(&self, update: GeyserUpdate, account_addresses: &mut HashSet<Pubkey>) {
+        if let Err(error) = self.handle_geyser_update(update, account_addresses) {
+            log_genuine_error("Failed to process Geyser update", error);
+            ERROR_COUNT.inc();
+        }
+    }
+
+    fn handle_geyser_update(
+        &self,
+        update: GeyserUpdate,
+        account_addresses: &mut HashSet<Pubkey>,
+    ) -> Result<()> {
+        let GeyserUpdate {
+            account_type,
+            address,
+            account,
+        } = update;
+
+        debug!("Processing the {:?} {:?} update.", account_type, address);
+
+        match account_type {
+            AccountType::Oracle => {
+                self.cache.oracles.try_update(&address, account)?;
+
+                for bank in self.cache.banks.get_banks_for_oracle(&address)? {
+                    self.add_accounts_for_bank(&bank, account_addresses)?;
+                }
+            }
+            AccountType::Marginfi => {
+                let mut data = account.data.as_slice();
+                let marginfi_account = MarginfiAccount::try_deserialize(&mut data)?;
+                self.cache
+                    .marginfi_accounts
+                    .try_insert(MarginfiAccountWrapper::new(address, marginfi_account))?;
+
+                account_addresses.insert(address);
+            }
+            AccountType::Bank => {
+                let mut data = account.data.as_slice();
+                let bank = Bank::try_deserialize(&mut data)?;
+                self.cache.banks.try_insert(address, bank, account)?;
+
+                self.add_accounts_for_bank(&address, account_addresses)?;
+            }
+            AccountType::Token => {
+                self.cache.tokens.try_update_account(address, account)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn add_accounts_for_bank(
+        &self,
+        bank: &Pubkey,
+        account_addresses: &mut HashSet<Pubkey>,
+    ) -> Result<()> {
+        account_addresses.extend(
+            self.cache
+                .marginfi_accounts
+                .try_get_accounts_for_bank_with_liabilities(bank)?,
+        );
+        Ok(())
+    }
+
+    fn check_accounts(
         &mut self,
+        account_addresses: Vec<Pubkey>,
         stale_swb_oracles: &mut HashSet<Pubkey>,
     ) -> Result<Vec<PreparedLiquidatableAccount>> {
         LIQUIDATION_SCAN_IN_PROGRESS.set(1);
@@ -209,37 +300,29 @@ impl Liquidator {
         let clock = clock_manager::get_clock(&self.cache.clock)?;
 
         let evaluation_result = {
-            let mut next_index: usize = 0;
             let mut result: Vec<PreparedLiquidatableAccount> = vec![];
-            loop {
-                let accounts_batch = self
+
+            for account_address in account_addresses {
+                total_scanned += 1;
+                if account_address == self.liquidator_account.liquidator_address {
+                    continue;
+                }
+
+                let account = self
                     .cache
                     .marginfi_accounts
-                    .try_get_account_batch(next_index, ACCOUNT_SCAN_BATCH_SIZE)?;
-                if accounts_batch.is_empty() {
-                    break;
-                }
-                next_index += accounts_batch.len();
+                    .try_get_account(&account_address)?;
 
-                for account in accounts_batch {
-                    total_scanned += 1;
-                    if account.address == self.liquidator_account.liquidator_address {
-                        continue;
-                    }
-                    match self.process_account(&account, clock.clone(), stale_swb_oracles) {
-                        Ok(acc_opt) => {
-                            if let Some(acc) = acc_opt {
-                                result.push(acc);
-                            }
+                match self.process_account(&account, clock.clone(), stale_swb_oracles) {
+                    Ok(acc_opt) => {
+                        if let Some(acc) = acc_opt {
+                            result.push(acc);
                         }
-                        Err(err) => {
-                            if !err.to_string().contains(SWB_STALE_HANDLED_ERROR) {
-                                debug!(
-                                    "Failed to process account {:?}: {:?}",
-                                    account.address, err
-                                );
-                                ERROR_COUNT.inc();
-                            }
+                    }
+                    Err(err) => {
+                        if !err.to_string().contains(SWB_STALE_HANDLED_ERROR) {
+                            debug!("Failed to process account {:?}: {:?}", account.address, err);
+                            ERROR_COUNT.inc();
                         }
                     }
                 }
@@ -394,10 +477,14 @@ impl Liquidator {
         liab_bank_wrapper: &BankWrapper,
     ) -> Result<LiquidationAmounts> {
         let mut accounts: Vec<_> = vec![];
+        let mut bank_to_emode_config = HashMap::<Pubkey, EmodeConfig>::new();
         for pk in banks_and_oracles.iter() {
             let bank_account = cache.banks.try_get_bank(pk);
             let account = match bank_account {
-                Ok(wrapper) => wrapper.account,
+                Ok(wrapper) => {
+                    bank_to_emode_config.insert(*pk, wrapper.bank.emode.emode_config);
+                    wrapper.account
+                }
                 Err(_) => cache.oracles.try_get_account(pk)?,
             };
             accounts.push(account);
@@ -415,7 +502,16 @@ impl Liquidator {
             RequirementType::Maintenance,
             &mut None,
             HealthPriceMode::Client(clock.clone()),
+            OnRampTransition::PreTransition,
         )?;
+
+        let emode_configs = account
+            .account
+            .lending_account
+            .get_active_balances_iter()
+            .filter(|b| !b.is_empty(BalanceSide::Liabilities))
+            .map(|b| bank_to_emode_config.remove(&b.bank_pk).unwrap());
+        let reconciled_emode_config = reconcile_emode_configs(emode_configs);
 
         let maintenance_health = total_weighted_assets - total_weighted_liabilities;
         debug!(
@@ -432,7 +528,9 @@ impl Liquidator {
         let liab_oracle_wrapper =
             OracleWrapper::build(&self.cache, &clock, &liab_bank_wrapper.address)?;
 
-        let asset_weight_maint: I80F48 = asset_bank_wrapper.bank.config.asset_weight_maint.into();
+        let asset_weight_maint: I80F48 = asset_bank_wrapper
+            .bank
+            .get_asset_weight(RequirementType::Maintenance, &reconciled_emode_config);
         let liab_weight_maint: I80F48 = liab_bank_wrapper.bank.config.liability_weight_maint.into();
 
         let liquidation_discount = fixed_macro::types::I80F48!(0.95);
@@ -440,11 +538,11 @@ impl Liquidator {
         let all = asset_weight_maint - liab_weight_maint * liquidation_discount;
 
         if all >= I80F48::ZERO {
-            debug!("Account {:?} has no liquidatable amount: {:?}, asset_weight_maint: {:?}, liab_weight_maint: {:?}", account.address, all, asset_weight_maint, liab_weight_maint);
+            warn!("Account {:?} has no liquidatable amount: {:?}, asset_weight_maint: {:?}, liab_weight_maint: {:?}", account.address, all, asset_weight_maint, liab_weight_maint);
             return Ok(LiquidationAmounts::none());
         }
 
-        let underwater_maint_value =
+        let underwater_value =
             maintenance_health / (asset_weight_maint - liab_weight_maint * liquidation_discount);
 
         let (asset_amount, _) = account.get_balance_for_bank(asset_bank_wrapper)?;
@@ -454,17 +552,17 @@ impl Liquidator {
             &asset_oracle_wrapper,
             asset_amount,
             BalanceSide::Assets,
-            RequirementType::Maintenance,
+            RequirementType::Equity,
         )?;
 
         let liab_value = liab_bank_wrapper.calc_value(
             &liab_oracle_wrapper,
             liab_amount,
             BalanceSide::Liabilities,
-            RequirementType::Maintenance,
+            RequirementType::Equity,
         )?;
 
-        let max_liquidatable_value = min(min(asset_value, liab_value), underwater_maint_value);
+        let max_liquidatable_value = min(min(asset_value, liab_value), underwater_value);
         let liquidator_profit = max_liquidatable_value
             .checked_mul(I80F48::from_num(PROFIT_SHARE))
             .unwrap();
@@ -477,14 +575,14 @@ impl Liquidator {
             &asset_oracle_wrapper,
             max_liquidatable_value,
             BalanceSide::Assets,
-            RequirementType::Maintenance,
+            RequirementType::Equity,
         )?;
 
         let max_liquidatable_liab_amount = liab_bank_wrapper.calc_amount(
             &liab_oracle_wrapper,
             max_liquidatable_value,
             BalanceSide::Liabilities,
-            RequirementType::Maintenance,
+            RequirementType::Equity,
         )?;
 
         let dust_liab_threshold = liab_bank_wrapper.calc_amount(
