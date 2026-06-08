@@ -9,7 +9,6 @@ use solana_program::pubkey::Pubkey;
 use solana_sdk::account::Account;
 use std::{
     collections::HashMap,
-    mem::size_of,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -20,7 +19,6 @@ use tokio::runtime::{Builder, Runtime};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::prelude::*;
 
-const MARGIN_ACCOUNT_SIZE: usize = size_of::<MarginfiAccount>() + 8;
 const RATE_LIMIT_LOG_INTERVAL_SECS: u64 = 60;
 const MAX_ERRORS_PER_MINUTE: u64 = 5;
 
@@ -203,9 +201,7 @@ impl GeyserService {
                                 continue
                             );
 
-                            if account.owner == marginfi_type_crate::ID
-                                && account_update.data.len() == MARGIN_ACCOUNT_SIZE
-                            {
+                            if account.owner == marginfi_type_crate::ID {
                                 if let Ok(marginfi_account) = MarginfiAccount::try_deserialize(
                                     &mut account.data.clone().as_slice(),
                                 ) {

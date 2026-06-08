@@ -8133,8 +8133,8 @@ dependencies = [
 
 [[package]]
 name = "switchboard-on-demand-client"
-version = "0.5.1"
-source = "git+https://github.com/switchboard-xyz/switchboard-sdk?rev=3ed155e6c6a1f4fc912dc60388e099f02cb651ce#3ed155e6c6a1f4fc912dc60388e099f02cb651ce"
+version = "0.6.0"
+source = "git+https://github.com/switchboard-xyz/switchboard-sdk?rev=d2c50213359bb35b5e0902ffcd4bafb4315860c1#d2c50213359bb35b5e0902ffcd4bafb4315860c1"
 dependencies = [
  "anyhow_ext",
  "arrayref",
