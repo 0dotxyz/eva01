@@ -62,7 +62,7 @@ pub fn make_init_liquidation_record_ix(
 }
 
 pub fn make_start_liquidate_ix(
-    group: Pubkey,
+    _group: Pubkey,
     liquidatee_account: Pubkey,
     liquidator_account: Pubkey,
     liquidation_record: Pubkey,
@@ -70,7 +70,6 @@ pub fn make_start_liquidate_ix(
     banks: &[Pubkey],
 ) -> Instruction {
     let mut accounts = marginfi::accounts::StartLiquidation {
-        group,
         marginfi_account: liquidatee_account,
         liquidation_receiver: liquidator_account,
         liquidation_record,
@@ -212,7 +211,7 @@ pub fn make_withdraw_ix(
 }
 
 pub fn make_end_liquidate_ix(
-    group: Pubkey,
+    _group: Pubkey,
     liquidatee_account: Pubkey,
     liquidator_account: Pubkey,
     liquidation_record: Pubkey,
@@ -221,7 +220,6 @@ pub fn make_end_liquidate_ix(
     banks: &[Pubkey],
 ) -> Instruction {
     let mut accounts = marginfi::accounts::EndLiquidation {
-        group,
         marginfi_account: liquidatee_account,
         liquidation_receiver: liquidator_account,
         liquidation_record,

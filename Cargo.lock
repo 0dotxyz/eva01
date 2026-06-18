@@ -1627,7 +1627,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 [[package]]
 name = "drift-mocks"
 version = "0.1.0"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=878fab5bd8898dec866630e2f58f90d9c2dee055#878fab5bd8898dec866630e2f58f90d9c2dee055"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=4abf7d0a45e1f719a630487c2d09d3d1e9d36c85#4abf7d0a45e1f719a630487c2d09d3d1e9d36c85"
 dependencies = [
  "anchor-lang",
  "bytemuck",
@@ -1890,6 +1890,15 @@ checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
  "event-listener",
  "pin-project-lite",
+]
+
+[[package]]
+name = "fast-math"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2465292146cdfc2011350fe3b1c616ac83cf0faeedb33463ba1c332ed8948d66"
+dependencies = [
+ "ieee754",
 ]
 
 [[package]]
@@ -2783,7 +2792,7 @@ dependencies = [
 [[package]]
 name = "id-crate"
 version = "0.1.0"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=878fab5bd8898dec866630e2f58f90d9c2dee055#878fab5bd8898dec866630e2f58f90d9c2dee055"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=4abf7d0a45e1f719a630487c2d09d3d1e9d36c85#4abf7d0a45e1f719a630487c2d09d3d1e9d36c85"
 dependencies = [
  "anchor-lang",
  "cfg-if",
@@ -2815,6 +2824,12 @@ dependencies = [
  "icu_normalizer",
  "icu_properties",
 ]
+
+[[package]]
+name = "ieee754"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9007da9cacbd3e6343da136e98b0d2df013f553d35bdec8b518f07bea768e19c"
 
 [[package]]
 name = "indexmap"
@@ -3013,7 +3028,7 @@ dependencies = [
 [[package]]
 name = "juplend-mocks"
 version = "0.1.0"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=878fab5bd8898dec866630e2f58f90d9c2dee055#878fab5bd8898dec866630e2f58f90d9c2dee055"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=4abf7d0a45e1f719a630487c2d09d3d1e9d36c85#4abf7d0a45e1f719a630487c2d09d3d1e9d36c85"
 dependencies = [
  "anchor-lang",
  "bytemuck",
@@ -3036,7 +3051,7 @@ dependencies = [
 [[package]]
 name = "kamino-mocks"
 version = "0.1.0"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=878fab5bd8898dec866630e2f58f90d9c2dee055#878fab5bd8898dec866630e2f58f90d9c2dee055"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=4abf7d0a45e1f719a630487c2d09d3d1e9d36c85#4abf7d0a45e1f719a630487c2d09d3d1e9d36c85"
 dependencies = [
  "anchor-lang",
  "bytemuck",
@@ -3172,7 +3187,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "marginfi"
 version = "0.1.9"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=878fab5bd8898dec866630e2f58f90d9c2dee055#878fab5bd8898dec866630e2f58f90d9c2dee055"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=4abf7d0a45e1f719a630487c2d09d3d1e9d36c85#4abf7d0a45e1f719a630487c2d09d3d1e9d36c85"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
@@ -3207,7 +3222,7 @@ dependencies = [
 [[package]]
 name = "marginfi-type-crate"
 version = "0.1.9"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=878fab5bd8898dec866630e2f58f90d9c2dee055#878fab5bd8898dec866630e2f58f90d9c2dee055"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=4abf7d0a45e1f719a630487c2d09d3d1e9d36c85#4abf7d0a45e1f719a630487c2d09d3d1e9d36c85"
 dependencies = [
  "anchor-lang",
  "bs58 0.5.1",
@@ -4205,7 +4220,7 @@ dependencies = [
 [[package]]
 name = "pyth-solana-receiver-sdk"
 version = "1.2.1"
-source = "git+https://github.com/IliaZyrin/pyth-crosschain?rev=913ce2196a104635582d745c8fbd9a69e240070c#913ce2196a104635582d745c8fbd9a69e240070c"
+source = "git+https://github.com/0dotxyz/pyth-crosschain?rev=f170d205e47a6ea34ad30c424d9ec8cc61a1f1fc#f170d205e47a6ea34ad30c424d9ec8cc61a1f1fc"
 dependencies = [
  "anchor-lang",
  "borsh 1.6.1",
@@ -4217,11 +4232,20 @@ dependencies = [
 [[package]]
 name = "pythnet-sdk"
 version = "2.3.2"
-source = "git+https://github.com/IliaZyrin/pyth-crosschain?rev=913ce2196a104635582d745c8fbd9a69e240070c#913ce2196a104635582d745c8fbd9a69e240070c"
+source = "git+https://github.com/0dotxyz/pyth-crosschain?rev=f170d205e47a6ea34ad30c424d9ec8cc61a1f1fc#f170d205e47a6ea34ad30c424d9ec8cc61a1f1fc"
 dependencies = [
  "anchor-lang",
+ "bincode",
  "borsh 1.6.1",
+ "bytemuck",
+ "byteorder",
+ "fast-math",
+ "hex",
+ "rustc_version",
  "serde",
+ "sha3",
+ "slow_primes",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -5236,6 +5260,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f92a496fb766b417c996b9c5e57daf2f7ad3b0bebe1ccfca4856390e3d3bb67"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "slow_primes"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58267dd2fbaa6dceecba9e3e106d2d90a2b02497c0e8b01b8759beccf5113938"
+dependencies = [
+ "num",
 ]
 
 [[package]]
@@ -7511,7 +7544,7 @@ dependencies = [
 [[package]]
 name = "solend-mocks"
 version = "0.1.0"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=878fab5bd8898dec866630e2f58f90d9c2dee055#878fab5bd8898dec866630e2f58f90d9c2dee055"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?rev=4abf7d0a45e1f719a630487c2d09d3d1e9d36c85#4abf7d0a45e1f719a630487c2d09d3d1e9d36c85"
 dependencies = [
  "anchor-lang",
  "bytemuck",
@@ -8076,7 +8109,7 @@ dependencies = [
 [[package]]
 name = "switchboard-on-demand"
 version = "0.12.1"
-source = "git+https://github.com/switchboard-xyz/switchboard-sdk?rev=f1a570a65476d6d040bee1bd2d223c2c775ac2b6#f1a570a65476d6d040bee1bd2d223c2c775ac2b6"
+source = "git+https://github.com/switchboard-xyz/switchboard-sdk?rev=f75b1ef63e10eda35d046b1838810ec2935d7f39#f75b1ef63e10eda35d046b1838810ec2935d7f39"
 dependencies = [
  "anyhow",
  "arrayref",
