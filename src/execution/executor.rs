@@ -204,7 +204,31 @@ impl Executor {
                     info!("Prepending SWB crank to bundle for {}", liquidatee);
                     txs.insert(0, crank_tx);
                 }
-                self.submit(&txs)
+                // Re-simulate with the crank applied: a stale oracle made the first sim fail, so
+                // only submit if the cranked bundle now actually succeeds. Otherwise we'd pay to
+                // land a bundle that still reverts once the real price is posted (e.g. the account
+                // turns out healthy, 0x17b4) — which is exactly what Jito drops as "Failed".
+                match self.jito.simulate_bundle(
+                    &self.rpc_url,
+                    self.bundle_api_key.as_deref(),
+                    &txs,
+                    &[],
+                ) {
+                    Ok(sim2) if sim2.succeeded => self.submit(&txs),
+                    Ok(sim2) => {
+                        warn!(
+                            "Skipping {}: bundle still fails after crank (tx index {:?}): {}",
+                            liquidatee,
+                            sim2.failed_tx_index,
+                            sim2.error_message.unwrap_or_default()
+                        );
+                        Ok(())
+                    }
+                    Err(e) => {
+                        warn!("Skipping {}: re-simulation after crank failed: {}", liquidatee, e);
+                        Ok(())
+                    }
+                }
             }
             Ok(sim) => {
                 warn!(
