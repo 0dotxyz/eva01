@@ -1,25 +1,20 @@
-use super::{
-    bank::BankWrapper,
-    marginfi_account::{MarginfiAccountWrapper, ObservationAccounts},
-};
+use super::marginfi_account::{MarginfiAccountWrapper, ObservationAccounts};
 use crate::{
     cache::{Cache, DriftSpotMarket},
-    clock_manager,
     config::Eva01Config,
     drift_ixs::make_refresh_spot_market_ix,
     juplend_ixs::make_update_lending_rate_ix,
     kamino_ixs::{make_refresh_obligation_ix, make_refresh_reserve_ix},
     marginfi_ixs::{
-        initialize_marginfi_account, make_deposit_ix, make_drift_withdraw_ix,
-        make_end_liquidate_ix, make_init_liquidation_record_ix, make_juplend_withdraw_ix,
-        make_kamino_withdraw_ix, make_repay_ix, make_start_liquidate_ix, make_withdraw_ix,
+        initialize_marginfi_account, make_drift_withdraw_ix, make_end_liquidate_ix,
+        make_init_liquidation_record_ix, make_juplend_withdraw_ix, make_kamino_withdraw_ix,
+        make_repay_ix, make_start_liquidate_ix, make_withdraw_ix,
     },
     utils::{self, marginfi_account_by_authority},
-    wrappers::oracle::OracleWrapper,
 };
 use anyhow::{anyhow, Context, Result};
 use fixed::types::I80F48;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use marginfi_type_crate::{
     constants::{
         ASSET_TAG_DEFAULT, ASSET_TAG_DRIFT, ASSET_TAG_JUPLEND, ASSET_TAG_KAMINO, ASSET_TAG_SOL,
@@ -35,14 +30,11 @@ use solana_program::pubkey::Pubkey;
 use solana_sdk::{
     account::ReadableAccount,
     instruction::Instruction,
-    message::AddressLookupTableAccount,
     message::{v0::Message, VersionedMessage},
-    pubkey,
     signature::Keypair,
     signer::Signer,
     transaction::VersionedTransaction,
 };
-use solana_system_interface::instruction::transfer;
 use std::{collections::HashSet, sync::Arc, thread, time::Duration};
 
 pub const PROFIT_SHARE: f64 = 0.085;
@@ -64,7 +56,6 @@ pub struct LiquidatorAccount {
     pub liquidator_address: Pubkey,
     pub signer: Keypair,
     group: Pubkey,
-    preferred_mint_bank: Pubkey,
     rpc_client: RpcClient,
     cu_limit_ix: Instruction,
     pub cache: Arc<Cache>,
@@ -74,7 +65,6 @@ impl LiquidatorAccount {
     pub fn new(
         config: &Eva01Config,
         marginfi_group_id: Pubkey,
-        preferred_mint: Pubkey,
         cache: Arc<Cache>,
     ) -> Result<Self> {
         let signer = Keypair::try_from(config.wallet_keypair.as_slice())?;
@@ -108,13 +98,10 @@ impl LiquidatorAccount {
             accounts[0]
         };
 
-        let preferred_mint_bank = cache.banks.try_get_account_for_mint(&preferred_mint)?;
-
         Ok(Self {
             liquidator_address,
             signer,
             group: marginfi_group_id,
-            preferred_mint_bank,
             rpc_client,
             cu_limit_ix: ComputeBudgetInstruction::set_compute_unit_limit(1400000),
             cache,
@@ -399,170 +386,6 @@ impl LiquidatorAccount {
         }
 
         Ok((tx, ixs, temp_lut))
-    }
-
-    pub fn withdraw(&self, bank: &BankWrapper, amount: u64, withdraw_all: bool) -> Result<()> {
-        let marginfi_account = self.liquidator_address;
-
-        let signer_pk = self.signer.pubkey();
-
-        let banks_to_include: Vec<Pubkey> = vec![];
-        let banks_to_exclude = if withdraw_all {
-            vec![bank.address]
-        } else {
-            vec![]
-        };
-
-        let clock = clock_manager::get_clock(&self.cache.clock)?;
-
-        debug!("Collecting observation accounts for the account: {:?} with banks_to_include {:?} and banks_to_exclude {:?}", 
-        &self.liquidator_address, &banks_to_include, &banks_to_exclude);
-        let observation_accounts =
-            MarginfiAccountWrapper::get_observation_accounts::<OracleWrapper>(
-                &self
-                    .cache
-                    .marginfi_accounts
-                    .try_get_account(&self.liquidator_address)?
-                    .account
-                    .lending_account,
-                &banks_to_include,
-                &banks_to_exclude,
-                &self.cache,
-                &clock,
-            )?
-            .observation_accounts;
-
-        let mint_wrapper = self.cache.mints.try_get_account(&bank.bank.mint)?;
-        let withdraw_ix = make_withdraw_ix(
-            self.group,
-            marginfi_account,
-            signer_pk,
-            bank,
-            &mint_wrapper,
-            observation_accounts.as_ref(),
-            amount,
-            withdraw_all,
-        );
-
-        let ixs: Vec<Instruction> = vec![self.cu_limit_ix.clone(), withdraw_ix];
-        let luts = self
-            .cache
-            .luts
-            .lock()
-            .unwrap()
-            .select_for_tags(&[bank.bank.config.asset_tag]);
-
-        debug!(
-            "Withdrawing {:?} unscaled tokens of the Mint {} from the Liquidator account {:?}, Bank {:?}, ",
-            amount,
-            bank.bank.mint,
-            mint_wrapper.token,
-            self.preferred_mint_bank
-        );
-
-        self.send_withdraw_tx(&signer_pk, &ixs, &luts)?;
-
-        Ok(())
-    }
-
-    fn send_withdraw_tx(
-        &self,
-        signer_pk: &Pubkey,
-        ixs: &[Instruction],
-        luts: &[AddressLookupTableAccount],
-    ) -> Result<()> {
-        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
-        let msg = Message::try_compile(signer_pk, ixs, luts, recent_blockhash)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        let res = self
-            .rpc_client
-            .send_and_confirm_transaction_with_spinner_and_config(
-                &tx,
-                CommitmentConfig::finalized(),
-                RpcSendTransactionConfig {
-                    skip_preflight: false,
-                    preflight_commitment: Some(CommitmentLevel::Processed),
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| anyhow::anyhow!(e));
-
-        match res {
-            Ok(sig) => {
-                debug!("Withdrawal tx: {:?}", sig);
-                Ok(())
-            }
-            Err(e)
-                if !luts.is_empty()
-                    && e.to_string()
-                        .contains("address table account that doesn't exist") =>
-            {
-                warn!(
-                    "LUT is invalid or deactivated ({}); retrying withdraw without LUTs",
-                    luts[0].key
-                );
-                self.send_withdraw_tx(signer_pk, ixs, &[])
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    pub fn deposit(&self, bank: &BankWrapper, amount: u64) -> Result<()> {
-        let marginfi_account = self.liquidator_address;
-
-        let signer_pk = self.signer.pubkey();
-
-        let mint = bank.bank.mint;
-        let token_account = self.cache.tokens.try_get_token_for_mint(&mint)?;
-        let deposit_ix = make_deposit_ix(
-            self.group,
-            marginfi_account,
-            signer_pk,
-            bank,
-            token_account,
-            self.cache.mints.try_get_account(&mint)?.account.owner,
-            amount,
-        );
-
-        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
-
-        let instructions: Vec<Instruction> =
-            if mint == pubkey!("So11111111111111111111111111111111111111112") {
-                vec![transfer(&signer_pk, &token_account, amount), deposit_ix]
-            } else {
-                vec![deposit_ix]
-            };
-
-        let tx: solana_sdk::transaction::Transaction =
-            solana_sdk::transaction::Transaction::new_signed_with_payer(
-                &instructions,
-                Some(&signer_pk),
-                &[&self.signer],
-                recent_blockhash,
-            );
-
-        debug!("Depositing {:?}, token account {:?}", amount, token_account);
-
-        let res = self
-            .rpc_client
-            .send_and_confirm_transaction_with_spinner_and_config(
-                &tx,
-                CommitmentConfig::finalized(),
-                RpcSendTransactionConfig {
-                    skip_preflight: false,
-                    preflight_commitment: Some(CommitmentLevel::Processed),
-                    ..Default::default()
-                },
-            );
-        debug!(
-            "Depositing result for account {:?} (without preflight check): {:?} ",
-            marginfi_account, res
-        );
-
-        Ok(())
     }
 
     pub fn get_token_balance_for_mint(&self, mint_address: &Pubkey) -> Option<u64> {

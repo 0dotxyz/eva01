@@ -58,7 +58,6 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     let liquidator_account = Arc::new(LiquidatorAccount::new(
         &config.clone(),
         config.marginfi_group_key,
-        config.swap_mint,
         cache.clone(),
     )?);
 

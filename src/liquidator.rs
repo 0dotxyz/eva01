@@ -87,7 +87,7 @@ impl Liquidator {
         let swb_cranker = Arc::new(SwbCranker::new(&config, cache.as_ref())?);
 
         let rebalancer =
-            Rebalancer::new(config.clone(), liquidator_account.clone(), cache.clone())?;
+            Rebalancer::new(config.clone(), cache.clone())?;
 
         let jito = JitoClient::new(
             config.jito_block_engine_url.clone(),
@@ -129,7 +129,7 @@ impl Liquidator {
     }
 
     pub fn start(&mut self) -> Result<()> {
-        self.rebalancer.run(HashMap::new())?;
+        self.rebalancer.run()?;
 
         info!("Staring the Liquidator loop.");
         while !self.stop_liquidator.load(Ordering::Relaxed) {
@@ -170,8 +170,8 @@ impl Liquidator {
 
             info!("The Liquidation process is complete.");
 
-            // Sell-only true-up: with JIT-buy funding liabilities, no shortfall is passed.
-            if let Err(error) = self.rebalancer.run(HashMap::new()) {
+            // Sell-only sweep: convert any seized collateral / JIT-buy overshoot back to USDC.
+            if let Err(error) = self.rebalancer.run() {
                 error!("Rebalancing failed: {:?}", error);
             }
         }
