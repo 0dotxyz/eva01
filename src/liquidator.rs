@@ -28,7 +28,7 @@ use marginfi_type_crate::{
     constants::BANKRUPT_THRESHOLD,
     types::{
         reconcile_emode_configs, BalanceSide, Bank, BankOperationalState, EmodeConfig,
-        HealthPriceMode, MarginfiAccount, OnRampTransition, RequirementType,
+        HealthPriceMode, MarginfiAccount, RequirementType,
     },
 };
 use solana_program::pubkey::Pubkey;
@@ -445,7 +445,6 @@ impl Liquidator {
             RequirementType::Maintenance,
             &mut None,
             HealthPriceMode::Client(clock.clone()),
-            OnRampTransition::PreTransition,
         )?;
 
         let emode_configs = account
