@@ -29,11 +29,16 @@ pub struct Eva01Config {
     pub slippage_bps: u16,
     pub token_thresholds: HashMap<Pubkey, TokenThresholds>,
     pub default_token_max_threshold: I80F48,
-    pub token_dust_threshold: I80F48,
     pub titan_ws_endpoint: String,
     pub titan_api_key: String,
     pub jupiter_api_key: String,
     pub use_fumarole: bool,
+    /// Jito block-engine `sendBundle` endpoint; `None` uses the executor's built-in default.
+    pub jito_block_engine_url: Option<String>,
+    /// Hard cap on the Jito tip per bundle (lamports).
+    pub jito_tip_max_lamports: u64,
+    /// API key/uuid for `sendBundle`/`simulateBundle`; `None` for the public (unauthenticated) path.
+    pub bundle_api_key: Option<String>,
 }
 
 impl Eva01Config {
@@ -107,13 +112,6 @@ impl Eva01Config {
                 .expect("Invalid DEFAULT_TOKEN_MAX_THRESHOLD number"),
         );
 
-        let token_dust_threshold = I80F48::from_num(
-            std::env::var("TOKEN_DUST_THRESHOLD")
-                .unwrap_or("0.001".to_string())
-                .parse::<f64>()
-                .expect("Invalid TOKEN_DUST_THRESHOLD number"),
-        );
-
         let titan_ws_endpoint = std::env::var("TITAN_WS_ENDPOINT")
             .expect("TITAN_WS_ENDPOINT environment variable is not set");
         let titan_api_key =
@@ -123,6 +121,14 @@ impl Eva01Config {
             .expect("JUP_SWAP_API_KEY environment variable is not set");
 
         let use_fumarole = std::env::var("USE_FUMAROLE").is_ok_and(|x| x == "true");
+
+        let jito_block_engine_url = std::env::var("JITO_BLOCK_ENGINE_URL").ok();
+        // Default cap 0.001 SOL (matches Jito's typical max tip floor).
+        let jito_tip_max_lamports: u64 = std::env::var("JITO_TIP_MAX_LAMPORTS")
+            .unwrap_or_else(|_| "1000000".to_string())
+            .parse()
+            .expect("Invalid JITO_TIP_MAX_LAMPORTS number");
+        let bundle_api_key = std::env::var("JITO_API_KEY").ok();
 
         Ok(Eva01Config {
             rpc_url,
@@ -144,11 +150,13 @@ impl Eva01Config {
             slippage_bps,
             token_thresholds,
             default_token_max_threshold,
-            token_dust_threshold,
             titan_ws_endpoint,
             titan_api_key,
             jupiter_api_key,
             use_fumarole,
+            jito_block_engine_url,
+            jito_tip_max_lamports,
+            bundle_api_key,
         })
     }
 }
@@ -234,7 +242,6 @@ mod tests {
         let lut_group3 = Pubkey::new_unique().to_string();
         let min_profit = "0.01";
         let default_token_max_threshold = "10.0";
-        let token_dust_threshold = "0.01";
         let healthcheck_port = "3000";
 
         jail.set_env("YELLOWSTONE_ENDPOINT", yellowstone_endpoint);
@@ -251,7 +258,6 @@ mod tests {
         jail.set_env("MIN_PROFIT", min_profit);
         jail.set_env("PORT", healthcheck_port);
         jail.set_env("DEFAULT_TOKEN_MAX_THRESHOLD", default_token_max_threshold);
-        jail.set_env("TOKEN_DUST_THRESHOLD", token_dust_threshold);
     }
 
     fn setup_rebalancer_env(jail: &mut Jail) {

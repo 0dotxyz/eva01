@@ -24,6 +24,7 @@ mod cli;
 mod clock_manager;
 mod config;
 mod drift_ixs;
+mod execution;
 mod geyser;
 mod juplend_ixs;
 mod kamino_ixs;
