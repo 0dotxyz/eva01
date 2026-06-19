@@ -1,12 +1,5 @@
-use fixed::types::I80F48;
 use solana_sdk::pubkey::Pubkey;
-use std::{collections::HashMap, str::FromStr};
-
-#[derive(Clone, Debug)]
-pub struct TokenThresholds {
-    pub min_value: I80F48,
-    pub max_value: I80F48,
-}
+use std::str::FromStr;
 
 #[derive(Clone, Debug)]
 pub struct Eva01Config {
@@ -27,13 +20,16 @@ pub struct Eva01Config {
     pub jup_swap_api_url: String,
     pub swap_mint: Pubkey,
     pub slippage_bps: u16,
-    pub token_thresholds: HashMap<Pubkey, TokenThresholds>,
-    pub default_token_max_threshold: I80F48,
-    pub token_dust_threshold: I80F48,
     pub titan_ws_endpoint: String,
     pub titan_api_key: String,
     pub jupiter_api_key: String,
     pub use_fumarole: bool,
+    /// Jito block-engine `sendBundle` endpoint; `None` uses the executor's built-in default.
+    pub jito_block_engine_url: Option<String>,
+    /// Hard cap on the Jito tip per bundle (lamports).
+    pub jito_tip_max_lamports: u64,
+    /// API key/uuid for `sendBundle`/`simulateBundle`; `None` for the public (unauthenticated) path.
+    pub bundle_api_key: Option<String>,
 }
 
 impl Eva01Config {
@@ -98,22 +94,6 @@ impl Eva01Config {
         )
         .expect("Invalid SWAP_MINT Pubkey");
 
-        let token_thresholds = load_token_thresholds_from_env()?;
-
-        let default_token_max_threshold = I80F48::from_num(
-            std::env::var("DEFAULT_TOKEN_MAX_THRESHOLD")
-                .expect("DEFAULT_TOKEN_MAX_THRESHOLD environment variable is not set")
-                .parse::<f64>()
-                .expect("Invalid DEFAULT_TOKEN_MAX_THRESHOLD number"),
-        );
-
-        let token_dust_threshold = I80F48::from_num(
-            std::env::var("TOKEN_DUST_THRESHOLD")
-                .unwrap_or("0.001".to_string())
-                .parse::<f64>()
-                .expect("Invalid TOKEN_DUST_THRESHOLD number"),
-        );
-
         let titan_ws_endpoint = std::env::var("TITAN_WS_ENDPOINT")
             .expect("TITAN_WS_ENDPOINT environment variable is not set");
         let titan_api_key =
@@ -123,6 +103,14 @@ impl Eva01Config {
             .expect("JUP_SWAP_API_KEY environment variable is not set");
 
         let use_fumarole = std::env::var("USE_FUMAROLE").is_ok_and(|x| x == "true");
+
+        let jito_block_engine_url = std::env::var("JITO_BLOCK_ENGINE_URL").ok();
+        // Default cap 0.001 SOL (matches Jito's typical max tip floor).
+        let jito_tip_max_lamports: u64 = std::env::var("JITO_TIP_MAX_LAMPORTS")
+            .unwrap_or_else(|_| "1000000".to_string())
+            .parse()
+            .expect("Invalid JITO_TIP_MAX_LAMPORTS number");
+        let bundle_api_key = std::env::var("JITO_API_KEY").ok();
 
         Ok(Eva01Config {
             rpc_url,
@@ -142,13 +130,13 @@ impl Eva01Config {
             jup_swap_api_url,
             swap_mint,
             slippage_bps,
-            token_thresholds,
-            default_token_max_threshold,
-            token_dust_threshold,
             titan_ws_endpoint,
             titan_api_key,
             jupiter_api_key,
             use_fumarole,
+            jito_block_engine_url,
+            jito_tip_max_lamports,
+            bundle_api_key,
         })
     }
 }
@@ -161,35 +149,6 @@ fn derive_rpc_url(yellowstone_endpoint: &str, yellowstone_x_token: Option<&str>)
     {
         Some(token) => format!("{endpoint}/{token}"),
         None => endpoint.to_string(),
-    }
-}
-
-pub fn load_token_thresholds_from_env() -> anyhow::Result<HashMap<Pubkey, TokenThresholds>> {
-    match std::env::var("TOKEN_THRESHOLDS") {
-        Ok(s) if !s.trim().is_empty() => {
-            let raw: HashMap<String, (f64, f64)> = serde_json::from_str(&s)?;
-            let mut out = HashMap::with_capacity(raw.len());
-            for (k, (min_threshold, max_threshold)) in raw {
-                let pk = Pubkey::from_str(&k).map_err(|e| {
-                    anyhow::anyhow!("Invalid mint pubkey in TOKEN_THRESHOLDS: {k}: {e}")
-                })?;
-                if min_threshold * 2.0 > max_threshold {
-                    return Err(anyhow::anyhow!(
-                        "Invalid thresholds for {}: max must be greater than min * 2",
-                        pk
-                    ));
-                }
-                out.insert(
-                    pk,
-                    TokenThresholds {
-                        min_value: I80F48::from_num(min_threshold),
-                        max_value: I80F48::from_num(max_threshold),
-                    },
-                );
-            }
-            Ok(out)
-        }
-        _ => Ok(HashMap::new()),
     }
 }
 
@@ -233,8 +192,6 @@ mod tests {
         let lut_group2 = Pubkey::new_unique().to_string();
         let lut_group3 = Pubkey::new_unique().to_string();
         let min_profit = "0.01";
-        let default_token_max_threshold = "10.0";
-        let token_dust_threshold = "0.01";
         let healthcheck_port = "3000";
 
         jail.set_env("YELLOWSTONE_ENDPOINT", yellowstone_endpoint);
@@ -250,8 +207,6 @@ mod tests {
         jail.set_env("ADDRESS_LOOKUP_TABLES_GROUP3", &lut_group3);
         jail.set_env("MIN_PROFIT", min_profit);
         jail.set_env("PORT", healthcheck_port);
-        jail.set_env("DEFAULT_TOKEN_MAX_THRESHOLD", default_token_max_threshold);
-        jail.set_env("TOKEN_DUST_THRESHOLD", token_dust_threshold);
     }
 
     fn setup_rebalancer_env(jail: &mut Jail) {

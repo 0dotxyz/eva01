@@ -1,52 +1,34 @@
-use crate::{
-    cache::Cache,
-    config::{Eva01Config, TokenThresholds},
-    utils,
-    wrappers::{
-        liquidator_account::LiquidatorAccount, oracle::OracleWrapper,
-        token_account::TokenAccountWrapper,
-    },
-};
+use crate::{cache::Cache, config::Eva01Config};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use solana_commitment_config::CommitmentLevel;
 use solana_dex_superagg::{
     client::DexSuperAggClient,
     config::{ClientConfig, JupiterConfig, RoutingStrategy, SharedConfig, TitanConfig},
 };
 use solana_program::pubkey::Pubkey;
-use solana_sdk::account::ReadableAccount;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 use tokio::runtime::{Builder, Runtime};
 
-const SLIPPAGE_MULTIPLIER: I80F48 = I80F48!(1.05);
+/// Don't bother selling a position worth less than this (USD); the swap fee/dust isn't worth it.
+const MIN_REBALANCE_VALUE: I80F48 = I80F48!(0.5);
 
-/// The rebalancer is responsible to maintain the appropriate amounts of tokens on token accounts.
-/// Guided primarily by token_thresholds and specific requests from the liquidator.
+/// The rebalancer keeps the liquidator holding only the swap mint (USDC): every other token it ends
+/// up with — seized collateral from a liquidation, or a JIT-buy overshoot — is sold back to USDC on
+/// the next pass. There is no inventory to maintain and nothing is bought here (liabilities are
+/// funded just-in-time during liquidation), so it is a pure sell-to-USDC sweep.
 pub struct Rebalancer {
-    liquidator_account: Arc<LiquidatorAccount>,
     swap_mint: Pubkey,
-    swap_mint_bank: Pubkey,
     tokio_rt: Runtime,
     cache: Arc<Cache>,
-    default_token_max_threshold: I80F48,
-    token_thresholds: HashMap<Pubkey, TokenThresholds>,
     dex_client: Arc<DexSuperAggClient>,
     empty_stake_banks: HashSet<Pubkey>,
 }
 
 impl Rebalancer {
-    pub fn new(
-        config: Eva01Config,
-        liquidator_account: Arc<LiquidatorAccount>,
-        cache: Arc<Cache>,
-    ) -> anyhow::Result<Self> {
+    pub fn new(config: Eva01Config, cache: Arc<Cache>) -> anyhow::Result<Self> {
         let swap_mint = config.swap_mint;
-        let swap_mint_bank = cache.banks.try_get_account_for_mint(&config.swap_mint)?;
 
         let tokio_rt = Builder::new_multi_thread()
             .thread_name("rebalancer")
@@ -54,13 +36,9 @@ impl Rebalancer {
             .enable_all()
             .build()?;
 
-        let default_token_max_threshold = config.default_token_max_threshold;
-        let token_thresholds = config.token_thresholds;
-
         // Convert wallet keypair to JSON string format expected by solana-dex-superagg
         let wallet_keypair_str = serde_json::to_string(&config.wallet_keypair)?;
 
-        // Create ClientConfig for DexSuperAggClient
         let shared_config = SharedConfig {
             rpc_url: config.rpc_url.clone(),
             slippage_bps: config.slippage_bps,
@@ -91,205 +69,73 @@ impl Rebalancer {
         let dex_client = Arc::new(DexSuperAggClient::new(client_config)?);
 
         Ok(Self {
-            liquidator_account,
             swap_mint,
-            swap_mint_bank,
             tokio_rt,
             cache,
-            default_token_max_threshold,
-            token_thresholds,
             dex_client,
             empty_stake_banks: HashSet::new(),
         })
     }
 
-    pub fn run(&mut self, missing_tokens: HashMap<Pubkey, I80F48>) -> anyhow::Result<()> {
+    /// Sell every non-swap-mint token the wallet holds (above the dust floor) back to the swap mint.
+    pub fn run(&mut self) -> anyhow::Result<()> {
         info!("Running the Rebalancing process...");
 
-        let swap_token_address = self.cache.tokens.try_get_token_for_mint(&self.swap_mint)?;
-        let swap_wrapper = self
-            .cache
-            .try_get_token_wrapper_lenient(&self.swap_mint, &swap_token_address)?;
-
-        if let Err(e) = self.handle_token_accounts(missing_tokens, &swap_wrapper) {
-            error!("Failed to handle the Liquidator's tokens: {}", e);
-        }
-
-        if let Err(error) = self.deposit_preferred_token(&swap_wrapper) {
-            error!("Failed to deposit preferred token: {}", error);
-        }
-
-        info!("The Rebalancing process is complete.");
-
-        Ok(())
-    }
-
-    fn handle_token_accounts(
-        &mut self,
-        missing_tokens: HashMap<Pubkey, I80F48>,
-        swap_wrapper: &TokenAccountWrapper<OracleWrapper>,
-    ) -> anyhow::Result<()> {
-        let (necessary_swap_value, missing_mint_to_value) =
-            self.sell_excessive_tokens_and_calculate_necessary_swap_value(missing_tokens)?;
-
-        let existing_swap_value = swap_wrapper.get_value()?;
-
-        if necessary_swap_value > existing_swap_value {
-            let swap_bank_wrapper = self.cache.banks.try_get_bank(&self.swap_mint_bank)?;
-
-            // Withdraw 5% more to account for slippage and price changes
-            let amount = swap_wrapper
-                .get_amount_from_value(necessary_swap_value - existing_swap_value)?
-                .checked_mul(SLIPPAGE_MULTIPLIER)
-                .unwrap();
-
-            if let Err(e) =
-                self.liquidator_account
-                    .withdraw(&swap_bank_wrapper, amount.to_num(), false)
-            {
-                let err_str = e.to_string();
-                // BankAccountNotFound (0x1782): no balance account opened for this bank
-                // (or no deposit). Nothing to withdraw — proceed with wallet balance only.
-                if err_str.contains("0x1782") || err_str.contains("BankAccountNotFound") {
-                    warn!("No swap mint balance in marginfi lending account; proceeding with wallet balance only");
-                } else {
-                    return Err(e);
-                }
-            }
-        }
-
-        self.buy_missing_tokens(swap_wrapper, missing_mint_to_value)
-    }
-
-    fn sell_excessive_tokens_and_calculate_necessary_swap_value(
-        &mut self,
-        bank_to_amount: HashMap<Pubkey, I80F48>,
-    ) -> anyhow::Result<(I80F48, HashMap<Pubkey, I80F48>)> {
-        let mut mint_to_value: HashMap<Pubkey, I80F48> = HashMap::new();
-        let mut necessary_swap_value = I80F48::ZERO;
         for mint in self.cache.mints.get_mints() {
-            debug!("Processing token {}...", mint);
             if mint == self.swap_mint || self.empty_stake_banks.contains(&mint) {
                 continue;
             }
 
-            let token = self.cache.tokens.try_get_token_for_mint(&mint)?;
-            let wrapper = self.cache.try_get_token_wrapper_lenient(&mint, &token);
-            if let Err(e) = wrapper {
-                // Ignore empty stake banks
-                if e.to_string().contains("Stake pool supply is zero") {
-                    self.empty_stake_banks.insert(mint);
-                } else {
-                    // SwitchboardStalePrice here at startup is harmless — SwbPriceFetcher
-                    // populates synthetic oracle accounts on its first 30-second cycle.
-                    warn!("Skipping the token {} in rebalancing: {}", mint, e);
-                }
-                continue;
-            }
+            let token = match self.cache.tokens.try_get_token_for_mint(&mint) {
+                Ok(token) => token,
+                Err(_) => continue,
+            };
 
-            let wrapper = wrapper.unwrap();
-
-            if let Some(&amount) = bank_to_amount.get(&wrapper.bank_wrapper.address) {
-                let value_to_swap = wrapper.get_value_for_amount(amount)?;
-                let missing_value = if value_to_swap < I80F48::from_num(1) {
-                    I80F48::from_num(1)
-                } else {
-                    value_to_swap
-                        .checked_mul(SLIPPAGE_MULTIPLIER)
-                        .ok_or_else(|| anyhow::anyhow!("Failed to calculate missing token value"))?
-                };
-                mint_to_value.insert(mint, missing_value);
-                necessary_swap_value += missing_value;
-                continue;
-            }
-
-            let value = wrapper.get_value()?;
-            let min_value = self
-                .token_thresholds
-                .get(&mint)
-                .map(|t| t.min_value)
-                .unwrap_or(I80F48::ZERO);
-            let max_value = self
-                .token_thresholds
-                .get(&mint)
-                .map(|t| t.max_value)
-                .unwrap_or(self.default_token_max_threshold);
-
-            if value > max_value {
-                info!("The value of {} tokens is higher than set threshold: {} > {}. Selling ${} worth of tokens.", mint, value.to_num::<f64>(), max_value.to_num::<f64>(), (value - max_value / 2).to_num::<f64>());
-                let amount_to_swap = wrapper.get_amount_from_value(value - max_value / 2)?;
-                match self.swap(amount_to_swap.to_num(), mint, self.swap_mint) {
-                    Ok(swapped_amount) => {
-                        info!("Got {} back from the swap.", swapped_amount);
+            let wrapper = match self.cache.try_get_token_wrapper_lenient(&mint, &token) {
+                Ok(wrapper) => wrapper,
+                Err(e) => {
+                    // Ignore empty stake banks; SwitchboardStalePrice at startup is harmless
+                    // (SwbPriceFetcher populates synthetic oracle accounts on its first cycle).
+                    if e.to_string().contains("Stake pool supply is zero") {
+                        self.empty_stake_banks.insert(mint);
+                    } else {
+                        warn!("Skipping the token {} in rebalancing: {}", mint, e);
                     }
-                    Err(e) => {
-                        error!("Swap failed: {}", e);
-                    }
+                    continue;
                 }
-            } else if value < min_value {
-                info!("The value of {} tokens is lower than set threshold: {} < {}. Will buy ${} worth of tokens.", mint, value.to_num::<f64>(), min_value.to_num::<f64>(), min_value.to_num::<f64>());
-                mint_to_value.insert(mint, min_value);
-                necessary_swap_value += min_value.checked_mul(SLIPPAGE_MULTIPLIER).unwrap();
-            }
-        }
-        Ok((necessary_swap_value, mint_to_value))
-    }
+            };
 
-    fn buy_missing_tokens(
-        &mut self,
-        swap_token_wrapper: &TokenAccountWrapper<OracleWrapper>,
-        mint_to_value: HashMap<Pubkey, I80F48>,
-    ) -> anyhow::Result<()> {
-        for mint in self.cache.mints.get_mints() {
-            if mint == self.swap_mint {
+            if wrapper.balance == 0 {
                 continue;
             }
 
-            if let Some(&value_to_swap) = mint_to_value.get(&mint) {
-                let amount_to_swap = swap_token_wrapper.get_amount_from_value(value_to_swap)?;
-                if let Err(e) = self.swap(amount_to_swap.to_num(), self.swap_mint, mint) {
-                    error!("Swap failed: {}", e);
+            let value = match wrapper.get_value() {
+                Ok(value) => value,
+                Err(e) => {
+                    warn!(
+                        "Skipping the token {} in rebalancing (price unavailable): {}",
+                        mint, e
+                    );
+                    continue;
                 }
+            };
+
+            if value < MIN_REBALANCE_VALUE {
+                continue;
             }
-        }
-        Ok(())
-    }
 
-    fn deposit_preferred_token(
-        &self,
-        swap_wrapper: &TokenAccountWrapper<OracleWrapper>,
-    ) -> anyhow::Result<()> {
-        let amount = self
-            .get_token_balance_for_mint(&self.swap_mint)
-            .unwrap_or_default();
-
-        let max_value = self
-            .token_thresholds
-            .get(&self.swap_mint)
-            .map(|t| t.max_value)
-            .unwrap_or(self.default_token_max_threshold);
-
-        let max_amount = swap_wrapper.get_amount_from_value(max_value)?;
-        if amount < max_amount {
-            return Ok(());
-        }
-
-        // Leave the half of the max value on token acc
-        let amount = (amount - max_amount.checked_mul(I80F48::from_num(0.5)).unwrap()).to_num();
-
-        info!(
-            "Depositing {} of preferred token to the Swap mint bank {:?}.",
-            amount, &self.swap_mint_bank
-        );
-
-        let bank_wrapper = self.cache.banks.try_get_bank(&self.swap_mint_bank)?;
-
-        if let Err(error) = self.liquidator_account.deposit(&bank_wrapper, amount) {
-            error!(
-                "Failed to deposit to the Bank ({:?}): {:?}",
-                &self.swap_mint_bank, error
+            info!(
+                "Selling {} of {} (~${}) back to the swap mint.",
+                wrapper.balance,
+                mint,
+                value.to_num::<f64>()
             );
+            if let Err(e) = self.swap(wrapper.balance, mint, self.swap_mint) {
+                error!("Rebalance swap failed for {}: {}", mint, e);
+            }
         }
+
+        info!("The Rebalancing process is complete.");
 
         Ok(())
     }
@@ -331,28 +177,5 @@ impl Rebalancer {
         }
 
         Ok(result.swap_result.out_amount)
-    }
-
-    fn get_token_balance_for_mint(&self, mint_address: &Pubkey) -> Option<I80F48> {
-        let token_account_address = self.cache.tokens.get_token_for_mint(mint_address)?;
-        match self.cache.tokens.try_get_account(&token_account_address) {
-            Ok(account) => match utils::accessor::amount(account.data()) {
-                Ok(amount) => Some(I80F48::from_num(amount)),
-                Err(error) => {
-                    error!(
-                        "Failed to obtain balance amount for the Token {}: {}",
-                        token_account_address, error
-                    );
-                    None
-                }
-            },
-            Err(error) => {
-                error!(
-                    "Failed to get the Token account {}: {}",
-                    token_account_address, error
-                );
-                None
-            }
-        }
     }
 }
