@@ -1,7 +1,7 @@
 //! Liquidation execution layer.
 //!
 //! The scan loop decides *which* accounts to liquidate and hands each one off as a
-//! [`LiquidationIntent`]. A [`LiquidationStrategy`] turns an intent into an [`ExecutionPlan`]
+//! prepared liquidation. A [`LiquidationStrategy`] turns it into an [`ExecutionPlan`]
 //! (an ordered set of transactions), and the executor lands it as a Jito bundle with a
 //! sequential-RPC fallback. This separates the decision (scanning/ranking) from execution
 //! (tx assembly + submission), and lets different funding methods (inventory now, flashloan
@@ -10,14 +10,10 @@
 pub mod executor;
 pub mod inventory;
 
+use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 use anyhow::Result;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::transaction::VersionedTransaction;
-
-/// What the scan loop emits for the execution layer to act on. Today this is exactly the
-/// account the decision side already prepares; aliased here so the execution layer doesn't
-/// depend on the liquidator's internal naming.
-pub type LiquidationIntent = crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 
 /// An ordered set of transactions that, executed in sequence, perform one liquidation.
 ///
@@ -39,5 +35,5 @@ pub trait LiquidationStrategy {
 
     /// Assemble the transactions for this intent, or `None` if this strategy cannot handle it
     /// (e.g. collateral whose extra refresh ixs won't fit) so the caller can skip or try another.
-    fn assemble(&self, intent: &LiquidationIntent) -> Result<Option<ExecutionPlan>>;
+    fn assemble(&self, intent: &PreparedLiquidatableAccount) -> Result<Option<ExecutionPlan>>;
 }

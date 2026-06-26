@@ -30,7 +30,7 @@ use solana_program::pubkey::Pubkey;
 use solana_sdk::{
     account::ReadableAccount,
     instruction::Instruction,
-    message::{v0::Message, VersionedMessage},
+    message::{v0::Message, AddressLookupTableAccount, VersionedMessage},
     signature::Keypair,
     signer::Signer,
     transaction::VersionedTransaction,
@@ -62,11 +62,7 @@ pub struct LiquidatorAccount {
 }
 
 impl LiquidatorAccount {
-    pub fn new(
-        config: &Eva01Config,
-        marginfi_group_id: Pubkey,
-        cache: Arc<Cache>,
-    ) -> Result<Self> {
+    pub fn new(config: &Eva01Config, marginfi_group_id: Pubkey, cache: Arc<Cache>) -> Result<Self> {
         let signer = Keypair::try_from(config.wallet_keypair.as_slice())?;
         let rpc_client =
             RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
@@ -160,20 +156,27 @@ impl LiquidatorAccount {
     }
 
     /// Assemble (compile + sign) the liquidation transaction for the given account and amounts.
-    /// Pure tx construction used by the execution-layer `InventoryStrategy`. Returns the signed tx,
-    /// its instructions (for the LUT-retry path), and an optional temporary-LUT key created to fit
-    /// an oversized tx (the caller must deactivate it once the tx lands).
+    /// Pure tx construction used by the execution-layer `InventoryStrategy`. Returns the signed tx
+    /// and an optional temporary-LUT key created to fit an oversized tx.
     pub fn build_liquidate_tx(
         &self,
         account: &PreparedLiquidatableAccount,
         asset_amount: I80F48,
         liab_amount: I80F48,
-    ) -> Result<(VersionedTransaction, Vec<Instruction>, Option<Pubkey>)> {
-        let liquidatee_account_address = account.liquidatee_account.address;
+    ) -> Result<(VersionedTransaction, Option<Pubkey>)> {
+        let PreparedLiquidatableAccount {
+            liquidatee_account,
+            observation_accounts,
+            asset_bank,
+            liab_bank,
+            ..
+        } = account;
+
+        let liquidatee_account_address = liquidatee_account.address;
         let signer_pk = self.signer.pubkey();
 
-        let asset_bank_wrapper = self.cache.banks.try_get_bank(&account.asset_bank)?;
-        let liab_bank_wrapper = self.cache.banks.try_get_bank(&account.liab_bank)?;
+        let asset_bank_wrapper = self.cache.banks.try_get_bank(asset_bank)?;
+        let liab_bank_wrapper = self.cache.banks.try_get_bank(liab_bank)?;
         let asset_mint = asset_bank_wrapper.bank.mint;
         let liab_mint = liab_bank_wrapper.bank.mint;
 
@@ -184,7 +187,7 @@ impl LiquidatorAccount {
             drift_spot_markets,
             juplend_states,
             ..
-        } = &account.observation_accounts;
+        } = observation_accounts;
 
         debug!(
             "The Liquidatee {:?} observation accounts: {:?}",
@@ -192,10 +195,10 @@ impl LiquidatorAccount {
         );
 
         let liquidation_record =
-            if account.liquidatee_account.account.liquidation_record == Pubkey::default() {
-                self.init_liq_record(&account.liquidatee_account)?
+            if liquidatee_account.account.liquidation_record == Pubkey::default() {
+                self.init_liq_record(liquidatee_account)?
             } else {
-                account.liquidatee_account.account.liquidation_record
+                liquidatee_account.account.liquidation_record
             };
 
         let all_tags: Vec<u8> = liquidatee_banks
@@ -203,7 +206,7 @@ impl LiquidatorAccount {
             .filter_map(|pk| self.cache.banks.try_get_bank(pk).ok())
             .map(|b| b.bank.config.asset_tag)
             .collect();
-        let luts = self.cache.luts.lock().unwrap().select_for_tags(&all_tags);
+        let mut luts = self.cache.luts.lock().unwrap().select_for_tags(&all_tags);
 
         let mut ixs = Vec::new();
         ixs.push(self.cu_limit_ix.clone());
@@ -358,14 +361,21 @@ impl LiquidatorAccount {
         );
         ixs.push(end_ix);
 
-        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
-        let msg = Message::try_compile(&signer_pk, &ixs, &luts, recent_blockhash)?;
-        let mut tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])?;
+        self.compile_tx_with_lut_fit(&signer_pk, &ixs, &mut luts)
+    }
+
+    fn compile_tx_with_lut_fit(
+        &self,
+        signer_pk: &Pubkey,
+        ixs: &[Instruction],
+        luts: &mut Vec<AddressLookupTableAccount>,
+    ) -> Result<(VersionedTransaction, Option<Pubkey>)> {
+        let mut tx = self.compile_tx(signer_pk, ixs, luts)?;
+        let mut temp_lut: Option<Pubkey> = None;
 
         // Proactive LUT fit: if the tx exceeds the wire-size limit, pack its accounts into a
         // freshly-created targeted LUT and recompile. The caller deactivates the temp LUT once
         // the tx lands. (The 64-account-lock cap can't be fixed by a LUT, so that still fails.)
-        let mut temp_lut: Option<Pubkey> = None;
         if bincode::serialize(&tx)?.len() > MAX_TX_SIZE {
             let all_accounts: Vec<Pubkey> = ixs
                 .iter()
@@ -377,15 +387,23 @@ impl LiquidatorAccount {
                 .cache
                 .get_targeted_lut(&self.rpc_client, &self.signer, all_accounts)?;
             temp_lut = Some(lut.key);
-
-            let mut fitted_luts = luts;
-            fitted_luts.push(lut);
-            let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
-            let msg = Message::try_compile(&signer_pk, &ixs, &fitted_luts, recent_blockhash)?;
-            tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])?;
+            luts.push(lut);
+            tx = self.compile_tx(signer_pk, ixs, luts)?;
         }
 
-        Ok((tx, ixs, temp_lut))
+        Ok((tx, temp_lut))
+    }
+
+    fn compile_tx(
+        &self,
+        signer_pk: &Pubkey,
+        ixs: &[Instruction],
+        luts: &[AddressLookupTableAccount],
+    ) -> Result<VersionedTransaction> {
+        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
+        let msg = Message::try_compile(signer_pk, ixs, luts, recent_blockhash)?;
+        VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
+            .map_err(Into::into)
     }
 
     pub fn get_token_balance_for_mint(&self, mint_address: &Pubkey) -> Option<u64> {

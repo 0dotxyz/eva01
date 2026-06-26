@@ -22,7 +22,7 @@ use anyhow::{anyhow, Result};
 use crossbeam::channel::{Receiver, RecvTimeoutError};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use marginfi::state::{bank::BankImpl, marginfi_account::get_health_components};
 use marginfi_type_crate::{
     constants::BANKRUPT_THRESHOLD,
@@ -86,8 +86,7 @@ impl Liquidator {
         // The cranker is owned by the executor (for simulate-first cranking), behind an Arc.
         let swb_cranker = Arc::new(SwbCranker::new(&config, cache.as_ref())?);
 
-        let rebalancer =
-            Rebalancer::new(config.clone(), cache.clone())?;
+        let rebalancer = Rebalancer::new(config.clone(), cache.clone())?;
 
         let jito = JitoClient::new(
             config.jito_block_engine_url.clone(),
@@ -105,7 +104,6 @@ impl Liquidator {
             config.rpc_url.clone(),
             config.bundle_api_key.clone(),
             config.jito_tip_max_lamports,
-            config.min_profit as u64,
         );
 
         let strategy = InventoryStrategy::new(
@@ -155,7 +153,14 @@ impl Liquidator {
                     // a sequential RPC fallback). Funding is handled inside, so no shortfall map.
                     for acc in accounts {
                         let liquidatee = acc.liquidatee_account.address;
-                        if let Err(e) = self.executor.execute(&self.strategy, &acc) {
+                        if (acc.profit as f64) < self.min_profit {
+                            info!(
+                                "Skipping {}: est profit ${} < min ${}",
+                                liquidatee, acc.profit, self.min_profit
+                            );
+                            continue;
+                        }
+                        if let Err(e) = self.executor.try_execute(&self.strategy, &acc) {
                             error!(
                                 "Failed to execute liquidation for {:?}: {:?}",
                                 liquidatee, e
@@ -488,7 +493,7 @@ impl Liquidator {
         let all = asset_weight_maint - liab_weight_maint * liquidation_discount;
 
         if all >= I80F48::ZERO {
-            debug!("Account {:?} has no liquidatable amount: {:?}, asset_weight_maint: {:?}, liab_weight_maint: {:?}", account.address, all, asset_weight_maint, liab_weight_maint);
+            warn!("Account {:?} has no liquidatable amount: {:?}, asset_weight_maint: {:?}, liab_weight_maint: {:?}", account.address, all, asset_weight_maint, liab_weight_maint);
             return Ok(LiquidationAmounts::none());
         }
 

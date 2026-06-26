@@ -26,12 +26,12 @@ use solana_sdk::{signer::Signer, transaction::VersionedTransaction};
 
 use crate::clock_manager;
 use crate::wrappers::{
-    liquidator_account::{LiquidatorAccount, PROFIT_SHARE},
+    liquidator_account::{LiquidatorAccount, PreparedLiquidatableAccount, PROFIT_SHARE},
     oracle::OracleWrapper,
     token_account::TokenAccountWrapper,
 };
 
-use super::{ExecutionPlan, LiquidationIntent, LiquidationStrategy};
+use super::{ExecutionPlan, LiquidationStrategy};
 
 /// Extra margin over the oracle-derived input estimate, to absorb the oracle/market price gap and
 /// rounding so the first ExactIn quote usually already covers the shortfall (the quote is still
@@ -217,7 +217,7 @@ impl LiquidationStrategy for InventoryStrategy {
         "inventory"
     }
 
-    fn assemble(&self, intent: &LiquidationIntent) -> Result<Option<ExecutionPlan>> {
+    fn assemble(&self, intent: &PreparedLiquidatableAccount) -> Result<Option<ExecutionPlan>> {
         let liab_bank = self
             .liquidator_account
             .cache
@@ -258,7 +258,7 @@ impl LiquidationStrategy for InventoryStrategy {
             );
         }
 
-        let (liquidate_tx, _ixs, temp_lut) =
+        let (liquidate_tx, temp_lut) =
             self.liquidator_account
                 .build_liquidate_tx(intent, asset_amount, repay_amount)?;
         txs.push(liquidate_tx);

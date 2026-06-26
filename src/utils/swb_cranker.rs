@@ -71,15 +71,12 @@ impl SwbCranker {
         })
     }
 
-    fn build_crank_transaction(&self, swb_oracles: Vec<Pubkey>) -> Result<VersionedTransaction> {
+    pub fn build_crank_transaction(
+        &self,
+        swb_oracles: Vec<Pubkey>,
+    ) -> Result<VersionedTransaction> {
         self.tokio_rt
             .block_on(self.build_crank_transaction_async(swb_oracles))
-    }
-
-    /// Build a standalone SWB crank tx for the given feeds, for the execution layer to prepend to
-    /// a Jito bundle (simulate-first crank). Public wrapper over `build_crank_transaction`.
-    pub fn build_crank_tx(&self, swb_oracles: Vec<Pubkey>) -> Result<VersionedTransaction> {
-        self.build_crank_transaction(swb_oracles)
     }
 
     async fn build_crank_transaction_async(
@@ -118,5 +115,4 @@ impl SwbCranker {
 
         Ok(tx)
     }
-
 }

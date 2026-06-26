@@ -9,16 +9,24 @@ use std::{
     str::FromStr,
     sync::Mutex,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use log::{debug, warn};
 use reqwest::blocking::Client;
+use serde::Deserialize;
 use serde_json::{json, Value};
+use solana_client::rpc_client::RpcClient;
 use solana_program::pubkey::Pubkey;
-use solana_sdk::transaction::VersionedTransaction;
+use solana_sdk::{
+    message::{v0, VersionedMessage},
+    signature::Keypair,
+    signer::Signer,
+    transaction::VersionedTransaction,
+};
+use solana_system_interface::instruction::transfer;
 
 const DEFAULT_BUNDLE_ENDPOINT: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
 /// The well-known static Jito tip accounts. These rarely change; a bundle must tip one of them.
@@ -227,14 +235,6 @@ fn parse_bundle_status(resp: &Value) -> Result<Option<String>> {
         .map(|s| s.to_string()))
 }
 
-/// The static Jito tip accounts as `Pubkey`s (parsed from the hardcoded constants).
-pub fn default_tip_accounts() -> Vec<Pubkey> {
-    JITO_TIP_ACCOUNTS
-        .iter()
-        .map(|s| Pubkey::from_str(s).expect("hardcoded Jito tip account must be valid"))
-        .collect()
-}
-
 /// Build the `simulateBundle` config, mirroring p0-app's `createBundleConfig`: skip sig
 /// verification, replace the recent blockhash, and only inspect accounts after the last tx.
 fn build_simulate_config(num_txs: usize, accounts_to_inspect: &[Pubkey]) -> Value {
@@ -362,19 +362,49 @@ impl TipEstimator {
         tip
     }
 
+    /// Build the required Jito tip transfer transaction for a bundle.
+    pub fn build_tip_transaction(
+        &self,
+        signer: &Keypair,
+        rpc_client: &RpcClient,
+    ) -> Result<VersionedTransaction> {
+        let tip_account = select_tip_account()?;
+        let tip_lamports = self.current_tip();
+        let ix = transfer(&signer.pubkey(), &tip_account, tip_lamports);
+        let blockhash = rpc_client.get_latest_blockhash()?;
+        let msg = v0::Message::try_compile(&signer.pubkey(), &[ix], &[], blockhash)?;
+        VersionedTransaction::try_new(VersionedMessage::V0(msg), &[signer]).map_err(Into::into)
+    }
+
     fn fetch_tip_lamports(&self) -> Result<u64> {
         let resp: Value = self.http.get(TIP_FLOOR_URL).send()?.json()?;
         parse_tip_floor_lamports(&resp)
     }
 }
 
+fn select_tip_account() -> Result<Pubkey> {
+    let idx = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0)
+        % JITO_TIP_ACCOUNTS.len();
+    Pubkey::from_str(JITO_TIP_ACCOUNTS[idx])
+        .map_err(|e| anyhow!("hardcoded Jito tip account is invalid: {e}"))
+}
+
+#[derive(Deserialize)]
+struct TipFloorEntry {
+    ema_landed_tips_50th_percentile: f64,
+}
+
 /// Parse `ema_landed_tips_50th_percentile` (SOL) from the tip_floor response into lamports.
 fn parse_tip_floor_lamports(resp: &Value) -> Result<u64> {
-    let sol = resp
-        .get(0)
-        .and_then(|d| d.get("ema_landed_tips_50th_percentile"))
-        .and_then(|v| v.as_f64())
-        .ok_or_else(|| anyhow!("tip_floor missing ema_landed_tips_50th_percentile: {resp}"))?;
+    let entries: Vec<TipFloorEntry> = serde_json::from_value(resp.clone())
+        .map_err(|e| anyhow!("invalid tip_floor response ({e}): {resp}"))?;
+    let sol = entries
+        .first()
+        .ok_or_else(|| anyhow!("tip_floor response is empty: {resp}"))?
+        .ema_landed_tips_50th_percentile;
     if sol < 0.0 {
         return Err(anyhow!("negative tip floor: {sol}"));
     }
@@ -433,10 +463,12 @@ mod tests {
     }
 
     #[test]
-    fn test_default_tip_accounts() {
-        let accts = default_tip_accounts();
-        assert_eq!(accts.len(), 8);
-        // Sanity: all distinct and parse as valid pubkeys (parsing happens in the fn).
+    fn test_static_tip_accounts() {
+        assert_eq!(JITO_TIP_ACCOUNTS.len(), 8);
+        let accts: Vec<_> = JITO_TIP_ACCOUNTS
+            .iter()
+            .map(|account| Pubkey::from_str(account).unwrap())
+            .collect();
         let unique: std::collections::HashSet<_> = accts.iter().collect();
         assert_eq!(unique.len(), 8);
     }
