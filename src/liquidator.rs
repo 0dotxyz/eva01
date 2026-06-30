@@ -2,17 +2,17 @@ use crate::{
     cache::Cache,
     clock_manager,
     config::Eva01Config,
+    execution::{executor::Executor, inventory::InventoryStrategy},
     geyser::{AccountType, GeyserUpdate},
     rebalancer::Rebalancer,
     utils::{
+        jito::JitoClient,
         log_genuine_error,
         swb_cranker::{SwbCranker, SWB_STALE_HANDLED_ERROR, SWB_STALE_PRICE_ERROR_CODE_NUMBER},
     },
     wrappers::{
         bank::BankWrapper,
-        liquidator_account::{
-            LiquidationError, LiquidatorAccount, PreparedLiquidatableAccount, PROFIT_SHARE,
-        },
+        liquidator_account::{LiquidatorAccount, PreparedLiquidatableAccount, PROFIT_SHARE},
         marginfi_account::MarginfiAccountWrapper,
         oracle::{OracleWrapper, OracleWrapperTrait},
     },
@@ -31,8 +31,10 @@ use marginfi_type_crate::{
         HealthPriceMode, MarginfiAccount, RequirementType,
     },
 };
+use solana_client::rpc_client::RpcClient;
+use solana_commitment_config::CommitmentConfig;
 use solana_program::pubkey::Pubkey;
-use solana_sdk::{account_info::IntoAccountInfo, clock::Clock};
+use solana_sdk::{account_info::IntoAccountInfo, clock::Clock, signature::Keypair};
 use std::sync::atomic::Ordering;
 use std::{
     cmp::min,
@@ -44,12 +46,12 @@ use std::{
 pub struct Liquidator {
     liquidator_account: Arc<LiquidatorAccount>,
     rebalancer: Rebalancer,
+    executor: Executor,
+    strategy: InventoryStrategy,
     min_profit: f64,
     geyser_rx: Receiver<GeyserUpdate>,
     stop_liquidator: Arc<AtomicBool>,
     cache: Arc<Cache>,
-    swb_cranker: SwbCranker,
-    token_dust_threshold: I80F48,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,7 +59,6 @@ struct LiquidationAmounts {
     max_liquidatable_asset_amount: I80F48,
     max_liquidatable_liab_amount: I80F48,
     liquidator_profit: I80F48,
-    dust_liab_threshold: I80F48,
 }
 
 impl LiquidationAmounts {
@@ -66,7 +67,6 @@ impl LiquidationAmounts {
             max_liquidatable_asset_amount: I80F48::ZERO,
             max_liquidatable_liab_amount: I80F48::ZERO,
             liquidator_profit: I80F48::ZERO,
-            dust_liab_threshold: I80F48::ZERO,
         }
     }
 
@@ -83,25 +83,51 @@ impl Liquidator {
         stop_liquidator: Arc<AtomicBool>,
         cache: Arc<Cache>,
     ) -> Result<Self> {
-        let swb_cranker = SwbCranker::new(&config, cache.as_ref())?;
+        // The cranker is owned by the executor (for simulate-first cranking), behind an Arc.
+        let swb_cranker = Arc::new(SwbCranker::new(&config, cache.as_ref())?);
 
-        let rebalancer =
-            Rebalancer::new(config.clone(), liquidator_account.clone(), cache.clone())?;
+        let rebalancer = Rebalancer::new(config.clone(), cache.clone())?;
+        let dex_client = rebalancer.dex_client();
+
+        let jito = JitoClient::new(
+            config.jito_block_engine_url.clone(),
+            config.bundle_api_key.clone(),
+        );
+        let rpc_client =
+            RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
+        let signer = Keypair::try_from(config.wallet_keypair.as_slice())?;
+        let executor = Executor::new(
+            jito,
+            rpc_client,
+            cache.clone(),
+            swb_cranker,
+            signer,
+            config.rpc_url.clone(),
+            config.bundle_api_key.clone(),
+            config.jito_tip_max_lamports,
+        );
+
+        let strategy = InventoryStrategy::new(
+            liquidator_account.clone(),
+            config.swap_mint,
+            dex_client,
+            config.slippage_bps,
+        )?;
 
         Ok(Liquidator {
             liquidator_account,
             rebalancer,
+            executor,
+            strategy,
             min_profit: config.min_profit,
             geyser_rx,
             stop_liquidator,
             cache,
-            swb_cranker,
-            token_dust_threshold: config.token_dust_threshold,
         })
     }
 
     pub fn start(&mut self) -> Result<()> {
-        self.rebalancer.run(HashMap::new())?;
+        self.rebalancer.run()?;
 
         info!("Staring the Liquidator loop.");
         while !self.stop_liquidator.load(Ordering::Relaxed) {
@@ -113,56 +139,44 @@ impl Liquidator {
                 accounts_to_check.len()
             );
 
-            let mut missing_tokens: HashMap<Pubkey, I80F48> = HashMap::new();
             let mut stale_swb_oracles: HashSet<Pubkey> = HashSet::new();
             let checked_accounts = self.check_accounts(accounts_to_check, &mut stale_swb_oracles);
 
-            if let Ok(mut accounts) = checked_accounts {
-                // Accounts are sorted from the highest profit to the lowest
-                accounts.sort_by(|a, b| a.profit.cmp(&b.profit));
-                accounts.reverse();
+            match checked_accounts {
+                Ok(mut accounts) => {
+                    // Accounts are sorted from the highest profit to the lowest
+                    accounts.sort_by(|a, b| a.profit.cmp(&b.profit));
+                    accounts.reverse();
 
-                let mut tokens_in_shortage: HashSet<Pubkey> = HashSet::new();
-                for acc in accounts {
-                    let liquidatee = acc.liquidatee_account.address;
-                    let liab_bank = acc.liab_bank;
-                    let liab_amount = acc.liab_amount;
-
-                    if let Err(e) = self
-                        .liquidator_account
-                        .liquidate(acc, &mut tokens_in_shortage)
-                    {
-                        match e {
-                            LiquidationError::Anyhow(e) => {
-                                error!("Failed to liquidate account {:?}: {:?}", liquidatee, e);
-                            }
-                            LiquidationError::StaleOracles(swb_oracles) => {
-                                info!(
-                                    "Cranking stale SWB oracles for next cycle: {:?}",
-                                    swb_oracles
-                                );
-                                if let Err(crank_err) =
-                                    self.swb_cranker.crank_oracles(swb_oracles.clone())
-                                {
-                                    warn!("Failed to crank stale SWB oracles: {}", crank_err);
-                                }
-                            }
-                            LiquidationError::NotEnoughFunds => {
-                                missing_tokens
-                                    .entry(liab_bank)
-                                    .and_modify(|m| *m += liab_amount)
-                                    .or_insert(liab_amount);
-                            }
+                    // Hand each ranked account to the execution layer: it JIT-buys the liability
+                    // shortfall, simulate-first cranks stale oracles, and lands a Jito bundle (with
+                    // a sequential RPC fallback). Funding is handled inside, so no shortfall map.
+                    for acc in accounts {
+                        let liquidatee = acc.liquidatee_account.address;
+                        if (acc.profit as f64) < self.min_profit {
+                            info!(
+                                "Skipping {}: est profit ${} < min ${}",
+                                liquidatee, acc.profit, self.min_profit
+                            );
+                            continue;
+                        }
+                        if let Err(e) = self.executor.try_execute(&self.strategy, &acc) {
+                            error!(
+                                "Failed to execute liquidation for {:?}: {:?}",
+                                liquidatee, e
+                            );
                         }
                     }
                 }
-            } else if let Err(err) = checked_accounts {
-                error!("Failed to evaluate accounts in liquidation: {}", err);
+                Err(err) => {
+                    error!("Failed to evaluate accounts in liquidation: {}", err);
+                }
             }
 
             info!("The Liquidation process is complete.");
 
-            if let Err(error) = self.rebalancer.run(missing_tokens) {
+            // Sell-only sweep: convert any seized collateral / JIT-buy overshoot back to USDC.
+            if let Err(error) = self.rebalancer.run() {
                 error!("Rebalancing failed: {:?}", error);
             }
         }
@@ -369,7 +383,6 @@ impl Liquidator {
             asset_amount: slippage_adjusted_asset_amount,
             liab_amount: slippage_adjusted_liab_amount,
             profit: liquidation_amounts.liquidator_profit.to_num(),
-            dust_liab_threshold: liquidation_amounts.dust_liab_threshold,
         }))
     }
 
@@ -527,13 +540,6 @@ impl Liquidator {
             RequirementType::Equity,
         )?;
 
-        let dust_liab_threshold = liab_bank_wrapper.calc_amount(
-            &liab_oracle_wrapper,
-            self.token_dust_threshold, // in USD
-            BalanceSide::Liabilities,
-            RequirementType::Equity,
-        )?;
-
         debug!("Account {:?} liquidability evaluation:\nTotal weighted Assets {:?}\nTotal weighted Liabilities {:?}\nMaintenance health {:?}\n\
             Asset Bank {:?}\nAsset maint weight: {:?}\nAsset Amount {:?}\nAsset Value (USD) {:?}\n\
             Liab Bank {:?}\nLiab maint weight: {:?}\nLiab Amount {:?}\nLiab Value (USD) {:?}\n\
@@ -547,7 +553,6 @@ impl Liquidator {
             max_liquidatable_asset_amount,
             max_liquidatable_liab_amount,
             liquidator_profit,
-            dust_liab_threshold,
         })
     }
 
