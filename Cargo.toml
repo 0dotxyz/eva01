@@ -60,7 +60,7 @@ warp = "0.4.2"
 yellowstone-grpc-client = "10.2.0"
 yellowstone-grpc-proto = "10.1.1"
 
-solana-dex-superagg = { git = "https://github.com/0dotxyz/solana-dex-superagg", rev = "0f2d02701233b82cb819661e875c406b9f522c3b" }
+solana-dex-superagg = { git = "https://github.com/0dotxyz/solana-dex-superagg", rev = "0feb633981961307fa170130895a887324ffa923" }
 switchboard-on-demand-client = { git = "https://github.com/switchboard-xyz/switchboard-sdk", rev = "d2c50213359bb35b5e0902ffcd4bafb4315860c1" }
 
 [dependencies.marginfi_type_crate]

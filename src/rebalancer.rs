@@ -77,6 +77,10 @@ impl Rebalancer {
         })
     }
 
+    pub fn dex_client(&self) -> Arc<DexSuperAggClient> {
+        Arc::clone(&self.dex_client)
+    }
+
     /// Sell every non-swap-mint token the wallet holds (above the dust floor) back to the swap mint.
     pub fn run(&mut self) -> anyhow::Result<()> {
         info!("Running the Rebalancing process...");

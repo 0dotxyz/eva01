@@ -5819,7 +5819,7 @@ dependencies = [
 [[package]]
 name = "solana-dex-superagg"
 version = "1.0.0"
-source = "git+https://github.com/0dotxyz/solana-dex-superagg?rev=0f2d02701233b82cb819661e875c406b9f522c3b#0f2d02701233b82cb819661e875c406b9f522c3b"
+source = "git+https://github.com/0dotxyz/solana-dex-superagg?rev=0feb633981961307fa170130895a887324ffa923#0feb633981961307fa170130895a887324ffa923"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5829,6 +5829,7 @@ dependencies = [
  "bytes",
  "dotenvy",
  "figment",
+ "fixed",
  "futures-util",
  "jupiter-swap-api-client",
  "reqwest 0.12.28",

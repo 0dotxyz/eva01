@@ -87,6 +87,7 @@ impl Liquidator {
         let swb_cranker = Arc::new(SwbCranker::new(&config, cache.as_ref())?);
 
         let rebalancer = Rebalancer::new(config.clone(), cache.clone())?;
+        let dex_client = rebalancer.dex_client();
 
         let jito = JitoClient::new(
             config.jito_block_engine_url.clone(),
@@ -109,8 +110,7 @@ impl Liquidator {
         let strategy = InventoryStrategy::new(
             liquidator_account.clone(),
             config.swap_mint,
-            config.jup_swap_api_url.clone(),
-            config.jupiter_api_key.clone(),
+            dex_client,
             config.slippage_bps,
         )?;
 
