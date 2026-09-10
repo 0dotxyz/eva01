@@ -56,9 +56,13 @@ const NO_ROUTE_QUARANTINE_TTL: Duration = Duration::from_secs(3600);
 /// pull-feed staleness window, so a feed that genuinely goes stale is still re-cranked in time.
 const CRANK_LANDED_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// Base / cap for the per-target exponential backoff after a transient assemble failure
-/// (e.g. a Jupiter `429`): skip the target for `BASE * 2^(failures-1)`, capped at `MAX`.
-const TARGET_BACKOFF_BASE: Duration = Duration::from_secs(30);
+/// Base delays for the per-target exponential backoff: skip the target for
+/// `BASE * 2^(failures-1)`, capped at `TARGET_BACKOFF_MAX`.
+///
+/// Assemble failures are typically rate limits (a Jupiter `429`), which need a real pause;
+/// an execution failure can just be a lost race, so it starts short and escalates.
+const ASSEMBLE_BACKOFF_BASE: Duration = Duration::from_secs(30);
+const EXECUTION_BACKOFF_BASE: Duration = Duration::from_secs(5);
 const TARGET_BACKOFF_MAX: Duration = Duration::from_secs(900);
 
 /// Per-target backoff state after a transient (non-route) assemble failure.
@@ -85,14 +89,43 @@ impl BackoffState {
     }
 }
 
-/// Exponential backoff: `BASE * 2^(failures-1)`, capped at `TARGET_BACKOFF_MAX`.
-fn target_backoff_delay(failures: u32) -> Duration {
-    let shift = failures.saturating_sub(1).min(8);
-    let secs = TARGET_BACKOFF_BASE
+/// Exponential backoff: `base * 2^(failures-1)`, capped at `TARGET_BACKOFF_MAX`.
+fn target_backoff_delay(base: Duration, failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(16);
+    let secs = base
         .as_secs()
         .saturating_mul(1u64 << shift)
         .min(TARGET_BACKOFF_MAX.as_secs());
     Duration::from_secs(secs)
+}
+
+/// Bump `target`'s consecutive-failure count and push out its retry time.
+fn bump_target_backoff(
+    backoffs: &mut HashMap<Pubkey, BackoffState>,
+    target: &Pubkey,
+    base: Duration,
+    kind: &str,
+) {
+    let failures = match backoffs.get(target) {
+        Some(BackoffState::Target(backoff)) => backoff.failures,
+        _ => 0,
+    }
+    .saturating_add(1);
+    let delay = target_backoff_delay(base, failures);
+    backoffs.insert(
+        *target,
+        BackoffState::Target(TargetBackoff {
+            failures,
+            retry_after: Instant::now() + delay,
+        }),
+    );
+    debug!(
+        "Backing off {} for {}s (consecutive {} failures: {})",
+        target,
+        delay.as_secs(),
+        kind,
+        failures
+    );
 }
 
 pub struct Executor {
@@ -171,11 +204,7 @@ impl Executor {
         }
 
         let plan = match strategy.assemble(intent) {
-            Ok(Some(plan)) => {
-                // Assembly succeeded (quote went through or no buy was needed): clear any backoff.
-                self.clear_target_backoff(&liquidatee);
-                plan
-            }
+            Ok(Some(plan)) => plan,
             Ok(None) => {
                 debug!(
                     "Strategy '{}' cannot handle {}; skipping",
@@ -200,6 +229,7 @@ impl Executor {
         // Temp LUTs created during assembly are always cleaned up afterwards, whatever the path.
         let ExecutionPlan { mut txs, temp_luts } = plan;
         let mut cranked = false;
+        let mut attempt_failed = false;
         let result = match self.jito.simulate_bundle(
             &self.rpc_url,
             self.bundle_api_key.as_deref(),
@@ -232,6 +262,7 @@ impl Executor {
                             sim2.failed_tx_index,
                             sim2.error_message.unwrap_or_default()
                         );
+                        attempt_failed = true;
                         Ok(())
                     }
                     Err(e) => {
@@ -239,6 +270,7 @@ impl Executor {
                             "Skipping {}: re-simulation after crank failed: {}",
                             liquidatee, e
                         );
+                        attempt_failed = true;
                         Ok(())
                     }
                 }
@@ -250,6 +282,7 @@ impl Executor {
                     sim.failed_tx_index,
                     sim.error_message.unwrap_or_default()
                 );
+                attempt_failed = true;
                 Ok(())
             }
             Err(e) => {
@@ -273,6 +306,14 @@ impl Executor {
             self.record_landed_cranks(&intent.observation_accounts.swb_oracles);
         }
 
+        // Back off a target whose execution failed just like a failed assembly: every retry
+        // re-quotes the DEX and creates + deactivates a temporary LUT without landing anything.
+        if attempt_failed || result.is_err() {
+            self.note_execution_failure(&liquidatee);
+        } else {
+            self.clear_target_backoff(&liquidatee);
+        }
+
         self.deactivate_temp_luts(temp_luts);
         result
     }
@@ -282,15 +323,20 @@ impl Executor {
         Ok(self.cache.banks.try_get_bank(&intent.liab_bank)?.bank.mint)
     }
 
-    /// Whether a mint or target is currently backed off. Prunes expired entries.
+    /// Whether a mint or target is currently backed off. Expired target entries are kept for one
+    /// more `TARGET_BACKOFF_MAX` window so their failure counter — and thus the escalating delay —
+    /// survives a retry that fails again.
     fn is_backed_off(&self, key: &Pubkey) -> Result<bool> {
         let now = Instant::now();
         let mut guard = self
             .backoffs
             .lock()
             .map_err(|_| anyhow!("execution backoffs mutex poisoned"))?;
-        guard.retain(|_, state| now < state.retry_after());
-        Ok(guard.contains_key(key))
+        guard.retain(|_, state| match state {
+            BackoffState::Mint(retry_after) => now < *retry_after,
+            BackoffState::Target(backoff) => now < backoff.retry_after + TARGET_BACKOFF_MAX,
+        });
+        Ok(guard.get(key).is_some_and(|state| now < state.retry_after()))
     }
 
     /// Clear a target's backoff once it assembles successfully again.
@@ -328,35 +374,17 @@ impl Executor {
             return Ok(());
         }
 
-        let entry = guard.entry(*target).or_insert_with(|| {
-            BackoffState::Target(TargetBackoff {
-                failures: 0,
-                retry_after: Instant::now(),
-            })
-        });
-        let entry = match entry {
-            BackoffState::Target(entry) => entry,
-            BackoffState::Mint(_) => {
-                *entry = BackoffState::Target(TargetBackoff {
-                    failures: 0,
-                    retry_after: Instant::now(),
-                });
-                match entry {
-                    BackoffState::Target(entry) => entry,
-                    BackoffState::Mint(_) => unreachable!("target backoff entry was just inserted"),
-                }
-            }
-        };
-        entry.failures = entry.failures.saturating_add(1);
-        let delay = target_backoff_delay(entry.failures);
-        entry.retry_after = Instant::now() + delay;
-        debug!(
-            "Backing off {} for {}s (consecutive assemble failures: {})",
-            target,
-            delay.as_secs(),
-            entry.failures
-        );
+        bump_target_backoff(&mut guard, target, ASSEMBLE_BACKOFF_BASE, "assemble");
         Ok(())
+    }
+
+    /// Record an execution failure: the plan assembled, but the liquidation could not be landed
+    /// (simulation says it would revert, or the send failed). Same exponential backoff as an
+    /// assemble failure.
+    fn note_execution_failure(&self, target: &Pubkey) {
+        if let Ok(mut guard) = self.backoffs.lock() {
+            bump_target_backoff(&mut guard, target, EXECUTION_BACKOFF_BASE, "execution");
+        }
     }
 
     /// Deactivate any temporary LUTs created during assembly (best-effort; logs on failure), and

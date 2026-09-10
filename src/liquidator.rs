@@ -53,6 +53,9 @@ const MAX_CONCURRENT_LIQUIDATIONS: usize = 8;
 /// How often the feeds that are blocking accounts are reported.
 const STALE_ORACLE_REPORT_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How often the rebalancing sweep runs when Geyser has delivered no updates at all.
+const IDLE_REBALANCE_INTERVAL: Duration = Duration::from_secs(60);
+
 pub struct Liquidator {
     rebalancer: Rebalancer,
     executor: Executor,
@@ -159,15 +162,22 @@ impl Liquidator {
         }
 
         info!("Staring the Liquidator loop.");
+        let mut last_rebalance = Instant::now();
         while !self.stop_liquidator.load(Ordering::Relaxed) {
             debug!("Waiting for any data change...");
             let accounts_to_check = self.receive_geyser_updates()?;
-
-            self.run_liquidation_cycle(accounts_to_check);
+            let has_updates = !accounts_to_check.is_empty();
+            if has_updates {
+                self.run_liquidation_cycle(accounts_to_check);
+            }
 
             // Sell-only sweep: convert any seized collateral / JIT-buy overshoot back to USDC.
-            if let Err(error) = self.rebalancer.run() {
-                error!("Rebalancing failed: {:?}", error);
+            // Idle cycles only sweep on a heartbeat — nothing can have changed since the last one.
+            if has_updates || last_rebalance.elapsed() >= IDLE_REBALANCE_INTERVAL {
+                last_rebalance = Instant::now();
+                if let Err(error) = self.rebalancer.run() {
+                    error!("Rebalancing failed: {:?}", error);
+                }
             }
         }
         info!("The Liquidator loop is stopped.");
@@ -477,15 +487,23 @@ impl Liquidator {
         liab_values: Vec<(I80F48, Pubkey)>,
     ) -> Result<Option<(Pubkey, Pubkey)>> {
         if deposit_values.is_empty() || liab_values.is_empty() {
+            debug!(
+                "No bank candidates: {} priced deposit(s), {} priced liability(-ies)",
+                deposit_values.len(),
+                liab_values.len()
+            );
             return Ok(None);
         }
 
-        if deposit_values
+        let total_deposit_value = deposit_values
             .iter()
             .map(|(v, _)| v.to_num::<f64>())
-            .sum::<f64>()
-            < BANKRUPT_THRESHOLD
-        {
+            .sum::<f64>();
+        if total_deposit_value < BANKRUPT_THRESHOLD {
+            debug!(
+                "No bank candidates: deposits worth ${total_deposit_value:.6} are below the \
+                 bankruptcy threshold ${BANKRUPT_THRESHOLD}"
+            );
             return Ok(None);
         }
 
@@ -566,6 +584,11 @@ impl Liquidator {
             account.address, maintenance_health, total_weighted_assets, total_weighted_liabilities
         );
         if maintenance_health >= I80F48::ZERO {
+            debug!(
+                "Account {} is healthy: maintenance health ${:.6}",
+                account.address,
+                maintenance_health.to_num::<f64>()
+            );
             return Ok(LiquidationAmounts::none());
         }
 

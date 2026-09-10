@@ -227,14 +227,14 @@ impl SwbPriceFetcher {
                 .as_ref()
                 .map(|sp| &sp.price_realtime)
                 .unwrap_or(&entry.oracle_price.price_realtime);
-            if raw.price <= 0.0 {
-                warn!("SwbPriceFetcher: the API reported a non-positive price for bank {bank_address}, skipping");
-                continue;
-            }
             let price_rt = I80F48::from_num(raw.price);
             let conf_rt = I80F48::from_num(raw.confidence);
             if let Ok(bank) = self.cache.banks.try_get_bank(&bank_address) {
                 if is_switchboard_pull_setup(bank.bank.config.oracle_setup) {
+                    if raw.price <= 0.0 {
+                        warn!("SwbPriceFetcher: the API reported a non-positive price for bank {bank_address}, skipping");
+                        continue;
+                    }
                     if let Some(&oracle_key) = bank.bank.config.oracle_keys.first() {
                         let synthetic = build_synthetic_swb_account(price_rt, conf_rt);
                         if let Err(e) = self

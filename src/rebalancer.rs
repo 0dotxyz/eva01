@@ -8,7 +8,10 @@ use solana_dex_superagg::{
     config::{ClientConfig, JupiterConfig, RoutingStrategy, SharedConfig, TitanConfig},
 };
 use solana_program::pubkey::Pubkey;
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::{
     runtime::{Builder, Runtime},
     sync::Semaphore,
@@ -33,7 +36,7 @@ pub struct Rebalancer {
     dex_client: Arc<DexSuperAggClient>,
     dex_gate: Arc<Semaphore>,
     empty_stake_banks: HashSet<Pubkey>,
-    unpriceable_mints: HashSet<Pubkey>,
+    unsweepable_mints: HashMap<Pubkey, u64>,
 }
 
 impl Rebalancer {
@@ -85,7 +88,7 @@ impl Rebalancer {
             dex_client,
             dex_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_DEX_CALLS)),
             empty_stake_banks: HashSet::new(),
-            unpriceable_mints: HashSet::new(),
+            unsweepable_mints: HashMap::new(),
         })
     }
 
@@ -122,16 +125,19 @@ impl Rebalancer {
                     .ok()
                     .and_then(|account| accessor::amount(&account.data).ok())
                     .unwrap_or(0);
-                if balance > 0 {
-                    warn!(
-                        "Holding {} of {} that rebalancing cannot sweep: no non-integration bank prices this mint.",
-                        balance, mint
-                    );
-                } else if self.unpriceable_mints.insert(mint) {
-                    info!(
-                        "Excluding the mint {} from rebalancing: integration banks only.",
-                        mint
-                    );
+                // The condition is permanent, so report a mint only when its held amount changes.
+                if self.unsweepable_mints.insert(mint, balance) != Some(balance) {
+                    if balance > 0 {
+                        warn!(
+                            "Holding {} of {} that rebalancing cannot sweep: no non-integration bank prices this mint.",
+                            balance, mint
+                        );
+                    } else {
+                        info!(
+                            "Excluding the mint {} from rebalancing: integration banks only.",
+                            mint
+                        );
+                    }
                 }
                 continue;
             }
