@@ -2,7 +2,7 @@
 //!
 //! `try_execute()` turns a prepared liquidation into a landed liquidation:
 //! 1. ask the strategy to assemble the txs (`[buy?] [liquidate]`),
-//! 2. simulate-first: only prepend a crank tx when the program reports a stale oracle,
+//! 2. simulate-first: skip the target when the program reports the liquidation would fail,
 //! 3. submit as an atomic Jito bundle (with a tip), falling back to sequential RPC sends.
 //!
 //! The tip is added only on the bundle path; the sequential fallback sends the core txs as-is.
@@ -28,10 +28,7 @@ use solana_sdk::{
 };
 
 use crate::cache::Cache;
-use crate::utils::{
-    jito::{BundleOutcome, JitoClient, TipEstimator},
-    swb_cranker::SwbCranker,
-};
+use crate::utils::jito::{BundleOutcome, JitoClient, TipEstimator};
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 
 use super::{ExecutionPlan, LiquidationStrategy};
@@ -51,14 +48,13 @@ const SIGNATURE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Re-check a liability mint that has no swap route only after this long (routes can appear).
 const NO_ROUTE_QUARANTINE_TTL: Duration = Duration::from_secs(3600);
 
-/// After a crank actually LANDS, treat its feeds as fresh for this long so the sim-unavailable
-/// path doesn't re-crank them unconditionally every attempt. Kept comfortably below the Switchboard
-/// pull-feed staleness window, so a feed that genuinely goes stale is still re-cranked in time.
-const CRANK_LANDED_COOLDOWN: Duration = Duration::from_secs(30);
-
-/// Base / cap for the per-target exponential backoff after a transient assemble failure
-/// (e.g. a Jupiter `429`): skip the target for `BASE * 2^(failures-1)`, capped at `MAX`.
-const TARGET_BACKOFF_BASE: Duration = Duration::from_secs(30);
+/// Base delays for the per-target exponential backoff: skip the target for
+/// `BASE * 2^(failures-1)`, capped at `TARGET_BACKOFF_MAX`.
+///
+/// Assemble failures are typically rate limits (a Jupiter `429`), which need a real pause;
+/// an execution failure can just be a lost race, so it starts short and escalates.
+const ASSEMBLE_BACKOFF_BASE: Duration = Duration::from_secs(30);
+const EXECUTION_BACKOFF_BASE: Duration = Duration::from_secs(5);
 const TARGET_BACKOFF_MAX: Duration = Duration::from_secs(900);
 
 /// Per-target backoff state after a transient (non-route) assemble failure.
@@ -85,31 +81,55 @@ impl BackoffState {
     }
 }
 
-/// Exponential backoff: `BASE * 2^(failures-1)`, capped at `TARGET_BACKOFF_MAX`.
-fn target_backoff_delay(failures: u32) -> Duration {
-    let shift = failures.saturating_sub(1).min(8);
-    let secs = TARGET_BACKOFF_BASE
+/// Exponential backoff: `base * 2^(failures-1)`, capped at `TARGET_BACKOFF_MAX`.
+fn target_backoff_delay(base: Duration, failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(16);
+    let secs = base
         .as_secs()
         .saturating_mul(1u64 << shift)
         .min(TARGET_BACKOFF_MAX.as_secs());
     Duration::from_secs(secs)
 }
 
+/// Bump `target`'s consecutive-failure count and push out its retry time.
+fn bump_target_backoff(
+    backoffs: &mut HashMap<Pubkey, BackoffState>,
+    target: &Pubkey,
+    base: Duration,
+    kind: &str,
+) {
+    let failures = match backoffs.get(target) {
+        Some(BackoffState::Target(backoff)) => backoff.failures,
+        _ => 0,
+    }
+    .saturating_add(1);
+    let delay = target_backoff_delay(base, failures);
+    backoffs.insert(
+        *target,
+        BackoffState::Target(TargetBackoff {
+            failures,
+            retry_after: Instant::now() + delay,
+        }),
+    );
+    debug!(
+        "Backing off {} for {}s (consecutive {} failures: {})",
+        target,
+        delay.as_secs(),
+        kind,
+        failures
+    );
+}
+
 pub struct Executor {
     jito: JitoClient,
     rpc_client: RpcClient,
     cache: Arc<Cache>,
-    swb_cranker: Arc<SwbCranker>,
     signer: Keypair,
-    /// RPC URL that supports `simulateBundle` (used for simulate-first crank detection).
+    /// RPC URL that supports `simulateBundle` (used for the simulate-first check).
     rpc_url: String,
     /// Single key for both `sendBundle` (uuid) and `simulateBundle` (Bearer).
     bundle_api_key: Option<String>,
     tip_estimator: TipEstimator,
-    /// SWB feeds whose crank actually LANDED, with when. Used only to avoid re-cranking still-fresh
-    /// feeds on the sim-unavailable path (where staleness can't be detected); the sim-stale path
-    /// always cranks regardless, since the sim proves the feed is stale on-chain.
-    recently_cranked: Mutex<HashMap<Pubkey, Instant>>,
     /// Liability-mint no-route quarantines and per-liquidatee transient backoffs.
     backoffs: Mutex<HashMap<Pubkey, BackoffState>>,
     /// Count sequential fallback uses so logs reveal how often the non-bundle path is exercised.
@@ -122,7 +142,6 @@ impl Executor {
         jito: JitoClient,
         rpc_client: RpcClient,
         cache: Arc<Cache>,
-        swb_cranker: Arc<SwbCranker>,
         signer: Keypair,
         rpc_url: String,
         bundle_api_key: Option<String>,
@@ -132,12 +151,10 @@ impl Executor {
             jito,
             rpc_client,
             cache,
-            swb_cranker,
             signer,
             rpc_url,
             bundle_api_key,
             tip_estimator: TipEstimator::new(tip_max_lamports),
-            recently_cranked: Mutex::new(HashMap::new()),
             backoffs: Mutex::new(HashMap::new()),
             sequential_fallbacks: AtomicU64::new(0),
         }
@@ -171,11 +188,7 @@ impl Executor {
         }
 
         let plan = match strategy.assemble(intent) {
-            Ok(Some(plan)) => {
-                // Assembly succeeded (quote went through or no buy was needed): clear any backoff.
-                self.clear_target_backoff(&liquidatee);
-                plan
-            }
+            Ok(Some(plan)) => plan,
             Ok(None) => {
                 debug!(
                     "Strategy '{}' cannot handle {}; skipping",
@@ -192,14 +205,13 @@ impl Executor {
             }
         };
 
-        // Simulate-first crank detection. The outcome dispatches four ways:
-        //  - ran & ok                 -> bundle send, no crank
-        //  - ran & stale (0x17a1)     -> prepend crank, bundle send
-        //  - ran & other prog error   -> skip (doomed on-chain; don't burn tip+fees)
-        //  - couldn't run (infra err) -> crank all feeds + sequential RPC send (no bundle)
+        // Simulate-first. The outcome dispatches three ways:
+        //  - ran & ok                 -> bundle send
+        //  - ran & program error      -> skip (doomed on-chain; don't burn tip+fees)
+        //  - couldn't run (infra err) -> sequential RPC send (no bundle)
         // Temp LUTs created during assembly are always cleaned up afterwards, whatever the path.
-        let ExecutionPlan { mut txs, temp_luts } = plan;
-        let mut cranked = false;
+        let ExecutionPlan { txs, temp_luts } = plan;
+        let mut attempt_failed = false;
         let result = match self.jito.simulate_bundle(
             &self.rpc_url,
             self.bundle_api_key.as_deref(),
@@ -207,42 +219,6 @@ impl Executor {
             &[],
         ) {
             Ok(sim) if sim.succeeded => self.submit(&txs),
-            Ok(sim) if sim.is_stale_price_failure() => {
-                // Sim proves the feed is stale on-chain: always crank (force).
-                if let Some(crank_tx) = self.build_crank_if_needed(intent, true) {
-                    info!("Prepending SWB crank to bundle for {}", liquidatee);
-                    txs.insert(0, crank_tx);
-                    cranked = true;
-                }
-                // Re-simulate with the crank applied: a stale oracle made the first sim fail, so
-                // only submit if the cranked bundle now actually succeeds. Otherwise we'd pay to
-                // land a bundle that still reverts once the real price is posted (e.g. the account
-                // turns out healthy, 0x17b4) — which is exactly what Jito drops as "Failed".
-                match self.jito.simulate_bundle(
-                    &self.rpc_url,
-                    self.bundle_api_key.as_deref(),
-                    &txs,
-                    &[],
-                ) {
-                    Ok(sim2) if sim2.succeeded => self.submit(&txs),
-                    Ok(sim2) => {
-                        warn!(
-                            "Skipping {}: bundle still fails after crank (tx index {:?}): {}",
-                            liquidatee,
-                            sim2.failed_tx_index,
-                            sim2.error_message.unwrap_or_default()
-                        );
-                        Ok(())
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Skipping {}: re-simulation after crank failed: {}",
-                            liquidatee, e
-                        );
-                        Ok(())
-                    }
-                }
-            }
             Ok(sim) => {
                 warn!(
                     "Skipping {}: simulation reports the liquidation would fail (tx index {:?}): {}",
@@ -250,27 +226,24 @@ impl Executor {
                     sim.failed_tx_index,
                     sim.error_message.unwrap_or_default()
                 );
+                attempt_failed = true;
                 Ok(())
             }
             Err(e) => {
                 warn!(
-                    "simulateBundle unavailable for {} ({}); cranking all feeds and sending sequentially",
+                    "simulateBundle unavailable for {} ({}); sending sequentially",
                     liquidatee, e
                 );
-                // Staleness can't be detected here: crank defensively, but skip feeds we already
-                // landed a crank for recently (still fresh) instead of cranking unconditionally.
-                if let Some(crank_tx) = self.build_crank_if_needed(intent, false) {
-                    txs.insert(0, crank_tx);
-                    cranked = true;
-                }
                 self.submit_sequential(&txs)
             }
         };
 
-        // Record the crank as landed only when the submission actually succeeded, so a stale feed
-        // is never wrongly treated as fresh by the sim-unavailable path above.
-        if cranked && result.is_ok() {
-            self.record_landed_cranks(&intent.observation_accounts.swb_oracles);
+        // Back off a target whose execution failed just like a failed assembly: every retry
+        // re-quotes the DEX and creates + deactivates a temporary LUT without landing anything.
+        if attempt_failed || result.is_err() {
+            self.note_execution_failure(&liquidatee);
+        } else {
+            self.clear_target_backoff(&liquidatee);
         }
 
         self.deactivate_temp_luts(temp_luts);
@@ -282,15 +255,22 @@ impl Executor {
         Ok(self.cache.banks.try_get_bank(&intent.liab_bank)?.bank.mint)
     }
 
-    /// Whether a mint or target is currently backed off. Prunes expired entries.
+    /// Whether a mint or target is currently backed off. Expired target entries are kept for one
+    /// more `TARGET_BACKOFF_MAX` window so their failure counter — and thus the escalating delay —
+    /// survives a retry that fails again.
     fn is_backed_off(&self, key: &Pubkey) -> Result<bool> {
         let now = Instant::now();
         let mut guard = self
             .backoffs
             .lock()
             .map_err(|_| anyhow!("execution backoffs mutex poisoned"))?;
-        guard.retain(|_, state| now < state.retry_after());
-        Ok(guard.contains_key(key))
+        guard.retain(|_, state| match state {
+            BackoffState::Mint(retry_after) => now < *retry_after,
+            BackoffState::Target(backoff) => now < backoff.retry_after + TARGET_BACKOFF_MAX,
+        });
+        Ok(guard
+            .get(key)
+            .is_some_and(|state| now < state.retry_after()))
     }
 
     /// Clear a target's backoff once it assembles successfully again.
@@ -328,35 +308,17 @@ impl Executor {
             return Ok(());
         }
 
-        let entry = guard.entry(*target).or_insert_with(|| {
-            BackoffState::Target(TargetBackoff {
-                failures: 0,
-                retry_after: Instant::now(),
-            })
-        });
-        let entry = match entry {
-            BackoffState::Target(entry) => entry,
-            BackoffState::Mint(_) => {
-                *entry = BackoffState::Target(TargetBackoff {
-                    failures: 0,
-                    retry_after: Instant::now(),
-                });
-                match entry {
-                    BackoffState::Target(entry) => entry,
-                    BackoffState::Mint(_) => unreachable!("target backoff entry was just inserted"),
-                }
-            }
-        };
-        entry.failures = entry.failures.saturating_add(1);
-        let delay = target_backoff_delay(entry.failures);
-        entry.retry_after = Instant::now() + delay;
-        debug!(
-            "Backing off {} for {}s (consecutive assemble failures: {})",
-            target,
-            delay.as_secs(),
-            entry.failures
-        );
+        bump_target_backoff(&mut guard, target, ASSEMBLE_BACKOFF_BASE, "assemble");
         Ok(())
+    }
+
+    /// Record an execution failure: the plan assembled, but the liquidation could not be landed
+    /// (simulation says it would revert, or the send failed). Same exponential backoff as an
+    /// assemble failure.
+    fn note_execution_failure(&self, target: &Pubkey) {
+        if let Ok(mut guard) = self.backoffs.lock() {
+            bump_target_backoff(&mut guard, target, EXECUTION_BACKOFF_BASE, "execution");
+        }
     }
 
     /// Deactivate any temporary LUTs created during assembly (best-effort; logs on failure), and
@@ -388,66 +350,6 @@ impl Executor {
         });
     }
 
-    /// Build a crank tx for the intent's SWB feeds.
-    ///
-    /// `force` (sim reported the feed stale on-chain): always crank — the sim is authoritative, and
-    /// a prior *submitted-but-unlanded* crank must not suppress it or the account stays
-    /// un-liquidatable while its feed is still stale. Self-limiting: once the crank lands, the sim
-    /// stops reporting stale.
-    ///
-    /// `!force` (sim was unavailable, so staleness can't be detected — we'd otherwise crank
-    /// defensively every attempt): skip if we LANDED a crank for all these feeds recently, since
-    /// they're still fresh. Only landed cranks are recorded (see `record_landed_cranks`).
-    fn build_crank_if_needed(
-        &self,
-        intent: &PreparedLiquidatableAccount,
-        force: bool,
-    ) -> Option<VersionedTransaction> {
-        let oracles = &intent.observation_accounts.swb_oracles;
-        if oracles.is_empty() {
-            return None;
-        }
-
-        if !force {
-            if let Ok(mut guard) = self.recently_cranked.lock() {
-                let now = Instant::now();
-                guard.retain(|_, t| now.duration_since(*t) < CRANK_LANDED_COOLDOWN);
-                if oracles.iter().all(|o| guard.contains_key(o)) {
-                    debug!(
-                        "Skipping crank for {}: all SWB feeds landed-cranked within cooldown",
-                        intent.liquidatee_account.address
-                    );
-                    return None;
-                }
-            }
-        }
-
-        match self.swb_cranker.build_crank_transaction(oracles.clone()) {
-            Ok(crank_tx) => Some(crank_tx),
-            Err(e) => {
-                warn!(
-                    "Failed to build SWB crank tx for {}: {}",
-                    intent.liquidatee_account.address, e
-                );
-                None
-            }
-        }
-    }
-
-    /// Mark these SWB feeds as freshly cranked, once their crank has actually landed. Only landed
-    /// cranks count, so an accepted-but-unconfirmed bundle never suppresses a later needed crank.
-    fn record_landed_cranks(&self, oracles: &[Pubkey]) {
-        if oracles.is_empty() {
-            return;
-        }
-        if let Ok(mut guard) = self.recently_cranked.lock() {
-            let now = Instant::now();
-            for oracle in oracles {
-                guard.insert(*oracle, now);
-            }
-        }
-    }
-
     /// Land the ordered transactions as an atomic Jito bundle (with a tip). Only fall back to
     /// sequential RPC when the bundle was *never accepted* (infra error / rejection). If it was
     /// accepted but didn't confirm in time, leave it in-flight (no resend) to avoid double
@@ -456,7 +358,7 @@ impl Executor {
         if txs.is_empty() {
             return Err(anyhow!("Executor::submit called with no transactions"));
         }
-        // The liquidation tx is the last core tx (any crank/buy precede it); its signature is our
+        // The liquidation tx is the last core tx (any buy precedes it); its signature is our
         // authoritative "did it land" check when Jito's bundle status is unavailable/lagging.
         let liquidation_sig = txs.last().and_then(|tx| tx.signatures.first()).copied();
         match self.try_bundle(txs) {

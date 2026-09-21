@@ -146,10 +146,10 @@ impl JitoClient {
     /// Simulate a bundle atomically against a `simulateBundle`-capable RPC endpoint.
     ///
     /// Uses `skipSigVerify` + `replaceRecentBlockhash` so unsigned, blockhash-less txs can be
-    /// simulated. This is how the executor does simulate-first crank detection: simulate
-    /// `[buy?, liquidate]` without a crank, and only prepend a crank tx if the failure is a
-    /// stale-oracle error. `rpc_url` must support `simulateBundle` (block-engine sim is on the
-    /// RPC, not the bundle endpoint); `sim_api_key` is sent as a Bearer token when present.
+    /// simulated. This is how the executor does its simulate-first check: simulate
+    /// `[buy?, liquidate]` and skip the target when the program reports it would fail.
+    /// `rpc_url` must support `simulateBundle` (block-engine sim is on the RPC, not the bundle
+    /// endpoint); `sim_api_key` is sent as a Bearer token when present.
     pub fn simulate_bundle(
         &self,
         rpc_url: &str,
@@ -183,16 +183,6 @@ pub struct BundleSimulation {
     pub error_message: Option<String>,
     /// Index of the first failing tx within the bundle, if reported.
     pub failed_tx_index: Option<usize>,
-}
-
-impl BundleSimulation {
-    /// Whether the failure (if any) is the Switchboard stale-price error that warrants a crank.
-    pub fn is_stale_price_failure(&self) -> bool {
-        self.error_message
-            .as_deref()
-            .map(|m| m.contains(crate::utils::swb_cranker::SWB_STALE_PRICE_ERROR_CODE))
-            .unwrap_or(false)
-    }
 }
 
 /// Serialize each transaction with bincode and base64-encode it for the bundle payload.
@@ -484,11 +474,10 @@ mod tests {
         let sim = parse_simulate_bundle(&resp).unwrap();
         assert!(sim.succeeded);
         assert!(sim.error_message.is_none());
-        assert!(!sim.is_stale_price_failure());
     }
 
     #[test]
-    fn test_parse_simulate_bundle_stale_failure() {
+    fn test_parse_simulate_bundle_reports_failed_index() {
         let resp = json!({
             "result": { "context": { "slot": 1 }, "value": {
                 "summary": { "failed": { "error": { "TransactionFailure": [
@@ -501,7 +490,6 @@ mod tests {
         let sim = parse_simulate_bundle(&resp).unwrap();
         assert!(!sim.succeeded);
         assert_eq!(sim.failed_tx_index, Some(1));
-        assert!(sim.is_stale_price_failure());
     }
 
     #[test]
@@ -517,7 +505,6 @@ mod tests {
         });
         let sim = parse_simulate_bundle(&resp).unwrap();
         assert!(!sim.succeeded);
-        assert!(!sim.is_stale_price_failure());
     }
 
     #[test]

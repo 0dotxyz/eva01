@@ -15,12 +15,9 @@ pub struct Eva01Config {
     pub excluded_liquidation_mints: Vec<Pubkey>,
     pub min_profit: f64,
     pub healthcheck_port: u16,
-    pub swb_program_id: Pubkey,
     pub pyth_hermes_url: String,
     pub pyth_api_key: Option<String>,
     pub pyth_cranker_enabled: bool,
-    pub crossbar_api_url: Option<String>,
-    pub project0_api_url: Option<String>,
     pub jup_swap_api_url: String,
     pub swap_mint: Pubkey,
     pub slippage_bps: u16,
@@ -77,15 +74,6 @@ impl Eva01Config {
             .parse()
             .expect("Invalid PORT number");
 
-        let swb_program_id = Pubkey::from_str(
-            &std::env::var("SWB_PROGRAM_ID")
-                .unwrap_or_else(|_| "A43DyUGA7s8eXPxqEjJY6EBu1KKbNgfxF8h17VAHn13w".to_string()),
-        )
-        .expect("Invalid SWB_PROGRAM_ID Pubkey");
-
-        let crossbar_api_url = std::env::var("CROSSBAR_API_URL").ok();
-        let project0_api_url = std::env::var("PROJECT_0_API_URL").ok();
-
         let jup_swap_api_url = std::env::var("JUP_SWAP_API_URL")
             .expect("JUP_SWAP_API_URL environment variable is not set");
 
@@ -135,12 +123,9 @@ impl Eva01Config {
             excluded_liquidation_mints,
             min_profit,
             healthcheck_port,
-            swb_program_id,
             pyth_hermes_url,
             pyth_api_key,
             pyth_cranker_enabled,
-            crossbar_api_url,
-            project0_api_url,
             jup_swap_api_url,
             swap_mint,
             slippage_bps,

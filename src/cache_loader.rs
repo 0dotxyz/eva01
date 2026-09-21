@@ -497,11 +497,10 @@ pub fn get_accounts_to_track(cache: &Cache) -> Result<HashMap<Pubkey, AccountTyp
     // Accounts that a background fetcher keeps synthetically fresh must NOT be streamed by Geyser:
     // Geyser would clobber the patched (never-stale) value with the real, intermittently-stale
     // on-chain account, making the affected banks flap in and out of "stale oracle" during the
-    // liquidatability check. This covers SWB pull feeds (SwbPriceFetcher) and the Kamino reserve /
-    // Juplend lending accounts that IntegrationAccountFetcher patches. Drift spot markets are NOT
-    // fetcher-owned (no refresh_drift), so they stay on Geyser to keep their staleness field fresh.
-    let mut fetcher_owned = cache.banks.get_swb_oracles();
-    fetcher_owned.extend(cache.banks.get_kamino_reserves());
+    // liquidatability check. This covers the Kamino reserve / Juplend lending accounts that
+    // IntegrationAccountFetcher patches. Drift spot markets are NOT fetcher-owned (no
+    // refresh_drift), so they stay on Geyser to keep their staleness field fresh.
+    let mut fetcher_owned = cache.banks.get_kamino_reserves();
     fetcher_owned.extend(cache.banks.get_juplend_lending_states());
     for oracle_pk in cache.oracles.try_get_addresses()? {
         if !fetcher_owned.contains(&oracle_pk) {
