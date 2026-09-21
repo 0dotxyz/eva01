@@ -4,8 +4,6 @@ pub mod mints;
 mod oracles;
 mod tokens;
 
-pub use banks::is_switchboard_pull_setup;
-
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},

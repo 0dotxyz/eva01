@@ -5,10 +5,7 @@ use crate::{
     config::Eva01Config,
     geyser::{GeyserService, GeyserUpdate},
     liquidator::Liquidator,
-    utils::{
-        integration_account_fetcher::IntegrationAccountFetcher, pyth_cranker::PythCranker,
-        swb_price_fetcher::SwbPriceFetcher,
-    },
+    utils::{integration_account_fetcher::IntegrationAccountFetcher, pyth_cranker::PythCranker},
     wrappers::liquidator_account::LiquidatorAccount,
 };
 use log::{error, info, warn};
@@ -52,8 +49,6 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     cache_loader.load_cache(&mut cache)?;
 
     let accounts_to_track = get_accounts_to_track(&cache)?;
-    let swb_fetcher_api_url = config.project0_api_url.clone();
-    let swb_fetcher_crossbar_url = config.crossbar_api_url.clone();
     let integration_fetcher_rpc_url = config.rpc_url.clone();
 
     info!("Initializing services...");
@@ -86,7 +81,6 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         None
     };
 
-    let swb_fetcher_tx = geyser_tx.clone();
     let integration_fetcher_tx = geyser_tx.clone();
 
     let geyser_service = GeyserService::new(
@@ -96,13 +90,6 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         stop_liquidator.clone(),
     )?;
 
-    let swb_fetcher = SwbPriceFetcher::new(
-        swb_fetcher_api_url,
-        swb_fetcher_crossbar_url,
-        cache.clone(),
-        swb_fetcher_tx,
-        stop_liquidator.clone(),
-    );
     let integration_fetcher = IntegrationAccountFetcher::new(
         integration_fetcher_rpc_url,
         cache.clone(),
@@ -110,16 +97,13 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         stop_liquidator.clone(),
     );
 
-    // Prime both fetchers before any service runs: the accounts they own are loaded from chain in
-    // a state marginfi rejects as stale (Switchboard feeds, Kamino reserves, JupLend lending
-    // states), so anything pricing a bank before their first cycle — the Liquidator's initial scan
-    // above all — fails on staleness instead of evaluating the account.
+    // Prime the fetcher before any service runs: the accounts it owns are loaded from chain in a
+    // state marginfi rejects as stale (Kamino reserves, JupLend lending states), so anything
+    // pricing a bank before its first cycle — the Liquidator's initial scan above all — fails on
+    // staleness instead of evaluating the account.
     info!("Priming the fetcher-owned accounts...");
     if let Err(e) = integration_fetcher.fetch_and_update() {
         warn!("Failed to prime the integration accounts: {:?}", e);
-    }
-    if let Err(e) = swb_fetcher.fetch_and_update() {
-        warn!("Failed to prime the Switchboard prices: {:?}", e);
     }
 
     info!("Starting services...");
@@ -127,7 +111,6 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     if let Some(pyth_cranker) = pyth_cranker {
         thread::spawn(move || pyth_cranker.start());
     }
-    thread::spawn(move || swb_fetcher.start());
     thread::spawn(move || integration_fetcher.start());
 
     let cloned_stop = stop_liquidator.clone();

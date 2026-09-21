@@ -1,4 +1,4 @@
-use crate::cache::{is_switchboard_pull_setup, Cache};
+use crate::cache::Cache;
 
 use crate::wrappers::bank::BankWrapper;
 use marginfi::state::bank::BankImpl;
@@ -22,7 +22,6 @@ type Shares = Vec<(I80F48, Pubkey)>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationAccounts {
     pub observation_accounts: Vec<Pubkey>,
-    pub swb_oracles: Vec<Pubkey>,
     pub bank_pks: Vec<Pubkey>,
     pub kamino_reserves: HashSet<Pubkey>,
     pub drift_spot_markets: HashSet<Pubkey>,
@@ -114,7 +113,6 @@ impl MarginfiAccountWrapper {
         // Sort all bank_pks in descending order
         bank_pks.sort_by(|a, b| b.cmp(a));
 
-        let mut swb_oracles = vec![];
         let mut observation_accounts: Vec<Pubkey> = vec![];
         let mut kamino_reserves = HashSet::new();
         let mut drift_spot_markets = HashSet::new();
@@ -127,27 +125,17 @@ impl MarginfiAccountWrapper {
             let setup = bank_wrapper.bank.config.oracle_setup;
             let oracle_keys = oracle_account_keys(&bank_wrapper.bank, bank_pk)?;
 
-            if is_switchboard_pull_setup(setup) {
-                if let Some(feed) = oracle_keys.first() {
-                    swb_oracles.push(*feed);
-                }
-            }
-
             match setup {
                 OracleSetup::KaminoPythPush
-                | OracleSetup::KaminoSwitchboardPull
                 | OracleSetup::FixedKamino
                 | OracleSetup::KaminoMSOL
                 | OracleSetup::KaminoLST => {
                     kamino_reserves.insert(bank_wrapper.bank.integration_acc_1);
                 }
-                OracleSetup::DriftPythPull
-                | OracleSetup::DriftSwitchboardPull
-                | OracleSetup::FixedDrift => {
+                OracleSetup::DriftPythPull | OracleSetup::FixedDrift => {
                     drift_spot_markets.insert(bank_wrapper.bank.integration_acc_1);
                 }
                 OracleSetup::JuplendPythPull
-                | OracleSetup::JuplendSwitchboardPull
                 | OracleSetup::FixedJuplend
                 | OracleSetup::JuplendMSOL
                 | OracleSetup::JuplendLST => {
@@ -162,7 +150,6 @@ impl MarginfiAccountWrapper {
 
         Ok(ObservationAccounts {
             observation_accounts,
-            swb_oracles,
             bank_pks,
             kamino_reserves,
             drift_spot_markets,

@@ -2,8 +2,6 @@ pub mod healthcheck;
 pub mod integration_account_fetcher;
 pub mod jito;
 pub mod pyth_cranker;
-pub mod swb_cranker;
-pub mod swb_price_fetcher;
 
 use anyhow::{anyhow, Error, Result};
 use backoff::ExponentialBackoff;
@@ -242,7 +240,7 @@ pub fn log_genuine_error(prefix: &str, error: Error) {
         Ok(error) => match error {
             anchor_lang::error::Error::AnchorError(anchor_error) => {
                 match MarginfiError::from(anchor_error.error_code_number) {
-                    MarginfiError::SwitchboardStalePrice | MarginfiError::PythPushStalePrice => {
+                    MarginfiError::PythPushStalePrice => {
                         debug!("Discarding the oracle stale price error");
                     }
                     MarginfiError::MathError => {
@@ -403,12 +401,12 @@ mod tests {
     }
 
     #[test]
-    fn test_find_oracle_keys_swb() {
+    fn test_find_oracle_keys_plain() {
         let mut config = BankConfig::default();
         let mut keys = find_oracle_keys(&config);
         assert_eq!(keys.len(), 0);
 
-        config.oracle_setup = OracleSetup::SwitchboardPull;
+        config.oracle_setup = OracleSetup::PythPushOracle;
 
         let feed_id = Pubkey::new_unique();
         config.oracle_keys[0] = feed_id;
@@ -417,7 +415,7 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0], feed_id);
 
-        // "Migrate" (no-op for Swb oracles) the bank and check again
+        // "Migrate" the bank and check again
         config.config_flags = 1;
 
         keys = find_oracle_keys(&config);

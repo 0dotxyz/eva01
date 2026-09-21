@@ -14,23 +14,6 @@ use std::{
     sync::RwLock,
 };
 
-/// True for every Switchboard-Pull oracle setup (plain and integration variants).
-///
-/// These oracles are intentionally excluded from the Geyser subscription (see
-/// `get_accounts_to_track`) and kept fresh solely by `SwbPriceFetcher`'s synthetic
-/// price injection. The set here MUST match the set the fetcher writes for, otherwise
-/// an excluded-but-unfetched oracle stays frozen at its stale startup value and every
-/// account touching it is wrongly deemed non-liquidatable.
-pub fn is_switchboard_pull_setup(setup: OracleSetup) -> bool {
-    matches!(
-        setup,
-        OracleSetup::SwitchboardPull
-            | OracleSetup::KaminoSwitchboardPull
-            | OracleSetup::DriftSwitchboardPull
-            | OracleSetup::JuplendSwitchboardPull
-    )
-}
-
 #[derive(Default)]
 struct BanksCacheInner {
     banks: HashMap<Pubkey, BankWrapper>,
@@ -148,42 +131,6 @@ impl BanksCache {
                 )
             })
             .collect()
-    }
-
-    pub fn get_swb_oracles(&self) -> HashSet<Pubkey> {
-        self.inner
-            .read()
-            .expect("banks cache lock poisoned")
-            .banks
-            .iter()
-            .filter_map(|(_, bank)| {
-                if is_switchboard_pull_setup(bank.bank.config.oracle_setup) {
-                    Some(bank.bank.config.oracle_keys[0])
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    /// Multiple banks can share the same oracle key, so each entry is a Vec.
-    ///
-    /// Covers the same setups as [`get_swb_oracles`](Self::get_swb_oracles) — including the
-    /// integration variants (Kamino/Drift/Juplend SwitchboardPull) — so the Crossbar fallback
-    /// injects synthetic prices for every oracle excluded from Geyser. For integration banks
-    /// the raw underlying feed lives at `oracle_keys[0]`; the program re-applies the per-bank
-    /// exchange rate on read, so writing the raw feed price there is correct and collision-free.
-    pub fn get_swb_oracle_to_bank_map(&self) -> HashMap<Pubkey, Vec<Pubkey>> {
-        let mut map: HashMap<Pubkey, Vec<Pubkey>> = HashMap::new();
-        let inner = self.inner.read().expect("banks cache lock poisoned");
-        for (bank_addr, bank) in &inner.banks {
-            if is_switchboard_pull_setup(bank.bank.config.oracle_setup) {
-                map.entry(bank.bank.config.oracle_keys[0])
-                    .or_default()
-                    .push(*bank_addr);
-            }
-        }
-        map
     }
 
     pub fn get_kamino_reserves(&self) -> HashSet<Pubkey> {

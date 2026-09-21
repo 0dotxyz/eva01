@@ -5,11 +5,7 @@ use crate::{
     execution::{executor::Executor, inventory::InventoryStrategy},
     geyser::{AccountType, GeyserUpdate},
     rebalancer::Rebalancer,
-    utils::{
-        jito::JitoClient,
-        log_genuine_error,
-        swb_cranker::{SwbCranker, SWB_STALE_HANDLED_ERROR, SWB_STALE_PRICE_ERROR_CODE_NUMBER},
-    },
+    utils::{jito::JitoClient, log_genuine_error},
     wrappers::{
         bank::BankWrapper,
         liquidator_account::{LiquidatorAccount, PreparedLiquidatableAccount, PROFIT_SHARE},
@@ -22,7 +18,7 @@ use anyhow::{anyhow, Result};
 use crossbeam::channel::{Receiver, RecvTimeoutError};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use marginfi::state::{bank::BankImpl, marginfi_account::get_health_components};
 use marginfi_type_crate::{
     constants::BANKRUPT_THRESHOLD,
@@ -40,7 +36,7 @@ use std::sync::atomic::Ordering;
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},
-    sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
+    sync::{atomic::AtomicBool, Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -49,9 +45,6 @@ use std::{
 /// letting a burst of liquidatable accounts (e.g. a price crash) be worked in parallel rather
 /// than one-at-a-time.
 const MAX_CONCURRENT_LIQUIDATIONS: usize = 8;
-
-/// How often the feeds that are blocking accounts are reported.
-const STALE_ORACLE_REPORT_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How often the rebalancing sweep runs when Geyser has delivered no updates at all.
 const IDLE_REBALANCE_INTERVAL: Duration = Duration::from_secs(60);
@@ -64,7 +57,6 @@ pub struct Liquidator {
     geyser_rx: Receiver<GeyserUpdate>,
     stop_liquidator: Arc<AtomicBool>,
     cache: Arc<Cache>,
-    stale_reported_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -96,9 +88,6 @@ impl Liquidator {
         stop_liquidator: Arc<AtomicBool>,
         cache: Arc<Cache>,
     ) -> Result<Self> {
-        // The cranker is owned by the executor (for simulate-first cranking), behind an Arc.
-        let swb_cranker = Arc::new(SwbCranker::new(&config, cache.as_ref())?);
-
         let rebalancer = Rebalancer::new(config.clone(), cache.clone())?;
         let dex_client = rebalancer.dex_client();
         let dex_gate = rebalancer.dex_gate();
@@ -114,7 +103,6 @@ impl Liquidator {
             jito,
             rpc_client,
             cache.clone(),
-            swb_cranker,
             signer,
             config.rpc_url.clone(),
             config.bundle_api_key.clone(),
@@ -137,7 +125,6 @@ impl Liquidator {
             geyser_rx,
             stop_liquidator,
             cache,
-            stale_reported_at: Instant::now() - STALE_ORACLE_REPORT_INTERVAL,
         })
     }
 
@@ -191,10 +178,7 @@ impl Liquidator {
             accounts_to_check.len()
         );
 
-        let account_count = accounts_to_check.len();
-        let stale_swb_oracles: RwLock<HashSet<Pubkey>> = RwLock::new(HashSet::new());
-        let checked_accounts = self.check_accounts(accounts_to_check, &stale_swb_oracles);
-        self.report_stale_oracles(&stale_swb_oracles, account_count);
+        let checked_accounts = self.check_accounts(accounts_to_check);
 
         match checked_accounts {
             Ok(mut accounts) => {
@@ -345,33 +329,9 @@ impl Liquidator {
         Ok(())
     }
 
-    /// Switchboard feeds that neither the price fetcher nor Crossbar could price block every
-    /// account touching them, silently. Surface them at most once per interval, since the same
-    /// feeds recur on every cycle.
-    fn report_stale_oracles(&mut self, stale: &RwLock<HashSet<Pubkey>>, accounts: usize) {
-        let stale = match stale.read() {
-            Ok(stale) if !stale.is_empty() => stale,
-            _ => return,
-        };
-
-        if self.stale_reported_at.elapsed() < STALE_ORACLE_REPORT_INTERVAL {
-            return;
-        }
-        self.stale_reported_at = Instant::now();
-
-        warn!(
-            "{} Switchboard oracle(s) have no usable price and block accounts from being \
-             evaluated (of {} scanned): {:?}",
-            stale.len(),
-            accounts,
-            stale.iter().collect::<Vec<_>>()
-        );
-    }
-
     fn check_accounts(
         &self,
         account_addresses: Vec<Pubkey>,
-        stale_swb_oracles: &RwLock<HashSet<Pubkey>>,
     ) -> Result<Vec<PreparedLiquidatableAccount>> {
         let clock = clock_manager::get_clock(&self.cache.clock)?;
 
@@ -386,12 +346,10 @@ impl Liquidator {
                     .try_get_account(&account_address)
                     .ok()?;
 
-                match self.process_account(&account, clock.clone(), stale_swb_oracles) {
+                match self.process_account(&account, clock.clone()) {
                     Ok(acc_opt) => acc_opt,
                     Err(err) => {
-                        if !err.to_string().contains(SWB_STALE_HANDLED_ERROR) {
-                            debug!("Failed to process account {:?}: {:?}", account.address, err);
-                        }
+                        debug!("Failed to process account {:?}: {:?}", account.address, err);
                         None
                     }
                 }
@@ -403,7 +361,6 @@ impl Liquidator {
         &self,
         account: &MarginfiAccountWrapper,
         clock: Clock,
-        stale_swb_oracles: &RwLock<HashSet<Pubkey>>,
     ) -> Result<Option<PreparedLiquidatableAccount>> {
         let (deposit_shares, liab_shares) = account.get_deposits_and_liabilities_shares();
         if deposit_shares.is_empty() || liab_shares.is_empty() {
@@ -415,7 +372,6 @@ impl Liquidator {
             deposit_shares,
             &BalanceSide::Assets,
             RequirementType::Maintenance,
-            stale_swb_oracles,
         )?;
 
         let liab_values = self.get_value_of_shares(
@@ -423,7 +379,6 @@ impl Liquidator {
             liab_shares,
             &BalanceSide::Liabilities,
             RequirementType::Maintenance,
-            stale_swb_oracles,
         )?;
 
         let (asset_bank_pk, liab_bank_pk) =
@@ -683,44 +638,12 @@ impl Liquidator {
         shares: Vec<(I80F48, Pubkey)>,
         balance_side: &BalanceSide,
         requirement_type: RequirementType,
-        stale_swb_oracles: &RwLock<HashSet<Pubkey>>,
     ) -> Result<Vec<(I80F48, Pubkey)>> {
         let mut values: Vec<(I80F48, Pubkey)> = Vec::new();
 
         for (shares_amount, bank_pk) in shares {
             let bank_wrapper = self.cache.banks.try_get_bank(&bank_pk)?;
-            if stale_swb_oracles
-                .read()
-                .map_err(|_| anyhow!("stale oracle set is poisoned"))?
-                .contains(&bank_wrapper.bank.config.oracle_keys[0])
-            {
-                return Err(anyhow!(SWB_STALE_HANDLED_ERROR));
-            }
-
-            let oracle_wrapper = match OracleWrapper::build(&self.cache, clock, &bank_pk) {
-                Ok(oracle_wrapper) => oracle_wrapper,
-                Err(err) => {
-                    if err
-                        .downcast_ref::<anchor_lang::error::Error>()
-                        .is_some_and(|e| {
-                            if let anchor_lang::error::Error::AnchorError(anchor_error) = e {
-                                return anchor_error.error_code_number
-                                    == SWB_STALE_PRICE_ERROR_CODE_NUMBER;
-                            }
-                            false
-                        })
-                    {
-                        // If it's Switchboard, then it's always at position 0
-                        stale_swb_oracles
-                            .write()
-                            .map_err(|_| anyhow!("stale oracle set is poisoned"))?
-                            .insert(bank_wrapper.bank.config.oracle_keys[0]);
-                        return Err(anyhow!(SWB_STALE_HANDLED_ERROR));
-                    }
-
-                    return Err(err);
-                }
-            };
+            let oracle_wrapper = OracleWrapper::build(&self.cache, clock, &bank_pk)?;
 
             if !matches!(
                 bank_wrapper.bank.config.operational_state,

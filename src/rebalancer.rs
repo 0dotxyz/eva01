@@ -145,8 +145,7 @@ impl Rebalancer {
             let wrapper = match self.cache.try_get_token_wrapper_lenient(&mint, &token) {
                 Ok(wrapper) => wrapper,
                 Err(e) => {
-                    // Ignore empty stake banks; SwitchboardStalePrice at startup is harmless
-                    // (SwbPriceFetcher populates synthetic oracle accounts on its first cycle).
+                    // Ignore empty stake banks.
                     if e.to_string().contains("Stake pool supply is zero") {
                         self.empty_stake_banks.insert(mint);
                     } else {
