@@ -41,6 +41,8 @@ pub fn oracle_account_keys(bank: &Bank, bank_address: &Pubkey) -> Result<Vec<Pub
         OracleSetup::KaminoPythPush
         | OracleSetup::DriftPythPull
         | OracleSetup::JuplendPythPull
+        | OracleSetup::ScopeKamino
+        | OracleSetup::ScopeJuplend
         | OracleSetup::PythMSOL
         | OracleSetup::PythLST
         | OracleSetup::PTPyth => vec![key(0)?, key(1)?],
@@ -138,7 +140,7 @@ impl OracleWrapper {
             .map(|(address, account)| (address, account).into_account_info())
             .collect();
 
-        let source = OraclePriceFeedAdapter::try_from_bank(bank, &remaining_ais, clock)?;
+        let source = OraclePriceFeedAdapter::try_from_bank(bank, &remaining_ais, clock, false)?;
 
         Ok(Self { source })
     }

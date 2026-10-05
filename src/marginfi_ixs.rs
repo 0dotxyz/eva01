@@ -90,6 +90,31 @@ pub fn make_start_liquidate_ix(
     }
 }
 
+/// `marginfi_account_tag_liq_record`: starts the liquidation-premium timer on an unhealthy account.
+/// Permissionless; the fee payer is the only signer.
+pub fn make_tag_liq_record_ix(
+    group: Pubkey,
+    liquidatee_account: Pubkey,
+    observation_accounts: &[Pubkey],
+) -> Instruction {
+    let mut accounts = marginfi::accounts::TagLiquidationRecord {
+        marginfi_account: liquidatee_account,
+        group,
+    }
+    .to_account_metas(None);
+    accounts.extend(
+        observation_accounts
+            .iter()
+            .map(|a| AccountMeta::new_readonly(*a, false)),
+    );
+
+    Instruction {
+        program_id: marginfi_type_crate::ID,
+        accounts,
+        data: marginfi::instruction::MarginfiAccountTagLiqRecord.data(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn make_repay_ix(
     marginfi_group: Pubkey,

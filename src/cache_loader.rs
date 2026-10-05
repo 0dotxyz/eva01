@@ -4,7 +4,7 @@ use anchor_lang::AccountDeserialize;
 use anchor_spl::associated_token;
 use anyhow::Ok;
 use log::{debug, error, info, warn};
-use marginfi_type_crate::types::{Bank, MarginfiAccount, MarginfiGroup};
+use marginfi_type_crate::types::{Bank, FeeState, MarginfiAccount, MarginfiGroup};
 use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig};
 use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_client::{
@@ -22,7 +22,7 @@ use crate::{
     cache::{Cache, GroupedLuts},
     drift,
     geyser::AccountType,
-    utils::{batch_get_multiple_accounts, BatchLoadingConfig},
+    utils::{self, batch_get_multiple_accounts, BatchLoadingConfig},
     wrappers::marginfi_account::MarginfiAccountWrapper,
 };
 use anchor_client::Program;
@@ -68,6 +68,20 @@ impl CacheLoader {
             bytemuck::from_bytes::<MarginfiGroup>(&marginfi_group_account.data[8..]);
         cache.global_fee_wallet = marginfi_group.fee_state_cache.global_fee_wallet;
         cache.marginfi_group = *marginfi_group;
+
+        let fee_state_account = self.rpc_client.get_account(&cache.global_fee_state_key)?;
+        let fee_state = bytemuck::try_from_bytes::<FeeState>(
+            fee_state_account
+                .data
+                .get(8..8 + std::mem::size_of::<FeeState>())
+                .ok_or_else(|| anyhow!("FeeState account is too short"))?,
+        )
+        .map_err(|e| anyhow!("Failed to decode FeeState: {:?}", e))?;
+        cache.liquidation_max_fee = fee_state.liquidation_max_fee.into();
+        info!(
+            "Liquidation max fee (FeeState): {}",
+            cache.liquidation_max_fee
+        );
 
         self.load_luts(cache)?;
         self.load_marginfi_accounts(cache)?;
@@ -255,8 +269,7 @@ impl CacheLoader {
         )?;
 
         for (bank_address, bank_account) in bank_accounts.into_iter() {
-            let mut data = bank_account.data.as_slice();
-            let bank = Bank::try_deserialize(&mut data)
+            let bank = utils::decode_bank(&bank_account.data)
                 .map_err(|e| anyhow!("Failed to deserialize Bank {}: {:?}", bank_address, e))?;
             cache.banks.try_insert(bank_address, bank, bank_account)?;
             debug!("Loaded the Bank {:?}.", bank_address);

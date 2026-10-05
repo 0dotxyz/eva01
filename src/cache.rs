@@ -13,6 +13,7 @@ use accounts::MarginfiAccountsCache;
 use anchor_lang::AccountDeserialize;
 use anyhow::{anyhow, Result};
 use banks::BanksCache;
+use fixed::types::I80F48;
 use marginfi_type_crate::{
     constants::{ASSET_TAG_DEFAULT, ASSET_TAG_SOL, ASSET_TAG_STAKED, FEE_STATE_SEED},
     pdas::derive_kamino_lending_market_authority,
@@ -91,6 +92,7 @@ pub struct Cache {
     pub luts: Arc<Mutex<GroupedLuts>>,
     pub global_fee_state_key: Pubkey,
     pub global_fee_wallet: Pubkey,
+    pub liquidation_max_fee: I80F48,
     pub drift_users: HashMap<Pubkey, DriftUser>,
 }
 
@@ -129,6 +131,7 @@ impl Cache {
             luts: Arc::new(Mutex::new(GroupedLuts::default())),
             global_fee_state_key,
             global_fee_wallet: Pubkey::default(),
+            liquidation_max_fee: I80F48::ZERO,
             drift_users: HashMap::new(),
         }
     }

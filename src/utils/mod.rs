@@ -9,7 +9,7 @@ use log::{debug, error};
 use marginfi::errors::MarginfiError;
 use marginfi_type_crate::{
     bank_authority_seed,
-    types::{BankConfig, BankVaultType},
+    types::{Bank, BankConfig, BankVaultType},
 };
 use rayon::{iter::ParallelIterator, slice::ParallelSlice};
 use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig};
@@ -178,6 +178,18 @@ pub fn find_bank_liquidity_vault_authority(bank_pk: &Pubkey, program_id: &Pubkey
     .0
 }
 
+/// Decodes a `Bank` account. 0.1.12 grew the account from 1,856 to 3,904 bytes, all of it new tail
+/// padding, and banks are resized only after the upgrade: shorter (old-layout) data is zero-padded.
+pub fn decode_bank(data: &[u8]) -> Result<Bank> {
+    let body = data
+        .strip_prefix(&Bank::DISCRIMINATOR)
+        .ok_or_else(|| anyhow!("Not a Bank account"))?;
+    let mut bytes = vec![0u8; std::mem::size_of::<Bank>()];
+    let len = body.len().min(bytes.len());
+    bytes[..len].copy_from_slice(&body[..len]);
+    Ok(bytemuck::pod_read_unaligned(&bytes))
+}
+
 pub fn find_oracle_keys(bank_config: &BankConfig) -> Vec<Pubkey> {
     bank_config
         .oracle_keys
@@ -233,6 +245,24 @@ macro_rules! ward {
             None => continue,
         }
     };
+}
+
+/// `url` reduced to scheme and host, for logs: RPC and provider URLs commonly carry an API token in
+/// the path or query (e.g. the Yellowstone x-token appended to derive the RPC URL).
+pub fn redact_url(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, url),
+    };
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host = &rest[..host_end];
+    // Credentials in the authority (user:pass@host) are dropped as well.
+    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+    let suffix = if host_end < rest.len() { "/…" } else { "" };
+    match scheme {
+        Some(scheme) => format!("{scheme}://{host}{suffix}"),
+        None => format!("{host}{suffix}"),
+    }
 }
 
 pub fn log_genuine_error(prefix: &str, error: Error) {
@@ -303,6 +333,39 @@ pub fn marginfi_account_by_authority(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decode_bank_zero_pads_the_pre_resize_layout() {
+        let mut bank: super::Bank = bytemuck::Zeroable::zeroed();
+        bank.mint = Pubkey::new_unique();
+        let mut data = super::Bank::DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&bytemuck::bytes_of(&bank)[..1856]);
+
+        assert_eq!(super::decode_bank(&data).unwrap().mint, bank.mint);
+        assert!(super::decode_bank(&data[1..]).is_err());
+    }
+
+    use super::redact_url;
+
+    #[test]
+    fn redact_url_keeps_only_scheme_and_host() {
+        assert_eq!(
+            redact_url("https://rpc.example.com/abcd-secret-token"),
+            "https://rpc.example.com/…"
+        );
+        assert_eq!(
+            redact_url("https://rpc.example.com?api-key=secret"),
+            "https://rpc.example.com/…"
+        );
+        assert_eq!(
+            redact_url("https://user:pass@rpc.example.com/x"),
+            "https://rpc.example.com/…"
+        );
+        assert_eq!(
+            redact_url("https://rpc.example.com"),
+            "https://rpc.example.com"
+        );
+        assert_eq!(redact_url("rpc.example.com/token"), "rpc.example.com/…");
+    }
 
     use crate::utils::find_oracle_keys;
 

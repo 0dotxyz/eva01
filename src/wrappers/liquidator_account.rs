@@ -8,7 +8,7 @@ use crate::{
     marginfi_ixs::{
         make_drift_withdraw_ix, make_end_liquidate_ix, make_init_liquidation_record_ix,
         make_juplend_withdraw_ix, make_kamino_withdraw_ix, make_repay_ix, make_start_liquidate_ix,
-        make_withdraw_ix,
+        make_tag_liq_record_ix, make_withdraw_ix,
     },
     utils::{self, marginfi_account_by_authority},
 };
@@ -18,26 +18,39 @@ use log::{debug, error, info};
 use marginfi_type_crate::{
     constants::{
         ASSET_TAG_DEFAULT, ASSET_TAG_DRIFT, ASSET_TAG_JUPLEND, ASSET_TAG_KAMINO, ASSET_TAG_SOL,
+        ASSET_TAG_STAKED,
     },
     pdas::derive_drift_spot_market,
     types::Bank,
 };
-use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
+use solana_client::rpc_client::RpcClient;
 
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::{
     account::ReadableAccount,
     instruction::Instruction,
     message::{v0::Message, AddressLookupTableAccount, VersionedMessage},
-    signature::Keypair,
+    signature::{Keypair, Signature},
     signer::Signer,
     transaction::VersionedTransaction,
 };
 use std::{collections::HashSet, sync::Arc};
 
-pub const PROFIT_SHARE: f64 = 0.085;
+/// Collateral tags `build_liquidate_tx` can withdraw. Staked banks hold a plain SPL LST, so they go
+/// through the standard withdraw like DEFAULT/SOL.
+pub fn is_seizable_asset_tag(tag: u8) -> bool {
+    matches!(
+        tag,
+        ASSET_TAG_DEFAULT
+            | ASSET_TAG_SOL
+            | ASSET_TAG_STAKED
+            | ASSET_TAG_KAMINO
+            | ASSET_TAG_DRIFT
+            | ASSET_TAG_JUPLEND
+    )
+}
 
 /// Max serialized Solana transaction size on the wire.
 const MAX_TX_SIZE: usize = 1232;
@@ -90,57 +103,6 @@ impl LiquidatorAccount {
         })
     }
 
-    pub fn init_liq_record(&self, liquidatee_account: &MarginfiAccountWrapper) -> Result<Pubkey> {
-        info!(
-            "Initializing liquidation record for account {:?}",
-            liquidatee_account.address
-        );
-
-        let signer_pk = self.signer.pubkey();
-        let (init_ix, liquidation_record) =
-            make_init_liquidation_record_ix(liquidatee_account.address, signer_pk);
-
-        let recent_blockhash = self
-            .rpc_client
-            .get_latest_blockhash()
-            .map_err(|e| anyhow!(e))?;
-
-        let msg = Message::try_compile(&signer_pk, &[init_ix], &[], recent_blockhash)
-            .map_err(|e| anyhow!(e))?;
-
-        let txn = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
-            .map_err(|e| anyhow!(e))?;
-
-        info!(
-            "Sending liquidation tx for the Account {} .",
-            liquidatee_account.address
-        );
-        match self
-            .rpc_client
-            .send_and_confirm_transaction_with_spinner_and_config(
-                &txn,
-                CommitmentConfig::finalized(),
-                RpcSendTransactionConfig {
-                    skip_preflight: false,
-                    preflight_commitment: Some(CommitmentLevel::Processed),
-                    ..Default::default()
-                },
-            ) {
-            Ok(signature) => {
-                info!(
-                    "Liquidation record init tx for the Account {} was finalized. Signature: {}",
-                    liquidatee_account.address, signature,
-                );
-                Ok(liquidation_record)
-            }
-            Err(err) => Err(anyhow!(
-                "Liquidation record init tx for the Account {} failed: {} ",
-                liquidatee_account.address,
-                err
-            )),
-        }
-    }
-
     /// Assemble (compile + sign) the liquidation transaction for the given account and amounts.
     /// Pure tx construction used by the execution-layer `InventoryStrategy`. Returns the signed tx
     /// and an optional temporary-LUT key created to fit an oversized tx.
@@ -180,11 +142,17 @@ impl LiquidatorAccount {
             liquidatee_account_address, liquidatee_observation_accounts
         );
 
-        let liquidation_record =
+        // A first-time liquidatee has no record yet: create it in this same transaction, ahead of
+        // `start_liquidation` (the program allows exactly that). A record created in its own
+        // transaction can be closed by anyone before we use it, since a never-used record has no
+        // inactivity lock, and waiting for it to finalize would stall the liquidation.
+        let (init_record_ix, liquidation_record) =
             if liquidatee_account.account.liquidation_record == Pubkey::default() {
-                self.init_liq_record(liquidatee_account)?
+                let (ix, record) =
+                    make_init_liquidation_record_ix(liquidatee_account_address, signer_pk);
+                (Some(ix), record)
             } else {
-                liquidatee_account.account.liquidation_record
+                (None, liquidatee_account.account.liquidation_record)
             };
 
         let all_tags: Vec<u8> = liquidatee_banks
@@ -207,44 +175,12 @@ impl LiquidatorAccount {
             liquidatee_banks,
         );
 
-        for kamino_reserve_address in kamino_reserves {
-            let kamino_reserve = self.cache.try_get_kamino_reserve(kamino_reserve_address)?;
-
-            debug!(
-                "Putting a refresh ix for Kamino Reserve: {}",
-                kamino_reserve_address
-            );
-
-            let refresh_reserve_ix =
-                make_refresh_reserve_ix(*kamino_reserve_address, &kamino_reserve);
-            ixs.push(refresh_reserve_ix);
-        }
-
-        for spot_market_address in drift_spot_markets {
-            let spot_market = self.cache.try_get_drift_market(spot_market_address)?;
-
-            let refresh_spot_market_ix = make_refresh_spot_market_ix(
-                *spot_market_address,
-                spot_market.market.vault,
-                spot_market.market.oracle,
-            );
-            ixs.push(refresh_spot_market_ix);
-        }
-
-        for lending_state_address in juplend_states {
-            let lending_state = self
-                .cache
-                .try_get_juplend_lending_state(lending_state_address)?;
-
-            let update_lending_rate_ix =
-                make_update_lending_rate_ix(*lending_state_address, &lending_state);
-            ixs.push(update_lending_rate_ix);
-        }
+        ixs.extend(self.venue_refresh_ixs(kamino_reserves, drift_spot_markets, juplend_states)?);
 
         let asset_mint_wrapper = self.cache.mints.try_get_account(&asset_mint)?;
 
         let withdraw_ix = match asset_bank_wrapper.bank.config.asset_tag {
-            ASSET_TAG_DEFAULT | ASSET_TAG_SOL => make_withdraw_ix(
+            ASSET_TAG_DEFAULT | ASSET_TAG_SOL | ASSET_TAG_STAKED => make_withdraw_ix(
                 self.group,
                 liquidatee_account_address,
                 signer_pk,
@@ -322,6 +258,7 @@ impl LiquidatorAccount {
             }
         };
 
+        ixs.extend(init_record_ix);
         ixs.push(start_ix);
         ixs.push(withdraw_ix);
 
@@ -349,6 +286,85 @@ impl LiquidatorAccount {
         ixs.push(end_ix);
 
         self.compile_tx_with_lut_fit(&signer_pk, &ixs, &mut luts)
+    }
+
+    /// Kamino, Drift and JupLend venue accounts must be refreshed in the same slot as any health
+    /// check that reads them.
+    fn venue_refresh_ixs(
+        &self,
+        kamino_reserves: &HashSet<Pubkey>,
+        drift_spot_markets: &HashSet<Pubkey>,
+        juplend_states: &HashSet<Pubkey>,
+    ) -> Result<Vec<Instruction>> {
+        let mut ixs = Vec::new();
+        for kamino_reserve_address in kamino_reserves {
+            let kamino_reserve = self.cache.try_get_kamino_reserve(kamino_reserve_address)?;
+
+            debug!(
+                "Putting a refresh ix for Kamino Reserve: {}",
+                kamino_reserve_address
+            );
+
+            let refresh_reserve_ix =
+                make_refresh_reserve_ix(*kamino_reserve_address, &kamino_reserve);
+            ixs.push(refresh_reserve_ix);
+        }
+
+        for spot_market_address in drift_spot_markets {
+            let spot_market = self.cache.try_get_drift_market(spot_market_address)?;
+
+            let refresh_spot_market_ix = make_refresh_spot_market_ix(
+                *spot_market_address,
+                spot_market.market.vault,
+                spot_market.market.oracle,
+            );
+            ixs.push(refresh_spot_market_ix);
+        }
+
+        for lending_state_address in juplend_states {
+            let lending_state = self
+                .cache
+                .try_get_juplend_lending_state(lending_state_address)?;
+
+            let update_lending_rate_ix =
+                make_update_lending_rate_ix(*lending_state_address, &lending_state);
+            ixs.push(update_lending_rate_ix);
+        }
+        Ok(ixs)
+    }
+
+    /// Tags an unhealthy account so the receivership premium it pays grows over time. Sent over RPC
+    /// and confirmed; there is no MEV to race for, since anyone may tag and the first tag wins.
+    pub fn send_tag_tx(
+        &self,
+        liquidatee: Pubkey,
+        observation_accounts: &ObservationAccounts,
+    ) -> Result<Signature> {
+        let ObservationAccounts {
+            observation_accounts: liquidatee_observation_accounts,
+            bank_pks: liquidatee_banks,
+            kamino_reserves,
+            drift_spot_markets,
+            juplend_states,
+            ..
+        } = observation_accounts;
+
+        let mut ixs = vec![self.cu_limit_ix.clone(), self.cu_price_ix.clone()];
+        ixs.extend(self.venue_refresh_ixs(kamino_reserves, drift_spot_markets, juplend_states)?);
+        ixs.push(make_tag_liq_record_ix(
+            self.group,
+            liquidatee,
+            liquidatee_observation_accounts,
+        ));
+
+        let all_tags: Vec<u8> = liquidatee_banks
+            .iter()
+            .filter_map(|pk| self.cache.banks.try_get_bank(pk).ok())
+            .map(|b| b.bank.config.asset_tag)
+            .collect();
+        let luts = self.cache.luts.lock().unwrap().select_for_tags(&all_tags);
+        let tx = self.compile_tx(&self.signer.pubkey(), &ixs, &luts)?;
+        Ok(self.rpc_client.send_and_confirm_transaction(&tx)?)
     }
 
     fn compile_tx_with_lut_fit(

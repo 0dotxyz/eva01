@@ -67,7 +67,7 @@ pythnet-sdk = { git = "https://github.com/0dotxyz/pyth-crosschain", rev = "f170d
 
 [dependencies.marginfi_type_crate]
 git = "https://github.com/mrgnlabs/marginfi-v2"
-tag = "mrgn-0.1.11-rc1"
+tag = "mrgn-0.1.12-rc1"
 #rev = "c2ff79441abed715008abdeafefbec4f447a4bda"
 package = "marginfi-type-crate"
 default-features = false
@@ -75,7 +75,7 @@ features = ["client"]
 
 [dependencies.marginfi]
 git = "https://github.com/mrgnlabs/marginfi-v2"
-tag = "mrgn-0.1.11-rc1"
+tag = "mrgn-0.1.12-rc1"
 #rev = "c2ff79441abed715008abdeafefbec4f447a4bda"
 default-features = false
 features = ["client", "no-entrypoint", "custom-heap"]

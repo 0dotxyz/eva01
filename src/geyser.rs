@@ -1,10 +1,14 @@
-use crate::{config::Eva01Config, utils::account_update_to_account, ward};
+use crate::{
+    config::Eva01Config,
+    utils::{account_update_to_account, decode_bank},
+    ward,
+};
 use anchor_lang::AccountDeserialize;
 use anyhow::Result;
 use crossbeam::channel::Sender;
 use futures::StreamExt;
 use log::{error, info, warn};
-use marginfi_type_crate::types::{Bank, MarginfiAccount};
+use marginfi_type_crate::types::MarginfiAccount;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::account::Account;
 use std::{
@@ -179,9 +183,7 @@ impl GeyserService {
                                     self.send_update(AccountType::Marginfi, address, &account);
                                 }
 
-                                if let Ok(bank) =
-                                    Bank::try_deserialize(&mut account.data.as_slice())
-                                {
+                                if let Ok(bank) = decode_bank(&account.data) {
                                     if bank.group != self.marginfi_group_pk {
                                         continue;
                                     }
