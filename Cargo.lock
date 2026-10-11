@@ -1539,15 +1539,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 
 [[package]]
-name = "dotenvy"
-version = "0.15.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
-
-[[package]]
 name = "drift-mocks"
 version = "0.1.0"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc1#9582b8c3964120c4a4bcf521065e31c2df250ec4"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc2#9fcb729ae3a6de67544fe6f8147da8d86bdf3692"
 dependencies = [
  "anchor-lang",
  "bytemuck",
@@ -1722,7 +1716,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cea14ef9355e3beab063703aa9dab15afd25f0667c341310c1e5274bb1d0da18"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1808,7 +1802,7 @@ dependencies = [
 [[package]]
 name = "exponent-mocks"
 version = "0.1.0"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc1#9582b8c3964120c4a4bcf521065e31c2df250ec4"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc2#9fcb729ae3a6de67544fe6f8147da8d86bdf3692"
 dependencies = [
  "anchor-lang",
  "bytemuck",
@@ -1884,7 +1878,6 @@ checksum = "8cb01cd46b0cf372153850f4c6c272d9cbea2da513e07538405148f95bd789f3"
 dependencies = [
  "atomic",
  "parking_lot",
- "pear",
  "serde",
  "tempfile",
  "uncased",
@@ -2626,7 +2619,7 @@ dependencies = [
 [[package]]
 name = "id-crate"
 version = "0.1.0"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc1#9582b8c3964120c4a4bcf521065e31c2df250ec4"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc2#9fcb729ae3a6de67544fe6f8147da8d86bdf3692"
 dependencies = [
  "anchor-lang",
  "cfg-if",
@@ -2687,12 +2680,6 @@ dependencies = [
  "unit-prefix",
  "web-time",
 ]
-
-[[package]]
-name = "inlinable_string"
-version = "0.1.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8fae54786f62fb2918dcfae3d568594e50eb9b5c25bf04371af6fe7516452fb"
 
 [[package]]
 name = "inout"
@@ -2849,7 +2836,7 @@ dependencies = [
 [[package]]
 name = "juplend-mocks"
 version = "0.1.0"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc1#9582b8c3964120c4a4bcf521065e31c2df250ec4"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc2#9fcb729ae3a6de67544fe6f8147da8d86bdf3692"
 dependencies = [
  "anchor-lang",
  "bytemuck",
@@ -2873,7 +2860,7 @@ dependencies = [
 [[package]]
 name = "kamino-mocks"
 version = "0.1.0"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc1#9582b8c3964120c4a4bcf521065e31c2df250ec4"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc2#9fcb729ae3a6de67544fe6f8147da8d86bdf3692"
 dependencies = [
  "anchor-lang",
  "bytemuck",
@@ -3009,7 +2996,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "marginfi"
 version = "0.1.12"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc1#9582b8c3964120c4a4bcf521065e31c2df250ec4"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc2#9fcb729ae3a6de67544fe6f8147da8d86bdf3692"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
@@ -3046,8 +3033,8 @@ dependencies = [
 
 [[package]]
 name = "marginfi-type-crate"
-version = "0.1.11"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc1#9582b8c3964120c4a4bcf521065e31c2df250ec4"
+version = "0.1.12"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc2#9fcb729ae3a6de67544fe6f8147da8d86bdf3692"
 dependencies = [
  "anchor-lang",
  "bs58",
@@ -3063,21 +3050,12 @@ dependencies = [
 [[package]]
 name = "marinade-mocks"
 version = "0.1.0"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc1#9582b8c3964120c4a4bcf521065e31c2df250ec4"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc2#9fcb729ae3a6de67544fe6f8147da8d86bdf3692"
 dependencies = [
  "anchor-lang",
  "bytemuck",
  "marginfi-type-crate",
  "static_assertions",
-]
-
-[[package]]
-name = "matchers"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
-dependencies = [
- "regex-automata",
 ]
 
 [[package]]
@@ -3224,15 +3202,6 @@ name = "nonzero_ext"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
-
-[[package]]
-name = "nu-ansi-term"
-version = "0.50.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
-dependencies = [
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "num"
@@ -3542,29 +3511,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pear"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdeeaa00ce488657faba8ebf44ab9361f9365a97bd39ffb8a60663f57ff4b467"
-dependencies = [
- "inlinable_string",
- "pear_codegen",
- "yansi",
-]
-
-[[package]]
-name = "pear_codegen"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bab5b985dc082b345f812b7df84e1bef27e7207b39e448439ba8bd69c93f147"
-dependencies = [
- "proc-macro2",
- "proc-macro2-diagnostics",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "pem"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3758,19 +3704,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "proc-macro2-diagnostics"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af066a9c399a26e020ada66a034357a868728e72cd426f3adcd35f80d88d88c8"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
- "version_check",
- "yansi",
 ]
 
 [[package]]
@@ -4098,7 +4031,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.9",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4494,7 +4427,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4614,7 +4547,7 @@ dependencies = [
 [[package]]
 name = "scope-mocks"
 version = "0.1.0"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc1#9582b8c3964120c4a4bcf521065e31c2df250ec4"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc2#9fcb729ae3a6de67544fe6f8147da8d86bdf3692"
 dependencies = [
  "anchor-lang",
  "bytemuck",
@@ -4883,15 +4816,6 @@ checksum = "75872d278a8f37ef87fa0ddbda7802605cb18344497949862c0d4dcb291eba60"
 dependencies = [
  "digest 0.10.7",
  "keccak",
-]
-
-[[package]]
-name = "sharded-slab"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
-dependencies = [
- "lazy_static",
 ]
 
 [[package]]
@@ -5518,34 +5442,25 @@ dependencies = [
 
 [[package]]
 name = "solana-dex-superagg"
-version = "1.0.0"
-source = "git+https://github.com/0dotxyz/solana-dex-superagg?rev=0feb633981961307fa170130895a887324ffa923#0feb633981961307fa170130895a887324ffa923"
+version = "2.0.0"
+source = "git+https://github.com/0dotxyz/solana-dex-superagg?rev=64c9be3e5939f80cc763e5aa1e923e0033ef8407#64c9be3e5939f80cc763e5aa1e923e0033ef8407"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
  "bincode",
- "bs58",
  "bytes",
- "dotenvy",
- "figment",
- "fixed",
  "futures-util",
  "jupiter-swap-api-client",
- "reqwest",
  "rmp-serde",
  "serde",
- "serde_json",
+ "solana-address-lookup-table-interface",
  "solana-client",
  "solana-commitment-config",
- "solana-program",
+ "solana-compute-budget-interface",
  "solana-sdk",
- "spl-associated-token-account",
- "spl-token",
  "tokio",
  "tokio-tungstenite",
  "tracing",
- "tracing-subscriber",
  "urlencoding",
 ]
 
@@ -7245,7 +7160,7 @@ dependencies = [
 [[package]]
 name = "solend-mocks"
 version = "0.1.0"
-source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc1#9582b8c3964120c4a4bcf521065e31c2df250ec4"
+source = "git+https://github.com/mrgnlabs/marginfi-v2?tag=mrgn-0.1.12-rc2#9fcb729ae3a6de67544fe6f8147da8d86bdf3692"
 dependencies = [
  "anchor-lang",
  "bytemuck",
@@ -7915,7 +7830,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7965,15 +7880,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "thread_local"
-version = "1.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
-dependencies = [
- "cfg-if",
 ]
 
 [[package]]
@@ -8361,36 +8267,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e672c95779cf947c5311f83787af4fa8fffd12fb27e4993211a84bdfd9610f9c"
 dependencies = [
  "once_cell",
- "valuable",
-]
-
-[[package]]
-name = "tracing-log"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
-dependencies = [
- "log",
- "once_cell",
- "tracing-core",
-]
-
-[[package]]
-name = "tracing-subscriber"
-version = "0.3.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2054a14f5307d601f88daf0553e1cbf472acc4f2c51afab632431cdcd72124d5"
-dependencies = [
- "matchers",
- "nu-ansi-term",
- "once_cell",
- "regex-automata",
- "sharded-slab",
- "smallvec",
- "thread_local",
- "tracing",
- "tracing-core",
- "tracing-log",
 ]
 
 [[package]]
@@ -8568,12 +8444,6 @@ name = "uuid"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "458f7a779bf54acc9f347480ac654f68407d3aab21269a6e3c9f922acd9e2da9"
-
-[[package]]
-name = "valuable"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcpkg"
@@ -8801,7 +8671,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9191,12 +9061,6 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
 ]
-
-[[package]]
-name = "yansi"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yellowstone-grpc-client"
