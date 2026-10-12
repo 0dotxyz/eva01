@@ -39,7 +39,6 @@ pub fn oracle_account_keys(bank: &Bank, bank_address: &Pubkey) -> Result<Vec<Pub
         // Feed + one multiplier account: the venue's reserve/market/lending state, the Marinade
         // state (mSOL/SOL), the SPL stake pool (LST/SOL), or the Exponent vault (PT).
         OracleSetup::KaminoPythPush
-        | OracleSetup::DriftPythPull
         | OracleSetup::JuplendPythPull
         | OracleSetup::ScopeKamino
         | OracleSetup::ScopeJuplend
@@ -51,7 +50,7 @@ pub fn oracle_account_keys(bank: &Bank, bank_address: &Pubkey) -> Result<Vec<Pub
         | OracleSetup::JuplendMSOL
         | OracleSetup::KaminoLST
         | OracleSetup::JuplendLST => vec![key(0)?, key(1)?, key(2)?],
-        OracleSetup::FixedKamino | OracleSetup::FixedDrift | OracleSetup::FixedJuplend => {
+        OracleSetup::FixedKamino | OracleSetup::FixedJuplend => {
             vec![key(1)?]
         }
         OracleSetup::Fixed => vec![],

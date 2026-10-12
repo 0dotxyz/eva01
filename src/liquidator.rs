@@ -60,7 +60,7 @@ const MAX_CONCURRENT_LIQUIDATIONS: usize = 8;
 /// How often the rebalancing sweep runs when Geyser has delivered no updates at all.
 const IDLE_REBALANCE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Taken off the premium `end_liquidation` allows, so price drift between evaluation and landing
+/// Taken off the premium `end_liquidation` allows, so price moves between evaluation and landing
 /// cannot push the seizure over the cap.
 const PREMIUM_SAFETY_MARGIN: I80F48 = I80F48!(0.005);
 

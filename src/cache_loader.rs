@@ -1,6 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
 
-use anchor_lang::AccountDeserialize;
 use anchor_spl::associated_token;
 use anyhow::Ok;
 use log::{debug, error, info, warn};
@@ -20,7 +19,6 @@ use solana_sdk::{
 
 use crate::{
     cache::{Cache, GroupedLuts},
-    drift,
     geyser::AccountType,
     utils::{self, batch_get_multiple_accounts, BatchLoadingConfig},
     wrappers::marginfi_account::MarginfiAccountWrapper,
@@ -89,7 +87,6 @@ impl CacheLoader {
         self.load_mints(cache)?;
         self.load_oracles(cache)?;
         self.load_tokens(cache)?;
-        self.load_drift_users(cache)?;
 
         Ok(())
     }
@@ -471,37 +468,6 @@ impl CacheLoader {
 
         Ok(())
     }
-
-    fn load_drift_users(&self, cache: &mut Cache) -> anyhow::Result<()> {
-        info!("Loading Drift Users...");
-
-        let user_addresses = cache
-            .banks
-            .get_drift_users()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let user_accounts = batch_get_multiple_accounts(
-            &self.rpc_client,
-            &user_addresses,
-            BatchLoadingConfig::DEFAULT,
-        )?;
-
-        for (&address, account) in user_addresses.iter().zip(user_accounts.iter()) {
-            if let Some(account) = account {
-                debug!("Loaded the Drift User: {:?}", address);
-                let mut data: &[u8] = &account.data;
-                let user = drift::accounts::User::try_deserialize(&mut data)?;
-
-                cache.drift_users.insert(address, user);
-            } else {
-                error!("User account {:?} not found.", address);
-            }
-        }
-
-        info!("Loaded {} Drift Users.", cache.drift_users.len());
-
-        Ok(())
-    }
 }
 
 pub fn get_accounts_to_track(cache: &Cache) -> Result<HashMap<Pubkey, AccountType>> {
@@ -511,8 +477,7 @@ pub fn get_accounts_to_track(cache: &Cache) -> Result<HashMap<Pubkey, AccountTyp
     // Geyser would clobber the patched (never-stale) value with the real, intermittently-stale
     // on-chain account, making the affected banks flap in and out of "stale oracle" during the
     // liquidatability check. This covers the Kamino reserve / Juplend lending accounts that
-    // IntegrationAccountFetcher patches. Drift spot markets are NOT fetcher-owned (no
-    // refresh_drift), so they stay on Geyser to keep their staleness field fresh.
+    // IntegrationAccountFetcher patches.
     let mut fetcher_owned = cache.banks.get_kamino_reserves();
     fetcher_owned.extend(cache.banks.get_juplend_lending_states());
     for oracle_pk in cache.oracles.try_get_addresses()? {

@@ -1,27 +1,21 @@
 use super::marginfi_account::{MarginfiAccountWrapper, ObservationAccounts};
 use crate::{
-    cache::{Cache, DriftSpotMarket},
+    cache::Cache,
     config::Eva01Config,
-    drift_ixs::make_refresh_spot_market_ix,
     juplend_ixs::make_update_lending_rate_ix,
     kamino_ixs::{make_refresh_obligation_ix, make_refresh_reserve_ix},
     marginfi_ixs::{
-        make_drift_withdraw_ix, make_end_liquidate_ix, make_init_liquidation_record_ix,
-        make_juplend_withdraw_ix, make_kamino_withdraw_ix, make_repay_ix, make_start_liquidate_ix,
-        make_tag_liq_record_ix, make_withdraw_ix,
+        make_end_liquidate_ix, make_init_liquidation_record_ix, make_juplend_withdraw_ix,
+        make_kamino_withdraw_ix, make_repay_ix, make_start_liquidate_ix, make_tag_liq_record_ix,
+        make_withdraw_ix,
     },
     utils::{self, marginfi_account_by_authority},
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
 use log::{debug, error, info};
-use marginfi_type_crate::{
-    constants::{
-        ASSET_TAG_DEFAULT, ASSET_TAG_DRIFT, ASSET_TAG_JUPLEND, ASSET_TAG_KAMINO, ASSET_TAG_SOL,
-        ASSET_TAG_STAKED,
-    },
-    pdas::derive_drift_spot_market,
-    types::Bank,
+use marginfi_type_crate::constants::{
+    ASSET_TAG_DEFAULT, ASSET_TAG_JUPLEND, ASSET_TAG_KAMINO, ASSET_TAG_SOL, ASSET_TAG_STAKED,
 };
 use solana_client::rpc_client::RpcClient;
 
@@ -43,12 +37,7 @@ use std::{collections::HashSet, sync::Arc};
 pub fn is_seizable_asset_tag(tag: u8) -> bool {
     matches!(
         tag,
-        ASSET_TAG_DEFAULT
-            | ASSET_TAG_SOL
-            | ASSET_TAG_STAKED
-            | ASSET_TAG_KAMINO
-            | ASSET_TAG_DRIFT
-            | ASSET_TAG_JUPLEND
+        ASSET_TAG_DEFAULT | ASSET_TAG_SOL | ASSET_TAG_STAKED | ASSET_TAG_KAMINO | ASSET_TAG_JUPLEND
     )
 }
 
@@ -132,7 +121,6 @@ impl LiquidatorAccount {
             observation_accounts: liquidatee_observation_accounts,
             bank_pks: liquidatee_banks,
             kamino_reserves,
-            drift_spot_markets,
             juplend_states,
             ..
         } = observation_accounts;
@@ -175,7 +163,7 @@ impl LiquidatorAccount {
             liquidatee_banks,
         );
 
-        ixs.extend(self.venue_refresh_ixs(kamino_reserves, drift_spot_markets, juplend_states)?);
+        ixs.extend(self.venue_refresh_ixs(kamino_reserves, juplend_states)?);
 
         let asset_mint_wrapper = self.cache.mints.try_get_account(&asset_mint)?;
 
@@ -210,24 +198,6 @@ impl LiquidatorAccount {
                     &asset_mint_wrapper,
                     asset_bank_wrapper.bank.integration_acc_2,
                     &kamino_reserve,
-                    liquidatee_observation_accounts.as_ref(),
-                    asset_amount.to_num(),
-                    false,
-                )
-            }
-            ASSET_TAG_DRIFT => {
-                let (drift_spot_market, reward_spot_market, reward_spot_market_2) =
-                    self.get_drift_spot_markets_for_bank(&asset_bank_wrapper.bank)?;
-
-                make_drift_withdraw_ix(
-                    self.group,
-                    liquidatee_account_address,
-                    signer_pk,
-                    &asset_bank_wrapper,
-                    &asset_mint_wrapper,
-                    &drift_spot_market,
-                    reward_spot_market.as_ref(),
-                    reward_spot_market_2.as_ref(),
                     liquidatee_observation_accounts.as_ref(),
                     asset_amount.to_num(),
                     false,
@@ -288,12 +258,11 @@ impl LiquidatorAccount {
         self.compile_tx_with_lut_fit(&signer_pk, &ixs, &mut luts)
     }
 
-    /// Kamino, Drift and JupLend venue accounts must be refreshed in the same slot as any health
+    /// Kamino and JupLend venue accounts must be refreshed in the same slot as any health
     /// check that reads them.
     fn venue_refresh_ixs(
         &self,
         kamino_reserves: &HashSet<Pubkey>,
-        drift_spot_markets: &HashSet<Pubkey>,
         juplend_states: &HashSet<Pubkey>,
     ) -> Result<Vec<Instruction>> {
         let mut ixs = Vec::new();
@@ -308,17 +277,6 @@ impl LiquidatorAccount {
             let refresh_reserve_ix =
                 make_refresh_reserve_ix(*kamino_reserve_address, &kamino_reserve);
             ixs.push(refresh_reserve_ix);
-        }
-
-        for spot_market_address in drift_spot_markets {
-            let spot_market = self.cache.try_get_drift_market(spot_market_address)?;
-
-            let refresh_spot_market_ix = make_refresh_spot_market_ix(
-                *spot_market_address,
-                spot_market.market.vault,
-                spot_market.market.oracle,
-            );
-            ixs.push(refresh_spot_market_ix);
         }
 
         for lending_state_address in juplend_states {
@@ -344,13 +302,12 @@ impl LiquidatorAccount {
             observation_accounts: liquidatee_observation_accounts,
             bank_pks: liquidatee_banks,
             kamino_reserves,
-            drift_spot_markets,
             juplend_states,
             ..
         } = observation_accounts;
 
         let mut ixs = vec![self.cu_limit_ix.clone(), self.cu_price_ix.clone()];
-        ixs.extend(self.venue_refresh_ixs(kamino_reserves, drift_spot_markets, juplend_states)?);
+        ixs.extend(self.venue_refresh_ixs(kamino_reserves, juplend_states)?);
         ixs.push(make_tag_liq_record_ix(
             self.group,
             liquidatee,
@@ -430,54 +387,6 @@ impl LiquidatorAccount {
                 None
             }
         }
-    }
-
-    fn get_drift_spot_markets_for_bank(
-        &self,
-        bank: &Bank,
-    ) -> Result<(
-        DriftSpotMarket,
-        Option<DriftSpotMarket>,
-        Option<DriftSpotMarket>,
-    )> {
-        let drift_spot_market = self.cache.try_get_drift_market(&bank.integration_acc_1)?;
-
-        let drift_user = self
-            .cache
-            .drift_users
-            .get(&bank.integration_acc_2)
-            .context(format!(
-                "Couldn't find the data for Drift user: {}",
-                bank.integration_acc_2
-            ))?;
-
-        // Note: rewards can take up to 2 positions, at indexes 2 and 3 (0 and 1 are for deposits).
-        let (reward_spot_market, reward_spot_market_2) =
-            if drift_user.spot_positions[2].scaled_balance > 0 {
-                let reward_spot_market_address =
-                    derive_drift_spot_market(drift_user.spot_positions[2].market_index).0;
-
-                let reward_spot_market = self
-                    .cache
-                    .try_get_drift_market(&reward_spot_market_address)?;
-
-                if drift_user.spot_positions[3].scaled_balance > 0 {
-                    let reward_spot_market_2_address =
-                        derive_drift_spot_market(drift_user.spot_positions[3].market_index).0;
-
-                    let reward_spot_market_2 = self
-                        .cache
-                        .try_get_drift_market(&reward_spot_market_2_address)?;
-
-                    (Some(reward_spot_market), Some(reward_spot_market_2))
-                } else {
-                    (Some(reward_spot_market), None)
-                }
-            } else {
-                (None, None)
-            };
-
-        Ok((drift_spot_market, reward_spot_market, reward_spot_market_2))
     }
 }
 

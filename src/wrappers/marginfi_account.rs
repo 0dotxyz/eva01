@@ -52,7 +52,6 @@ pub struct ObservationAccounts {
     pub observation_accounts: Vec<Pubkey>,
     pub bank_pks: Vec<Pubkey>,
     pub kamino_reserves: HashSet<Pubkey>,
-    pub drift_spot_markets: HashSet<Pubkey>,
     pub juplend_states: HashSet<Pubkey>,
 }
 
@@ -146,7 +145,6 @@ impl MarginfiAccountWrapper {
 
         let mut observation_accounts: Vec<Pubkey> = vec![];
         let mut kamino_reserves = HashSet::new();
-        let mut drift_spot_markets = HashSet::new();
         let mut juplend_states = HashSet::new();
 
         for bank_pk in bank_pks.iter() {
@@ -163,9 +161,6 @@ impl MarginfiAccountWrapper {
                 | OracleSetup::KaminoLST
                 | OracleSetup::ScopeKamino => {
                     kamino_reserves.insert(bank_wrapper.bank.integration_acc_1);
-                }
-                OracleSetup::DriftPythPull | OracleSetup::FixedDrift => {
-                    drift_spot_markets.insert(bank_wrapper.bank.integration_acc_1);
                 }
                 OracleSetup::JuplendPythPull
                 | OracleSetup::FixedJuplend
@@ -185,7 +180,6 @@ impl MarginfiAccountWrapper {
             observation_accounts,
             bank_pks,
             kamino_reserves,
-            drift_spot_markets,
             juplend_states,
         })
     }

@@ -5,7 +5,7 @@ mod oracles;
 mod tokens;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::{Arc, Mutex},
 };
 
@@ -32,7 +32,6 @@ use tokens::TokensCache;
 
 use crate::{
     clock_manager,
-    drift::accounts::{SpotMarket, User as DriftUser},
     juplend_earn::accounts::Lending,
     kamino_lending::accounts::Reserve,
     utils::accessor,
@@ -93,7 +92,6 @@ pub struct Cache {
     pub global_fee_state_key: Pubkey,
     pub global_fee_wallet: Pubkey,
     pub liquidation_max_fee: I80F48,
-    pub drift_users: HashMap<Pubkey, DriftUser>,
 }
 
 #[derive(Clone)]
@@ -101,12 +99,6 @@ pub struct KaminoReserve {
     pub address: Pubkey,
     pub reserve: Reserve,
     pub lending_market_authority: Pubkey,
-}
-
-#[derive(Clone)]
-pub struct DriftSpotMarket {
-    pub address: Pubkey,
-    pub market: SpotMarket,
 }
 
 impl Cache {
@@ -132,7 +124,6 @@ impl Cache {
             global_fee_state_key,
             global_fee_wallet: Pubkey::default(),
             liquidation_max_fee: I80F48::ZERO,
-            drift_users: HashMap::new(),
         }
     }
 
@@ -158,23 +149,6 @@ impl Cache {
         })?;
 
         Ok(Self::build_kamino_reserve(*address, reserve))
-    }
-
-    pub fn try_get_drift_market(&self, address: &Pubkey) -> Result<DriftSpotMarket> {
-        let account = self.oracles.try_get_account(address)?;
-        let mut data: &[u8] = &account.data;
-        let market = SpotMarket::try_deserialize(&mut data).map_err(|e| {
-            anyhow!(
-                "Failed to deserialize Drift spot market {} from OracleCache: {}",
-                address,
-                e
-            )
-        })?;
-
-        Ok(DriftSpotMarket {
-            address: *address,
-            market,
-        })
     }
 
     pub fn try_get_juplend_lending_state(&self, address: &Pubkey) -> Result<Lending> {

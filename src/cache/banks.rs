@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use marginfi::state::bank_config::BankConfigImpl;
 use marginfi_type_crate::{
-    constants::{ASSET_TAG_DRIFT, ASSET_TAG_JUPLEND, ASSET_TAG_KAMINO},
+    constants::{ASSET_TAG_JUPLEND, ASSET_TAG_KAMINO},
     types::{is_marginfi_asset_tag, Bank, OracleSetup},
 };
 use solana_sdk::{account::Account, pubkey::Pubkey};
@@ -113,7 +113,6 @@ impl BanksCache {
                     OracleSetup::PythPushOracle
                         | OracleSetup::StakedWithPythPush
                         | OracleSetup::KaminoPythPush
-                        | OracleSetup::DriftPythPull
                         | OracleSetup::JuplendPythPull
                         | OracleSetup::PythMSOL
                         | OracleSetup::KaminoMSOL
@@ -142,22 +141,6 @@ impl BanksCache {
             .filter_map(|(_, bank)| {
                 if bank.bank.config.asset_tag == ASSET_TAG_KAMINO {
                     Some(bank.bank.integration_acc_1)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn get_drift_users(&self) -> HashSet<Pubkey> {
-        self.inner
-            .read()
-            .expect("banks cache lock poisoned")
-            .banks
-            .iter()
-            .filter_map(|(_, bank)| {
-                if bank.bank.config.asset_tag == ASSET_TAG_DRIFT {
-                    Some(bank.bank.integration_acc_2)
                 } else {
                     None
                 }

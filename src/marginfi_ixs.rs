@@ -5,9 +5,8 @@ use log::{debug, trace};
 use marginfi_type_crate::{
     constants::LIQUIDATION_RECORD_SEED,
     pdas::{
-        derive_drift_signer, derive_drift_state, derive_juplend_lending_admin,
-        derive_juplend_liquidity, derive_juplend_liquidity_vault, derive_juplend_rate_model,
-        derive_kamino_user_state,
+        derive_juplend_lending_admin, derive_juplend_liquidity, derive_juplend_liquidity_vault,
+        derive_juplend_rate_model, derive_kamino_user_state,
     },
 };
 use solana_sdk::{
@@ -18,8 +17,7 @@ use solana_sdk::{
 use solana_sdk_ids::system_program;
 
 use crate::{
-    cache::{DriftSpotMarket, KaminoReserve},
-    drift::program::Drift,
+    cache::KaminoReserve,
     juplend_earn::accounts::Lending,
     kamino_farms::program::Farms as KaminoFarms,
     kamino_lending::program::KaminoLending,
@@ -317,90 +315,6 @@ pub fn make_kamino_withdraw_ix(
         data: marginfi::instruction::KaminoWithdraw {
             amount,
             flags: if withdraw_all { Some(1) } else { None },
-        }
-        .data(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn make_drift_withdraw_ix(
-    group: Pubkey,
-    marginfi_account: Pubkey,
-    authority: Pubkey,
-    bank: &BankWrapper,
-    mint_wrapper: &MintWrapper,
-    drift_spot_market: &DriftSpotMarket,
-    reward_spot_market: Option<&DriftSpotMarket>,
-    reward_spot_market_2: Option<&DriftSpotMarket>,
-    remaining: &[Pubkey],
-    amount: u64,
-    withdraw_all: bool,
-) -> Instruction {
-    let drift_oracle = if bank.bank.mint
-        == Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
-    {
-        Some(marginfi_type_crate::ID)
-    } else {
-        Some(drift_spot_market.market.oracle)
-    };
-
-    let mut accounts = marginfi::accounts::DriftWithdraw {
-        group,
-        marginfi_account,
-        authority,
-        bank: bank.address,
-        drift_oracle,
-        liquidity_vault_authority: find_bank_liquidity_vault_authority(
-            &bank.address,
-            &marginfi_type_crate::ID,
-        ),
-        liquidity_vault: bank.bank.liquidity_vault,
-        destination_token_account: mint_wrapper.token,
-        drift_state: derive_drift_state().0,
-        integration_acc_1: bank.bank.integration_acc_1, // spot market
-        integration_acc_2: bank.bank.integration_acc_2, // user
-        integration_acc_3: bank.bank.integration_acc_3, // user stats
-        drift_spot_market_vault: drift_spot_market.market.vault,
-        drift_reward_oracle: reward_spot_market
-            .map(|m| m.market.oracle)
-            .or(Some(marginfi_type_crate::ID)),
-        drift_reward_spot_market: reward_spot_market
-            .map(|m| m.address)
-            .or(Some(marginfi_type_crate::ID)),
-        drift_reward_mint: reward_spot_market
-            .map(|m| m.market.mint)
-            .or(Some(marginfi_type_crate::ID)),
-        drift_reward_oracle_2: reward_spot_market_2
-            .map(|m| m.market.oracle)
-            .or(Some(marginfi_type_crate::ID)),
-        drift_reward_spot_market_2: reward_spot_market_2
-            .map(|m| m.address)
-            .or(Some(marginfi_type_crate::ID)),
-        drift_reward_mint_2: reward_spot_market_2
-            .map(|m| m.market.mint)
-            .or(Some(marginfi_type_crate::ID)),
-        drift_signer: derive_drift_signer().0,
-        mint: bank.bank.mint,
-        drift_program: Drift::id(),
-        token_program: mint_wrapper.account.owner,
-        system_program: system_program::id(),
-    }
-    .to_account_metas(None);
-
-    mark_signer(&mut accounts, authority);
-
-    accounts.extend(
-        remaining
-            .iter()
-            .map(|a| AccountMeta::new_readonly(*a, false)),
-    );
-
-    Instruction {
-        program_id: marginfi_type_crate::ID,
-        accounts,
-        data: marginfi::instruction::DriftWithdraw {
-            amount,
-            withdraw_all: Some(withdraw_all),
         }
         .data(),
     }

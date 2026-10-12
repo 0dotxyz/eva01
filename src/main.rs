@@ -23,7 +23,6 @@ mod cache_loader;
 mod cli;
 mod clock_manager;
 mod config;
-mod drift_ixs;
 mod execution;
 mod geyser;
 mod juplend_ixs;
@@ -39,14 +38,6 @@ declare_program!(kamino_lending);
 declare_program!(kamino_farms);
 declare_program!(juplend_earn);
 declare_program!(liquidity);
-
-#[allow(clippy::too_many_arguments)]
-mod drift_idl {
-    use anchor_lang::{self, declare_program};
-    declare_program!(drift);
-}
-
-use drift_idl::*;
 
 fn main() -> Result<(), Box<dyn Error>> {
     init_logging();

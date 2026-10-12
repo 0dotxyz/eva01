@@ -107,7 +107,7 @@ impl Rebalancer {
                 Err(_) => continue,
             };
 
-            // Mints backed only by integration banks (Kamino/Drift/JupLend) have no bank that
+            // Mints backed only by integration banks (Kamino/JupLend) have no bank that
             // prices the raw SPL token, so they can never be swept.
             // Expected to only ever happen on staging.
             if self.cache.banks.try_get_account_for_mint(&mint).is_err() {
