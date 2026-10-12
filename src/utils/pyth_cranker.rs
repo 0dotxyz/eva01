@@ -78,6 +78,13 @@ const VAA_HEADER_SIZE: usize = 46;
 const VAA_SPLIT_INDEX: usize = 721;
 const DEFAULT_TREASURY_ID: u8 = 0;
 
+/// Seconds since `publish_time`, as of the cached clock. The cached clock can trail a fresh
+/// update's publish time, so a negative age is clamped to 0 rather than wrapping when compared as
+/// unsigned (which made fresh feeds look ancient and get re-cranked).
+fn feed_age(now: i64, publish_time: i64) -> u64 {
+    now.saturating_sub(publish_time).max(0) as u64
+}
+
 #[derive(Deserialize)]
 struct HermesResponse {
     binary: HermesBinary,
@@ -92,7 +99,7 @@ struct HermesBinary {
 struct StaleFeed {
     oracle: Pubkey,
     feed_id: [u8; 32],
-    age: i64,
+    age: u64,
     max_age: u64,
 }
 
@@ -191,15 +198,15 @@ impl PythCranker {
                 }
                 // Our own write may not have reached the cache yet, so age from whichever is newer.
                 Some(&ours) => {
-                    let age = now.saturating_sub(ours.max(published));
-                    if (age as u64) < max_age / REFRESH_AGE_DIVISOR {
+                    let age = feed_age(now, ours.max(published));
+                    if age < max_age / REFRESH_AGE_DIVISOR {
                         continue;
                     }
                     age
                 }
                 None => {
-                    let age = now.saturating_sub(published);
-                    if (age as u64) < max_age.saturating_mul(ADOPT_AGE_MULTIPLE) {
+                    let age = feed_age(now, published);
+                    if age < max_age.saturating_mul(ADOPT_AGE_MULTIPLE) {
                         continue;
                     }
                     warn!(
@@ -302,7 +309,22 @@ impl PythCranker {
             )?,
             self.close_encoded_vaa_ix(&payer, &encoded_vaa.pubkey()),
         ]);
-        let signature = self.send(&update, &[&self.payer])?;
+        let signature = match self.send(&update, &[&self.payer]) {
+            Ok(signature) => signature,
+            Err(e) => {
+                // The VAA account from the first transaction holds rent that only this payer can
+                // reclaim; close it on the way out instead of stranding it.
+                let close = self.close_encoded_vaa_ix(&payer, &encoded_vaa.pubkey());
+                if let Err(close_err) = self.send(&[close], &[&self.payer]) {
+                    warn!(
+                        "PythCranker: failed to reclaim the VAA account {} after a failed update: \
+                         {close_err}",
+                        encoded_vaa.pubkey()
+                    );
+                }
+                return Err(e);
+            }
+        };
 
         self.adopted
             .lock()
@@ -472,4 +494,22 @@ fn publish_time(update: &MerklePriceUpdate) -> Result<i64> {
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feed_age_counts_seconds_since_publish() {
+        assert_eq!(feed_age(1_000, 940), 60);
+        assert_eq!(feed_age(1_000, 1_000), 0);
+    }
+
+    #[test]
+    fn feed_published_after_the_cached_clock_is_fresh() {
+        // The cached clock trails a just-published update: that's age 0, not ~u64::MAX.
+        assert_eq!(feed_age(1_000, 1_003), 0);
+        assert!(feed_age(1_000, 1_003) < 60 / REFRESH_AGE_DIVISOR);
+    }
 }

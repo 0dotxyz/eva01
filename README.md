@@ -3,7 +3,7 @@
 
 ## Structure
 * `bin` - environment configuration template
-* `idls` - IDLs for Project 0 integrations (Kamino, Drift, Juplend)
+* `idls` - IDLs for Project 0 integrations (Kamino, Juplend)
 * `src` - source code
 * `Dockerfile` - production (`network-mainnet`) image build
 * `Dockerfile.staging` - staging (`network-staging`) image build

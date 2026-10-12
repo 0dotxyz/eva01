@@ -5,7 +5,7 @@ mod oracles;
 mod tokens;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::{Arc, Mutex},
 };
 
@@ -13,6 +13,7 @@ use accounts::MarginfiAccountsCache;
 use anchor_lang::AccountDeserialize;
 use anyhow::{anyhow, Result};
 use banks::BanksCache;
+use fixed::types::I80F48;
 use marginfi_type_crate::{
     constants::{ASSET_TAG_DEFAULT, ASSET_TAG_SOL, ASSET_TAG_STAKED, FEE_STATE_SEED},
     pdas::derive_kamino_lending_market_authority,
@@ -31,7 +32,6 @@ use tokens::TokensCache;
 
 use crate::{
     clock_manager,
-    drift::accounts::{SpotMarket, User as DriftUser},
     juplend_earn::accounts::Lending,
     kamino_lending::accounts::Reserve,
     utils::accessor,
@@ -91,7 +91,7 @@ pub struct Cache {
     pub luts: Arc<Mutex<GroupedLuts>>,
     pub global_fee_state_key: Pubkey,
     pub global_fee_wallet: Pubkey,
-    pub drift_users: HashMap<Pubkey, DriftUser>,
+    pub liquidation_max_fee: I80F48,
 }
 
 #[derive(Clone)]
@@ -99,12 +99,6 @@ pub struct KaminoReserve {
     pub address: Pubkey,
     pub reserve: Reserve,
     pub lending_market_authority: Pubkey,
-}
-
-#[derive(Clone)]
-pub struct DriftSpotMarket {
-    pub address: Pubkey,
-    pub market: SpotMarket,
 }
 
 impl Cache {
@@ -129,7 +123,7 @@ impl Cache {
             luts: Arc::new(Mutex::new(GroupedLuts::default())),
             global_fee_state_key,
             global_fee_wallet: Pubkey::default(),
-            drift_users: HashMap::new(),
+            liquidation_max_fee: I80F48::ZERO,
         }
     }
 
@@ -155,23 +149,6 @@ impl Cache {
         })?;
 
         Ok(Self::build_kamino_reserve(*address, reserve))
-    }
-
-    pub fn try_get_drift_market(&self, address: &Pubkey) -> Result<DriftSpotMarket> {
-        let account = self.oracles.try_get_account(address)?;
-        let mut data: &[u8] = &account.data;
-        let market = SpotMarket::try_deserialize(&mut data).map_err(|e| {
-            anyhow!(
-                "Failed to deserialize Drift spot market {} from OracleCache: {}",
-                address,
-                e
-            )
-        })?;
-
-        Ok(DriftSpotMarket {
-            address: *address,
-            market,
-        })
     }
 
     pub fn try_get_juplend_lending_state(&self, address: &Pubkey) -> Result<Lending> {

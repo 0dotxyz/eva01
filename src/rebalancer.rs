@@ -4,10 +4,10 @@ use fixed_macro::types::I80F48;
 use log::{error, info, warn};
 use solana_commitment_config::CommitmentLevel;
 use solana_dex_superagg::{
-    client::DexSuperAggClient,
-    config::{ClientConfig, JupiterConfig, RoutingStrategy, SharedConfig, TitanConfig},
+    ClientConfig, DexSuperAggClient, DflowConfig, JupiterConfig, TitanConfig,
 };
 use solana_program::pubkey::Pubkey;
+use solana_sdk::signature::Keypair;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -24,6 +24,10 @@ const MAX_CONCURRENT_DEX_CALLS: usize = 2;
 
 /// Don't bother selling a position worth less than this (USD); the swap fee/dust isn't worth it.
 const MIN_REBALANCE_VALUE: I80F48 = I80F48!(1.0);
+
+/// Never sell for less than this fraction of the oracle value: further off, the market (or a pushed
+/// pool) is wrong and holding until the next pass beats dumping. Within the ~8.5% liquidation margin.
+pub const MIN_SELL_PRICE_VS_ORACLE: I80F48 = I80F48!(0.95);
 
 /// The rebalancer keeps the liquidator holding only the swap mint (USDC): every other token it ends
 /// up with — seized collateral from a liquidation, or a JIT-buy overshoot — is sold back to USDC on
@@ -49,37 +53,26 @@ impl Rebalancer {
             .enable_all()
             .build()?;
 
-        // Convert wallet keypair to JSON string format expected by solana-dex-superagg
-        let wallet_keypair_str = serde_json::to_string(&config.wallet_keypair)?;
-
-        let shared_config = SharedConfig {
+        let client_config = ClientConfig {
             rpc_url: config.rpc_url.clone(),
             slippage_bps: config.slippage_bps,
-            wallet_keypair: Some(wallet_keypair_str),
             compute_unit_price_micro_lamports: config.compute_unit_price_micro_lamports,
-            routing_strategy: Some(RoutingStrategy::BestPrice),
-            retry_tx_landing: 3,
-            commitment_level: CommitmentLevel::Confirmed,
+            jupiter: Some(JupiterConfig {
+                jup_swap_api_url: config.jup_swap_api_url.clone(),
+                api_key: config.jupiter_api_key.clone(),
+            }),
+            titan: Some(TitanConfig {
+                titan_ws_endpoint: config.titan_ws_endpoint.clone(),
+                titan_api_key: config.titan_api_key.clone(),
+            }),
+            dflow: config.dflow_api_key.clone().map(|api_key| DflowConfig {
+                api_url: "https://quote-api.dflow.net".to_string(),
+                api_key,
+            }),
+            ..Default::default()
         };
-
-        let jupiter_config = JupiterConfig {
-            jup_swap_api_url: config.jup_swap_api_url.clone(),
-            api_key: Some(config.jupiter_api_key.clone()),
-        };
-
-        let titan_config = Some(TitanConfig {
-            titan_ws_endpoint: config.titan_ws_endpoint.clone(),
-            titan_api_key: Some(config.titan_api_key.clone()),
-        });
-
-        let client_config = ClientConfig {
-            shared: shared_config,
-            jupiter: jupiter_config,
-            titan: titan_config,
-            dflow: None,
-        };
-
-        let dex_client = Arc::new(DexSuperAggClient::new(client_config)?);
+        let signer = Keypair::try_from(config.wallet_keypair.as_slice())?;
+        let dex_client = Arc::new(DexSuperAggClient::new(client_config, signer)?);
 
         Ok(Self {
             swap_mint,
@@ -114,7 +107,7 @@ impl Rebalancer {
                 Err(_) => continue,
             };
 
-            // Mints backed only by integration banks (Kamino/Drift/JupLend) have no bank that
+            // Mints backed only by integration banks (Kamino/JupLend) have no bank that
             // prices the raw SPL token, so they can never be swept.
             // Expected to only ever happen on staging.
             if self.cache.banks.try_get_account_for_mint(&mint).is_err() {
@@ -180,7 +173,7 @@ impl Rebalancer {
                 mint,
                 value.to_num::<f64>()
             );
-            if let Err(e) = self.swap(wrapper.balance, mint, self.swap_mint) {
+            if let Err(e) = self.swap(wrapper.balance, mint, self.swap_mint, value) {
                 error!("Rebalance swap failed for {}: {}", mint, e);
             }
         }
@@ -190,8 +183,15 @@ impl Rebalancer {
         Ok(())
     }
 
-    /// Execute a swap using the unified DEX aggregator client with best price strategy
-    fn swap(&self, amount: u64, input_mint: Pubkey, output_mint: Pubkey) -> anyhow::Result<u64> {
+    /// Swap `amount` of `input_mint` (worth `value` USD at the oracle) for `output_mint`, refusing
+    /// any route that pays less than [`MIN_SELL_PRICE_VS_ORACLE`] of that value.
+    fn swap(
+        &self,
+        amount: u64,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        value: I80F48,
+    ) -> anyhow::Result<u64> {
         if input_mint == output_mint {
             return Err(anyhow::anyhow!(
                 "Input and output mints cannot be the same: {:?}",
@@ -202,35 +202,37 @@ impl Rebalancer {
             return Err(anyhow::anyhow!("Amount cannot be zero: {:?}", input_mint));
         }
 
+        let output_token = self.cache.tokens.try_get_token_for_mint(&output_mint)?;
+        let min_out = self
+            .cache
+            .try_get_token_wrapper_lenient(&output_mint, &output_token)?
+            .get_amount_from_value(value * MIN_SELL_PRICE_VS_ORACLE)?
+            .to_num::<u64>();
+
         info!(
-            "Swapping {} tokens of mint {} to mint {} ...",
-            amount, input_mint, output_mint
+            "Swapping {} tokens of mint {} to mint {} (at least {}) ...",
+            amount, input_mint, output_mint, min_out
         );
 
-        const WSOL: Pubkey = Pubkey::from_str_const("So11111111111111111111111111111111111111112");
-        let wrap_and_unwrap_sol = input_mint == WSOL || output_mint == WSOL;
-
-        let result = self.tokio_rt.block_on(async {
+        let (prepared, signature) = self.tokio_rt.block_on(async {
             let _permit = self.dex_gate.acquire().await?;
-            self.dex_client
-                .swap(
-                    &input_mint.to_string(),
-                    &output_mint.to_string(),
-                    amount,
-                    wrap_and_unwrap_sol,
-                )
-                .await
+            // `max_in = amount`: sell exactly the balance, never bump the input.
+            let prepared = self
+                .dex_client
+                .build_swap_transaction(input_mint, output_mint, amount, min_out, Some(amount))
+                .await?;
+            let signature = self
+                .dex_client
+                .send_and_confirm(&prepared.transaction, CommitmentLevel::Confirmed)
+                .await?;
+            anyhow::Ok((prepared, signature))
         })?;
 
         info!(
-            "Swap successful! Transaction: {}, Output: {} tokens of mint {}",
-            result.swap_result.signature, result.swap_result.out_amount, output_mint
+            "Swap successful via {:?}! Transaction: {}, Output: {} tokens of mint {}",
+            prepared.aggregator, signature, prepared.out_amount, output_mint
         );
 
-        if let Some(agg) = result.swap_result.aggregator_used {
-            info!("Aggregator used: {:?}", agg);
-        }
-
-        Ok(result.swap_result.out_amount)
+        Ok(prepared.out_amount)
     }
 }

@@ -17,7 +17,7 @@ pub struct ClockManager {
 
 impl ClockManager {
     pub fn new(clock: Arc<Mutex<Clock>>, rpc_url: String) -> anyhow::Result<Self> {
-        info!("Initializing ClockManager with RPC URL: {}", rpc_url);
+        info!("Initializing ClockManager");
 
         let rpc_client = RpcClient::new(rpc_url);
         let refresh_interval = Duration::from_secs(REFRESH_INTERVAL_SEC);

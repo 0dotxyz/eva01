@@ -23,6 +23,7 @@ pub struct Eva01Config {
     pub slippage_bps: u16,
     pub titan_ws_endpoint: String,
     pub titan_api_key: String,
+    pub dflow_api_key: Option<String>,
     pub jupiter_api_key: String,
     /// Jito block-engine `sendBundle` endpoint; `None` uses the executor's built-in default.
     pub jito_block_engine_url: Option<String>,
@@ -91,6 +92,9 @@ impl Eva01Config {
             .expect("TITAN_WS_ENDPOINT environment variable is not set");
         let titan_api_key =
             std::env::var("TITAN_API_KEY").expect("TITAN_API_KEY environment variable is not set");
+        let dflow_api_key = std::env::var("DFLOW_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty());
 
         let jupiter_api_key = std::env::var("JUP_SWAP_API_KEY")
             .expect("JUP_SWAP_API_KEY environment variable is not set");
@@ -131,6 +135,7 @@ impl Eva01Config {
             slippage_bps,
             titan_ws_endpoint,
             titan_api_key,
+            dflow_api_key,
             jupiter_api_key,
             jito_block_engine_url,
             jito_tip_max_lamports,

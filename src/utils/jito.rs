@@ -171,7 +171,7 @@ impl JitoClient {
             req = req.bearer_auth(key);
         }
         let resp: Value = req.send()?.json()?;
-        parse_simulate_bundle(&resp)
+        parse_simulate_bundle(&resp, txs)
     }
 }
 
@@ -250,7 +250,7 @@ fn build_simulate_config(num_txs: usize, accounts_to_inspect: &[Pubkey]) -> Valu
 
 /// Parse a `simulateBundle` response into a [`BundleSimulation`]. On failure, extract the first
 /// failing tx index and its on-chain error message from `summary.failed.error.TransactionFailure`.
-fn parse_simulate_bundle(resp: &Value) -> Result<BundleSimulation> {
+fn parse_simulate_bundle(resp: &Value, txs: &[VersionedTransaction]) -> Result<BundleSimulation> {
     if let Some(err) = resp.get("error") {
         return Err(anyhow!("Jito simulateBundle error: {}", err));
     }
@@ -266,16 +266,23 @@ fn parse_simulate_bundle(resp: &Value) -> Result<BundleSimulation> {
         });
     }
 
-    // Failure: `{ "failed": { "error": { "TransactionFailure": [[idx...], "msg"] }, .. } }`
+    // Failure: `{ "failed": { "error": { "TransactionFailure": [[signature bytes], "msg"] }, .. } }`
     let tf = summary.pointer("/failed/error/TransactionFailure");
     let (failed_tx_index, error_message) = match tf {
         Some(tf) => {
-            let idx = tf
+            let signature: Vec<u8> = tf
                 .get(0)
                 .and_then(|a| a.as_array())
-                .and_then(|a| a.first())
-                .and_then(|n| n.as_u64())
-                .map(|n| n as usize);
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|n| n.as_u64())
+                        .map(|n| n as u8)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let idx = txs
+                .iter()
+                .position(|tx| tx.signatures.first().map(|s| s.as_ref()) == Some(&signature[..]));
             let msg = tf.get(1).and_then(|m| m.as_str()).map(|s| s.to_string());
             (idx, msg)
         }
@@ -471,9 +478,16 @@ mod tests {
                 "transactionResults": []
             } }
         });
-        let sim = parse_simulate_bundle(&resp).unwrap();
+        let sim = parse_simulate_bundle(&resp, &[]).unwrap();
         assert!(sim.succeeded);
         assert!(sim.error_message.is_none());
+    }
+
+    fn signed(byte: u8) -> VersionedTransaction {
+        VersionedTransaction {
+            signatures: vec![solana_sdk::signature::Signature::from([byte; 64])],
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -481,13 +495,13 @@ mod tests {
         let resp = json!({
             "result": { "context": { "slot": 1 }, "value": {
                 "summary": { "failed": { "error": { "TransactionFailure": [
-                    [1],
+                    vec![2u8; 64],
                     "Error processing Instruction 3: custom program error: 0x17a1"
                 ] }, "tx_signature": "sig" } },
                 "transactionResults": []
             } }
         });
-        let sim = parse_simulate_bundle(&resp).unwrap();
+        let sim = parse_simulate_bundle(&resp, &[signed(1), signed(2)]).unwrap();
         assert!(!sim.succeeded);
         assert_eq!(sim.failed_tx_index, Some(1));
     }
@@ -497,20 +511,21 @@ mod tests {
         let resp = json!({
             "result": { "context": { "slot": 1 }, "value": {
                 "summary": { "failed": { "error": { "TransactionFailure": [
-                    [0],
+                    vec![9u8; 64],
                     "Error processing Instruction 1: custom program error: 0x1"
                 ] } } },
                 "transactionResults": []
             } }
         });
-        let sim = parse_simulate_bundle(&resp).unwrap();
+        let sim = parse_simulate_bundle(&resp, &[signed(1)]).unwrap();
         assert!(!sim.succeeded);
+        assert_eq!(sim.failed_tx_index, None);
     }
 
     #[test]
     fn test_parse_simulate_bundle_rpc_error() {
         let resp = json!({ "error": { "code": -32601, "message": "method not found" } });
-        assert!(parse_simulate_bundle(&resp).is_err());
+        assert!(parse_simulate_bundle(&resp, &[]).is_err());
     }
 
     #[test]

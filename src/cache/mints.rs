@@ -41,6 +41,11 @@ impl MintsCache {
             .collect()
     }
 
+    /// Whether `mint` is in `EXCLUDED_LIQUIDATION_MINTS`: neither seized, bought, nor sold.
+    pub fn is_excluded(&self, mint: &Pubkey) -> bool {
+        self.excluded_mints.contains(mint)
+    }
+
     pub fn get_tokens(&self) -> Vec<Pubkey> {
         self.mints.values().map(|mint| mint.token).collect()
     }

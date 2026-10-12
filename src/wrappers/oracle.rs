@@ -39,8 +39,9 @@ pub fn oracle_account_keys(bank: &Bank, bank_address: &Pubkey) -> Result<Vec<Pub
         // Feed + one multiplier account: the venue's reserve/market/lending state, the Marinade
         // state (mSOL/SOL), the SPL stake pool (LST/SOL), or the Exponent vault (PT).
         OracleSetup::KaminoPythPush
-        | OracleSetup::DriftPythPull
         | OracleSetup::JuplendPythPull
+        | OracleSetup::ScopeKamino
+        | OracleSetup::ScopeJuplend
         | OracleSetup::PythMSOL
         | OracleSetup::PythLST
         | OracleSetup::PTPyth => vec![key(0)?, key(1)?],
@@ -49,7 +50,7 @@ pub fn oracle_account_keys(bank: &Bank, bank_address: &Pubkey) -> Result<Vec<Pub
         | OracleSetup::JuplendMSOL
         | OracleSetup::KaminoLST
         | OracleSetup::JuplendLST => vec![key(0)?, key(1)?, key(2)?],
-        OracleSetup::FixedKamino | OracleSetup::FixedDrift | OracleSetup::FixedJuplend => {
+        OracleSetup::FixedKamino | OracleSetup::FixedJuplend => {
             vec![key(1)?]
         }
         OracleSetup::Fixed => vec![],
@@ -138,7 +139,7 @@ impl OracleWrapper {
             .map(|(address, account)| (address, account).into_account_info())
             .collect();
 
-        let source = OraclePriceFeedAdapter::try_from_bank(bank, &remaining_ais, clock)?;
+        let source = OraclePriceFeedAdapter::try_from_bank(bank, &remaining_ais, clock, false)?;
 
         Ok(Self { source })
     }

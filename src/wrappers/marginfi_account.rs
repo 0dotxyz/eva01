@@ -7,9 +7,37 @@ use solana_sdk::clock::Clock;
 use super::oracle::{oracle_account_keys, OracleWrapperTrait};
 use anyhow::Result;
 use fixed::types::I80F48;
-use marginfi_type_crate::types::{BalanceSide, LendingAccount, MarginfiAccount, OracleSetup};
+use marginfi_type_crate::{
+    constants::PREMIUM_ACTIVE,
+    types::{
+        accrued_premium_total, premium_elapsed_seconds, Balance, BalanceSide, Bank, LendingAccount,
+        MarginfiAccount, OracleSetup,
+    },
+};
 use solana_program::pubkey::Pubkey;
 use std::collections::HashSet;
+
+/// Principal plus outstanding and accrued premium (zero unless the bank has `PREMIUM_ACTIVE`).
+fn liability_with_premium(bank: &Bank, balance: &Balance, clock: &Clock) -> Option<I80F48> {
+    let principal = bank
+        .get_liability_amount(balance.liability_shares.into())
+        .ok()?;
+    if !bank.get_flag(PREMIUM_ACTIVE) {
+        return Some(principal);
+    }
+    let elapsed = premium_elapsed_seconds(
+        balance,
+        bank.premium_activated_at,
+        clock.unix_timestamp.max(0) as u64,
+    );
+    let premium = accrued_premium_total(
+        principal,
+        balance.premium_rate_snapshot,
+        balance.premium_outstanding.into(),
+        elapsed,
+    )?;
+    principal.checked_add(premium)
+}
 
 #[derive(Clone)]
 pub struct MarginfiAccountWrapper {
@@ -24,7 +52,6 @@ pub struct ObservationAccounts {
     pub observation_accounts: Vec<Pubkey>,
     pub bank_pks: Vec<Pubkey>,
     pub kamino_reserves: HashSet<Pubkey>,
-    pub drift_spot_markets: HashSet<Pubkey>,
     pub juplend_states: HashSet<Pubkey>,
 }
 
@@ -33,7 +60,13 @@ impl MarginfiAccountWrapper {
         MarginfiAccountWrapper { address, account }
     }
 
-    pub fn get_balance_for_bank(&self, bank_wrapper: &BankWrapper) -> Result<(I80F48, I80F48)> {
+    /// `(assets, liabilities)` in native units. Liabilities include the variable-borrow premium,
+    /// which the repay pays off before principal.
+    pub fn get_balance_for_bank(
+        &self,
+        bank_wrapper: &BankWrapper,
+        clock: &Clock,
+    ) -> Result<(I80F48, I80F48)> {
         let balance = self
             .account
             .lending_account
@@ -49,10 +82,7 @@ impl MarginfiAccountWrapper {
                     Some((amount, I80F48::ZERO))
                 }
                 BalanceSide::Liabilities => {
-                    let amount = bank_wrapper
-                        .bank
-                        .get_liability_amount(b.liability_shares.into())
-                        .ok()?;
+                    let amount = liability_with_premium(&bank_wrapper.bank, b, clock)?;
                     Some((I80F48::ZERO, amount))
                 }
             })
@@ -115,7 +145,6 @@ impl MarginfiAccountWrapper {
 
         let mut observation_accounts: Vec<Pubkey> = vec![];
         let mut kamino_reserves = HashSet::new();
-        let mut drift_spot_markets = HashSet::new();
         let mut juplend_states = HashSet::new();
 
         for bank_pk in bank_pks.iter() {
@@ -129,16 +158,15 @@ impl MarginfiAccountWrapper {
                 OracleSetup::KaminoPythPush
                 | OracleSetup::FixedKamino
                 | OracleSetup::KaminoMSOL
-                | OracleSetup::KaminoLST => {
+                | OracleSetup::KaminoLST
+                | OracleSetup::ScopeKamino => {
                     kamino_reserves.insert(bank_wrapper.bank.integration_acc_1);
-                }
-                OracleSetup::DriftPythPull | OracleSetup::FixedDrift => {
-                    drift_spot_markets.insert(bank_wrapper.bank.integration_acc_1);
                 }
                 OracleSetup::JuplendPythPull
                 | OracleSetup::FixedJuplend
                 | OracleSetup::JuplendMSOL
-                | OracleSetup::JuplendLST => {
+                | OracleSetup::JuplendLST
+                | OracleSetup::ScopeJuplend => {
                     juplend_states.insert(bank_wrapper.bank.integration_acc_1);
                 }
                 _ => {}
@@ -152,7 +180,6 @@ impl MarginfiAccountWrapper {
             observation_accounts,
             bank_pks,
             kamino_reserves,
-            drift_spot_markets,
             juplend_states,
         })
     }
