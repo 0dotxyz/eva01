@@ -5443,16 +5443,19 @@ dependencies = [
 [[package]]
 name = "solana-dex-superagg"
 version = "2.0.0"
-source = "git+https://github.com/0dotxyz/solana-dex-superagg?rev=64c9be3e5939f80cc763e5aa1e923e0033ef8407#64c9be3e5939f80cc763e5aa1e923e0033ef8407"
+source = "git+https://github.com/0dotxyz/solana-dex-superagg?rev=51abc338ca8186a9e03f5ed57c5e69c6889461e1#51abc338ca8186a9e03f5ed57c5e69c6889461e1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "bincode",
  "bytes",
  "futures-util",
  "jupiter-swap-api-client",
+ "reqwest",
  "rmp-serde",
  "serde",
+ "serde_json",
  "solana-address-lookup-table-interface",
  "solana-client",
  "solana-commitment-config",
