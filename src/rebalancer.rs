@@ -3,7 +3,9 @@ use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{error, info, warn};
 use solana_commitment_config::CommitmentLevel;
-use solana_dex_superagg::{ClientConfig, DexSuperAggClient, JupiterConfig, TitanConfig};
+use solana_dex_superagg::{
+    ClientConfig, DexSuperAggClient, DflowConfig, JupiterConfig, TitanConfig,
+};
 use solana_program::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use std::{
@@ -62,6 +64,10 @@ impl Rebalancer {
             titan: Some(TitanConfig {
                 titan_ws_endpoint: config.titan_ws_endpoint.clone(),
                 titan_api_key: config.titan_api_key.clone(),
+            }),
+            dflow: config.dflow_api_key.clone().map(|api_key| DflowConfig {
+                api_url: "https://quote-api.dflow.net".to_string(),
+                api_key,
             }),
             ..Default::default()
         };
