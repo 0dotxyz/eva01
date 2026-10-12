@@ -247,24 +247,6 @@ macro_rules! ward {
     };
 }
 
-/// `url` reduced to scheme and host, for logs: RPC and provider URLs commonly carry an API token in
-/// the path or query (e.g. the Yellowstone x-token appended to derive the RPC URL).
-pub fn redact_url(url: &str) -> String {
-    let (scheme, rest) = match url.split_once("://") {
-        Some((scheme, rest)) => (Some(scheme), rest),
-        None => (None, url),
-    };
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let host = &rest[..host_end];
-    // Credentials in the authority (user:pass@host) are dropped as well.
-    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
-    let suffix = if host_end < rest.len() { "/…" } else { "" };
-    match scheme {
-        Some(scheme) => format!("{scheme}://{host}{suffix}"),
-        None => format!("{host}{suffix}"),
-    }
-}
-
 pub fn log_genuine_error(prefix: &str, error: Error) {
     match error.downcast::<anchor_lang::error::Error>() {
         Ok(error) => match error {
@@ -342,29 +324,6 @@ mod tests {
 
         assert_eq!(super::decode_bank(&data).unwrap().mint, bank.mint);
         assert!(super::decode_bank(&data[1..]).is_err());
-    }
-
-    use super::redact_url;
-
-    #[test]
-    fn redact_url_keeps_only_scheme_and_host() {
-        assert_eq!(
-            redact_url("https://rpc.example.com/abcd-secret-token"),
-            "https://rpc.example.com/…"
-        );
-        assert_eq!(
-            redact_url("https://rpc.example.com?api-key=secret"),
-            "https://rpc.example.com/…"
-        );
-        assert_eq!(
-            redact_url("https://user:pass@rpc.example.com/x"),
-            "https://rpc.example.com/…"
-        );
-        assert_eq!(
-            redact_url("https://rpc.example.com"),
-            "https://rpc.example.com"
-        );
-        assert_eq!(redact_url("rpc.example.com/token"), "rpc.example.com/…");
     }
 
     use crate::utils::find_oracle_keys;
