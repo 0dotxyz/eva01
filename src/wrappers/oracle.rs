@@ -5,8 +5,10 @@ use marginfi::state::{
     price::{OraclePriceFeedAdapter, PriceAdapter},
 };
 use marginfi_type_crate::types::{Bank, OraclePriceType, OracleSetup, PriceBias};
-use solana_program::pubkey::Pubkey;
-use solana_sdk::{account::Account, account_info::IntoAccountInfo, clock::Clock};
+use solana_account::Account;
+use solana_account_info::IntoAccountInfo;
+use solana_clock::Clock;
+use solana_pubkey::Pubkey;
 
 use crate::{cache::Cache, utils::staked_onramp};
 

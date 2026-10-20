@@ -1,4 +1,4 @@
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 use std::str::FromStr;
 
 #[derive(Clone, Debug)]
@@ -180,7 +180,7 @@ fn parse_pubkey_list(env_var: &str) -> anyhow::Result<Vec<Pubkey>> {
 mod tests {
     use figment::Jail;
     use serial_test::serial;
-    use solana_sdk::signature::Keypair;
+    use solana_keypair::Keypair;
 
     use super::*;
 

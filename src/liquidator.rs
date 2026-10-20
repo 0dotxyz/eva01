@@ -39,10 +39,12 @@ use marginfi_type_crate::{
     },
 };
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use solana_account_info::IntoAccountInfo;
 use solana_client::rpc_client::RpcClient;
+use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
-use solana_program::pubkey::Pubkey;
-use solana_sdk::{account_info::IntoAccountInfo, clock::Clock, signature::Keypair};
+use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
 use std::sync::atomic::Ordering;
 use std::{
     cmp::min,
@@ -186,6 +188,7 @@ impl Liquidator {
             config.swap_mint,
             dex_client,
             dex_gate,
+            config.slippage_bps,
             config.min_profit,
         )?;
 
@@ -279,10 +282,11 @@ impl Liquidator {
                     .collect();
 
                 // Hand ranked intents to the execution layer concurrently, bounded to
-                // MAX_CONCURRENT_LIQUIDATIONS in-flight. Each try_execute JIT-buys the liability
-                // shortfall, simulate-first cranks stale oracles, and lands a Jito bundle (with a
-                // sequential RPC fallback). Workers pull the next-highest-profit intent from the
-                // shared queue, so a burst of liquidatable accounts is worked in parallel.
+                // MAX_CONCURRENT_LIQUIDATIONS in-flight. Each try_execute sells the collateral
+                // for the liability in-tx (or JIT-buys the liability), simulates first, and lands
+                // a Jito bundle (with a sequential RPC fallback). Workers pull the next-highest-
+                // profit intent from the shared queue, so a burst of liquidatable accounts is
+                // worked in parallel.
                 if !intents.is_empty() {
                     let worker_count = MAX_CONCURRENT_LIQUIDATIONS.min(intents.len());
                     let queue = Mutex::new(intents.into_iter());
@@ -550,7 +554,7 @@ impl Liquidator {
             liab_bank: liab_bank_pk,
             asset_amount: slippage_adjusted_asset_amount,
             liab_amount: slippage_adjusted_liab_amount,
-            profit: liquidation_amounts.liquidator_profit,
+            profit: liquidation_amounts.liquidator_profit * I80F48!(0.90),
         })))
     }
 

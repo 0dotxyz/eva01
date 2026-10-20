@@ -1,7 +1,7 @@
 use log::{debug, error, info};
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::clock::Clock;
-use solana_sdk::sysvar::{self};
+use solana_clock::Clock;
+use solana_sdk_ids::sysvar;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

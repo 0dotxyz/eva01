@@ -23,11 +23,12 @@ use mints::MintsCache;
 use oracles::OraclesCache;
 use solana_address_lookup_table_interface::{instruction::*, state::AddressLookupTable};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
+use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::{
-    clock::Clock, message::AddressLookupTableAccount, pubkey::Pubkey, signature::Keypair,
-    signer::Signer,
-};
+use solana_keypair::Keypair;
+use solana_message::AddressLookupTableAccount;
+use solana_pubkey::Pubkey;
+use solana_signer::Signer;
 use tokens::TokensCache;
 
 use crate::{
@@ -208,7 +209,7 @@ impl Cache {
     ) -> anyhow::Result<()> {
         let ix = deactivate_lookup_table(lut_key, signer_keypair.pubkey());
         let recent_blockhash = rpc_client.get_latest_blockhash()?;
-        let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        let tx = solana_transaction::Transaction::new_signed_with_payer(
             &[ix],
             Some(&signer_keypair.pubkey()),
             &[signer_keypair],
@@ -261,7 +262,7 @@ impl Cache {
                     continue;
                 }
             };
-            let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+            let tx = solana_transaction::Transaction::new_signed_with_payer(
                 &[ix],
                 Some(&signer_keypair.pubkey()),
                 &[signer_keypair],
@@ -309,7 +310,7 @@ fn create_lut(
     );
 
     let recent_blockhash = rpc_client.get_latest_blockhash()?;
-    let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+    let tx = solana_transaction::Transaction::new_signed_with_payer(
         &[create_ix],
         Some(&signer_keypair.pubkey()),
         &[signer_keypair],
@@ -348,7 +349,7 @@ fn extend_lut(
         );
 
         let recent_blockhash = rpc_client.get_latest_blockhash()?;
-        let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        let tx = solana_transaction::Transaction::new_signed_with_payer(
             &[ix],
             Some(&signer_keypair.pubkey()),
             &[signer_keypair],

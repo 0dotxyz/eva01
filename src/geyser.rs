@@ -9,8 +9,8 @@ use crossbeam::channel::Sender;
 use futures::StreamExt;
 use log::{error, info, warn};
 use marginfi_type_crate::types::MarginfiAccount;
-use solana_program::pubkey::Pubkey;
-use solana_sdk::account::Account;
+use solana_account::Account;
+use solana_pubkey::Pubkey;
 use std::{
     collections::HashMap,
     sync::{

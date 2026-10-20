@@ -42,15 +42,13 @@ use solana_client::{
     rpc_request::{RpcError, RpcResponseErrorData},
 };
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::{
-    instruction::{AccountMeta, Instruction},
-    pubkey::Pubkey,
-    signature::Keypair,
-    signer::Signer,
-    transaction::Transaction,
-};
+use solana_instruction::{AccountMeta, Instruction};
+use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
 use solana_sdk_ids::system_program;
+use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
+use solana_transaction::Transaction;
 
 use crate::{cache::Cache, clock_manager, config::Eva01Config};
 

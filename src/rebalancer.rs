@@ -6,8 +6,8 @@ use solana_commitment_config::CommitmentLevel;
 use solana_dex_superagg::{
     ClientConfig, DexSuperAggClient, DflowConfig, JupiterConfig, TitanConfig,
 };
-use solana_program::pubkey::Pubkey;
-use solana_sdk::signature::Keypair;
+use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -27,12 +27,12 @@ const MIN_REBALANCE_VALUE: I80F48 = I80F48!(1.0);
 
 /// Never sell for less than this fraction of the oracle value: further off, the market (or a pushed
 /// pool) is wrong and holding until the next pass beats dumping. Within the ~8.5% liquidation margin.
-pub const MIN_SELL_PRICE_VS_ORACLE: I80F48 = I80F48!(0.95);
+const MIN_SELL_PRICE_VS_ORACLE: I80F48 = I80F48!(0.95);
 
-/// The rebalancer keeps the liquidator holding only the swap mint (USDC): every other token it ends
-/// up with — seized collateral from a liquidation, or a JIT-buy overshoot — is sold back to USDC on
-/// the next pass. There is no inventory to maintain and nothing is bought here (liabilities are
-/// funded just-in-time during liquidation), so it is a pure sell-to-USDC sweep.
+/// The rebalancer keeps the liquidator holding only the swap mint (USDC). Every other token it
+/// ends up with (a liquidation's leftover liability or seized collateral, or a JIT-buy overshoot)
+/// is sold back to USDC on the next pass. Nothing is bought here and no inventory is maintained:
+/// liabilities are funded during the liquidation itself, so this is a pure sell-to-USDC sweep.
 pub struct Rebalancer {
     swap_mint: Pubkey,
     tokio_rt: Runtime,
@@ -216,10 +216,9 @@ impl Rebalancer {
 
         let (prepared, signature) = self.tokio_rt.block_on(async {
             let _permit = self.dex_gate.acquire().await?;
-            // `max_in = amount`: sell exactly the balance, never bump the input.
             let prepared = self
                 .dex_client
-                .build_swap_transaction(input_mint, output_mint, amount, min_out, Some(amount))
+                .build_swap_transaction(input_mint, output_mint, amount, min_out)
                 .await?;
             let signature = self
                 .dex_client
@@ -229,10 +228,10 @@ impl Rebalancer {
         })?;
 
         info!(
-            "Swap successful via {:?}! Transaction: {}, Output: {} tokens of mint {}",
-            prepared.aggregator, signature, prepared.out_amount, output_mint
+            "Swap successful via {:?}! Transaction: {}, at least {} tokens of mint {}",
+            prepared.aggregator, signature, prepared.min_out_amount, output_mint
         );
 
-        Ok(prepared.out_amount)
+        Ok(prepared.min_out_amount)
     }
 }

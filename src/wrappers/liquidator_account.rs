@@ -13,23 +13,23 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use marginfi_type_crate::constants::{
     ASSET_TAG_DEFAULT, ASSET_TAG_JUPLEND, ASSET_TAG_KAMINO, ASSET_TAG_SOL, ASSET_TAG_STAKED,
 };
+use solana_account::ReadableAccount;
+use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_client::rpc_client::RpcClient;
-
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
-use solana_program::pubkey::Pubkey;
-use solana_sdk::{
-    account::ReadableAccount,
-    instruction::Instruction,
-    message::{v0::Message, AddressLookupTableAccount, VersionedMessage},
-    signature::{Keypair, Signature},
-    signer::Signer,
-    transaction::VersionedTransaction,
-};
+use solana_dex_superagg::SwapInstructions;
+use solana_instruction::Instruction;
+use solana_keypair::Keypair;
+use solana_message::{v0::Message, AddressLookupTableAccount, VersionedMessage};
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use solana_signer::Signer;
+use solana_transaction::versioned::VersionedTransaction;
 use std::{collections::HashSet, sync::Arc};
 
 /// Collateral tags `build_liquidate_tx` can withdraw. Staked banks hold a plain SPL LST, so they go
@@ -92,14 +92,15 @@ impl LiquidatorAccount {
         })
     }
 
-    /// Assemble (compile + sign) the liquidation transaction for the given account and amounts.
-    /// Pure tx construction used by the execution-layer `InventoryStrategy`. Returns the signed tx
-    /// and an optional temporary-LUT key created to fit an oversized tx.
+    /// Compiles and signs the liquidation transaction. With `swap`, its instructions (selling the
+    /// seized collateral for the liability) go between the withdraw and the repay. Returns the
+    /// transaction and the key of a temporary LUT, if one had to be created to fit it.
     pub fn build_liquidate_tx(
         &self,
         account: &PreparedLiquidatableAccount,
         asset_amount: I80F48,
         liab_amount: I80F48,
+        swap: Option<&SwapInstructions>,
     ) -> Result<(VersionedTransaction, Option<Pubkey>)> {
         let PreparedLiquidatableAccount {
             liquidatee_account,
@@ -231,6 +232,10 @@ impl LiquidatorAccount {
         ixs.extend(init_record_ix);
         ixs.push(start_ix);
         ixs.push(withdraw_ix);
+        if let Some(swap) = swap {
+            ixs.extend(swap.instructions.iter().cloned());
+            luts.extend(self.fetch_luts(&swap.address_lookup_tables)?);
+        }
 
         let liab_mint_wrapper = self.cache.mints.try_get_account(&liab_mint)?;
         let repay_ix = make_repay_ix(
@@ -324,34 +329,103 @@ impl LiquidatorAccount {
         Ok(self.rpc_client.send_and_confirm_transaction(&tx)?)
     }
 
+    /// Simulates `tx`. On failure returns the program error with the last log lines.
+    pub fn simulate_tx(&self, tx: &VersionedTransaction) -> Result<()> {
+        let result = self.rpc_client.simulate_transaction(tx)?.value;
+        match result.err {
+            None => Ok(()),
+            Some(err) => {
+                let logs = result.logs.unwrap_or_default();
+                let tail = logs.len().saturating_sub(5);
+                Err(anyhow!(
+                    "simulation failed: {:?}; logs: {:?}",
+                    err,
+                    &logs[tail..]
+                ))
+            }
+        }
+    }
+
+    fn fetch_luts(&self, keys: &[Pubkey]) -> Result<Vec<AddressLookupTableAccount>> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+        self.rpc_client
+            .get_multiple_accounts(keys)?
+            .into_iter()
+            .zip(keys)
+            .map(|(account, key)| {
+                let account = account.ok_or_else(|| anyhow!("Lookup table {} not found", key))?;
+                Ok(AddressLookupTableAccount {
+                    key: *key,
+                    addresses: AddressLookupTable::deserialize(&account.data)?
+                        .addresses
+                        .to_vec(),
+                })
+            })
+            .collect()
+    }
+
     fn compile_tx_with_lut_fit(
         &self,
         signer_pk: &Pubkey,
         ixs: &[Instruction],
         luts: &mut Vec<AddressLookupTableAccount>,
     ) -> Result<(VersionedTransaction, Option<Pubkey>)> {
-        let mut tx = self.compile_tx(signer_pk, ixs, luts)?;
-        let mut temp_lut: Option<Pubkey> = None;
-
-        // Proactive LUT fit: if the tx exceeds the wire-size limit, pack its accounts into a
-        // freshly-created targeted LUT and recompile. The caller deactivates the temp LUT once
-        // the tx lands. (The 64-account-lock cap can't be fixed by a LUT, so that still fails.)
-        if bincode::serialize(&tx)?.len() > MAX_TX_SIZE {
-            let all_accounts: Vec<Pubkey> = ixs
-                .iter()
-                .flat_map(|ix| ix.accounts.iter().map(|a| a.pubkey))
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            let lut = self
-                .cache
-                .get_targeted_lut(&self.rpc_client, &self.signer, all_accounts)?;
-            temp_lut = Some(lut.key);
-            luts.push(lut);
-            tx = self.compile_tx(signer_pk, ixs, luts)?;
+        let tx = self.compile_tx(signer_pk, ixs, luts)?;
+        if bincode::serialize(&tx)?.len() <= MAX_TX_SIZE {
+            return Ok((tx, None));
         }
 
-        Ok((tx, temp_lut))
+        // Too large: put the transaction's accounts into a new lookup table and recompile. The
+        // caller deactivates that table once the transaction lands. Measure with a stand-in table
+        // first, so a transaction that wouldn't fit even then costs no table. (A table doesn't
+        // help with the account-lock limit; that still fails.)
+        let all_accounts: Vec<Pubkey> = ixs
+            .iter()
+            .flat_map(|ix| ix.accounts.iter().map(|a| a.pubkey))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        luts.push(AddressLookupTableAccount {
+            key: Pubkey::new_unique(),
+            addresses: all_accounts.clone(),
+        });
+        let size = bincode::serialize(&self.compile_tx(signer_pk, ixs, luts)?)?.len();
+        luts.pop();
+        if size > MAX_TX_SIZE {
+            return Err(anyhow!(
+                "transaction is {} bytes even with a lookup table (max {})",
+                size,
+                MAX_TX_SIZE
+            ));
+        }
+
+        let lut = self
+            .cache
+            .get_targeted_lut(&self.rpc_client, &self.signer, all_accounts)?;
+        let temp_lut = lut.key;
+        luts.push(lut);
+        match self.compile_tx(signer_pk, ixs, luts) {
+            Ok(tx) => Ok((tx, Some(temp_lut))),
+            Err(e) => {
+                self.deactivate_luts(vec![temp_lut]);
+                Err(e)
+            }
+        }
+    }
+
+    /// Deactivates temporary lookup tables whose transaction was abandoned, so their rent can be
+    /// reclaimed later.
+    pub fn deactivate_luts(&self, keys: Vec<Pubkey>) {
+        for key in keys {
+            if let Err(e) = self
+                .cache
+                .deactivate_lut(&self.rpc_client, &self.signer, key)
+            {
+                warn!("Failed to deactivate temporary LUT {}: {}", key, e);
+            }
+        }
     }
 
     fn compile_tx(

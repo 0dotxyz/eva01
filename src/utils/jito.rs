@@ -19,14 +19,12 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use solana_client::rpc_client::RpcClient;
-use solana_program::pubkey::Pubkey;
-use solana_sdk::{
-    message::{v0, VersionedMessage},
-    signature::Keypair,
-    signer::Signer,
-    transaction::VersionedTransaction,
-};
+use solana_keypair::Keypair;
+use solana_message::{v0, VersionedMessage};
+use solana_pubkey::Pubkey;
+use solana_signer::Signer;
 use solana_system_interface::instruction::transfer;
+use solana_transaction::versioned::VersionedTransaction;
 
 const DEFAULT_BUNDLE_ENDPOINT: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
 /// The well-known static Jito tip accounts. These rarely change; a bundle must tip one of them.
@@ -485,7 +483,7 @@ mod tests {
 
     fn signed(byte: u8) -> VersionedTransaction {
         VersionedTransaction {
-            signatures: vec![solana_sdk::signature::Signature::from([byte; 64])],
+            signatures: vec![solana_signature::Signature::from([byte; 64])],
             ..Default::default()
         }
     }

@@ -9,8 +9,9 @@ use std::{
 
 use anyhow::Result;
 use log::{info, warn};
+use solana_account::Account;
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{account::Account, pubkey::Pubkey};
+use solana_pubkey::Pubkey;
 
 use crate::{
     cache::Cache,

@@ -4,7 +4,7 @@ use std::{
 };
 
 use indexmap::IndexMap;
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 
 use crate::wrappers::marginfi_account::MarginfiAccountWrapper;
 use anyhow::{anyhow, Result};

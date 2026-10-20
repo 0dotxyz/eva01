@@ -12,13 +12,14 @@ pub mod inventory;
 
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 use anyhow::Result;
-use solana_program::pubkey::Pubkey;
-use solana_sdk::transaction::VersionedTransaction;
+use solana_pubkey::Pubkey;
+use solana_transaction::versioned::VersionedTransaction;
 
 /// An ordered set of transactions that, executed in sequence, perform one liquidation.
 ///
-/// For the inventory strategy this is `[crank?] [buy?] [liquidate]`. The executor submits
-/// `txs` as a single atomic Jito bundle, falling back to sending them sequentially over RPC.
+/// For the inventory strategy this is `[liquidate]` (collateral sold inside the tx) or
+/// `[buy] [liquidate]`. The executor submits `txs` as a single atomic Jito bundle, falling back to
+/// sending them sequentially over RPC.
 pub struct ExecutionPlan {
     /// Transactions in execution order. Earlier txs' state is visible to later ones.
     pub txs: Vec<VersionedTransaction>,

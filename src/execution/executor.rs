@@ -1,7 +1,7 @@
 //! Submission + orchestration engine for the execution layer.
 //!
 //! `try_execute()` turns a prepared liquidation into a landed liquidation:
-//! 1. ask the strategy to assemble the txs (`[buy?] [liquidate]`),
+//! 1. ask the strategy to assemble the txs (`[liquidate]` or `[buy] [liquidate]`),
 //! 2. simulate-first: skip the target when the program reports the liquidation would fail,
 //! 3. submit as an atomic Jito bundle (with a tip), falling back to sequential RPC sends.
 //!
@@ -21,11 +21,10 @@ use anyhow::{anyhow, Result};
 use log::{debug, info, warn};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
-use solana_sdk::{
-    pubkey::Pubkey,
-    signature::{Keypair, Signature},
-    transaction::VersionedTransaction,
-};
+use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
 
 use crate::cache::Cache;
 use crate::utils::jito::{BundleOutcome, JitoClient, TipEstimator};

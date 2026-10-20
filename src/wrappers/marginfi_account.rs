@@ -2,7 +2,7 @@ use crate::cache::Cache;
 
 use crate::wrappers::bank::BankWrapper;
 use marginfi::state::bank::BankImpl;
-use solana_sdk::clock::Clock;
+use solana_clock::Clock;
 
 use super::oracle::{oracle_account_keys, OracleWrapperTrait};
 use anyhow::Result;
@@ -14,7 +14,7 @@ use marginfi_type_crate::{
         MarginfiAccount, OracleSetup,
     },
 };
-use solana_program::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 use std::collections::HashSet;
 
 /// Principal plus outstanding and accrued premium (zero unless the bank has `PREMIUM_ACTIVE`).
