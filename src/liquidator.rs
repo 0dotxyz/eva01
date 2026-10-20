@@ -12,7 +12,7 @@ use crate::{
             is_seizable_asset_tag, LiquidatorAccount, PreparedLiquidatableAccount,
         },
         marginfi_account::{MarginfiAccountWrapper, ObservationAccounts},
-        oracle::{OracleWrapper, OracleWrapperTrait},
+        oracle::{oracle_publish_time, OracleWrapper, OracleWrapperTrait},
     },
 };
 use anchor_lang::AccountDeserialize;
@@ -35,10 +35,11 @@ use marginfi_type_crate::{
     constants::BANKRUPT_THRESHOLD,
     types::{
         reconcile_emode_configs, BalanceSide, BankOperationalState, EmodeConfig, HealthPriceMode,
-        MarginfiAccount, MarginfiGroup, RequirementType,
+        MarginfiAccount, MarginfiGroup, OracleSetup, RequirementType,
     },
 };
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use solana_account::Account;
 use solana_account_info::IntoAccountInfo;
 use solana_client::rpc_client::RpcClient;
 use solana_clock::Clock;
@@ -346,6 +347,28 @@ impl Liquidator {
         }
     }
 
+    /// Our clock lags the chain, so a fresh Scope price can look "published in the future" and get
+    /// rejected. Moving the clock up to each new publish time prevents that.
+    fn advance_clock_to_oracle(&self, address: &Pubkey, account: &Account, banks: &[Pubkey]) {
+        let scope_entries: Vec<u16> = banks
+            .iter()
+            .filter_map(|bank| self.cache.banks.try_get_bank(bank).ok())
+            .filter(|wrapper| {
+                matches!(
+                    wrapper.bank.config.oracle_setup,
+                    OracleSetup::Scope | OracleSetup::ScopeKamino | OracleSetup::ScopeJuplend
+                ) && wrapper.bank.config.oracle_keys[0] == *address
+            })
+            .map(|wrapper| wrapper.bank.config.scope_entry_index)
+            .collect();
+
+        if let Some(publish_time) = oracle_publish_time(account, &scope_entries) {
+            if let Err(e) = clock_manager::advance_to(&self.cache.clock, publish_time) {
+                error!("Failed to advance the clock to the {address} publish time: {e}");
+            }
+        }
+    }
+
     fn handle_geyser_update(
         &self,
         update: GeyserUpdate,
@@ -361,9 +384,11 @@ impl Liquidator {
 
         match account_type {
             AccountType::Oracle => {
+                let banks = self.cache.banks.get_banks_for_oracle(&address)?;
+                self.advance_clock_to_oracle(&address, &account, &banks);
                 self.cache.oracles.try_update(&address, account)?;
 
-                for bank in self.cache.banks.get_banks_for_oracle(&address)? {
+                for bank in banks {
                     self.add_accounts_for_bank(&bank, account_addresses)?;
                 }
             }

@@ -79,6 +79,11 @@ package = "marginfi-type-crate"
 default-features = false
 features = ["client"]
 
+[dependencies.scope-mocks]
+git = "https://github.com/mrgnlabs/marginfi-v2"
+tag = "mrgn-0.1.12-rc2"
+features = ["no-entrypoint"]
+
 [dependencies.marginfi]
 git = "https://github.com/mrgnlabs/marginfi-v2"
 tag = "mrgn-0.1.12-rc2"

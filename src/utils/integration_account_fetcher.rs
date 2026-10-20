@@ -19,7 +19,7 @@ use crate::{
 };
 use crossbeam::channel::Sender;
 
-const FETCH_INTERVAL: Duration = Duration::from_secs(1800);
+const FETCH_INTERVAL: Duration = Duration::from_secs(60);
 
 // Kamino MinimalReserve: 8-byte discriminator + 8-byte version, then slot:u64 at [16..24]
 const KAMINO_SLOT_OFFSET: usize = 16;

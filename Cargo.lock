@@ -1771,6 +1771,7 @@ dependencies = [
  "rayon",
  "reqwest",
  "rust_decimal",
+ "scope-mocks",
  "serde",
  "serde_json",
  "serial_test",

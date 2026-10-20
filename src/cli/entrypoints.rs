@@ -119,15 +119,13 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
 
     thread::spawn(move || {
         if let Err(e) = liquidator.start() {
-            error!("The Liquidator service failed! {:?}", e);
-            panic!("Fatal error in the Liquidator service!");
+            exit_on_fatal("The Liquidator service", e);
         }
     });
 
     thread::spawn(move || {
         if let Err(e) = geyser_service.start() {
-            error!("GeyserService failed! {:?}", e);
-            panic!("Fatal error in GeyserService!");
+            exit_on_fatal("GeyserService", e);
         }
     });
 
@@ -138,4 +136,11 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     info!("The Main loop stopped.");
 
     Ok(())
+}
+
+/// A service thread that dies leaves the process up but deaf: panicking would only end that
+/// thread. Exit instead, so the supervisor restarts eva with a fresh cache.
+fn exit_on_fatal(service: &str, error: anyhow::Error) -> ! {
+    error!("{} failed, exiting: {:?}", service, error);
+    std::process::exit(1);
 }

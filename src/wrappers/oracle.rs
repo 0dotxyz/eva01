@@ -1,10 +1,16 @@
+use anchor_lang::AccountDeserialize;
 use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
 use marginfi::state::{
     marginfi_account::get_remaining_accounts_per_bank,
     price::{OraclePriceFeedAdapter, PriceAdapter},
 };
-use marginfi_type_crate::types::{Bank, OraclePriceType, OracleSetup, PriceBias};
+use marginfi_type_crate::{
+    pdas::SCOPE_PROGRAM_ID,
+    types::{Bank, OraclePriceType, OracleSetup, PriceBias},
+};
+use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
+use scope_mocks::state::{ScopeOraclePrices, SCOPE_ORACLE_PRICES_DISCRIMINATOR};
 use solana_account::Account;
 use solana_account_info::IntoAccountInfo;
 use solana_clock::Clock;
@@ -77,6 +83,28 @@ pub fn oracle_account_keys(bank: &Bank, bank_address: &Pubkey) -> Result<Vec<Pub
     }
 
     Ok(addresses)
+}
+
+/// Publish time of a Pyth price, or the newest of the given Scope entries (only the ones our banks
+/// use). `None` for other accounts and never-refreshed entries.
+pub fn oracle_publish_time(account: &Account, scope_entries: &[u16]) -> Option<i64> {
+    if account.owner == SCOPE_PROGRAM_ID {
+        let data = account.data.as_slice();
+        if data.get(..8)? != SCOPE_ORACLE_PRICES_DISCRIMINATOR {
+            return None;
+        }
+        let prices: &ScopeOraclePrices = bytemuck::try_from_bytes(data.get(8..)?).ok()?;
+        return scope_entries
+            .iter()
+            .filter_map(|&index| prices.prices.get(index as usize))
+            .filter_map(|entry| i64::try_from(entry.unix_timestamp).ok())
+            .filter(|&timestamp| timestamp > 0)
+            .max();
+    }
+
+    PriceUpdateV2::try_deserialize(&mut account.data.as_slice())
+        .ok()
+        .map(|update| update.price_message.publish_time)
 }
 
 pub trait OracleWrapperTrait {
@@ -161,5 +189,86 @@ impl OracleWrapperTrait for OracleWrapper {
 
     fn build(cache: &Cache, clock: &Clock, bank_address: &Pubkey) -> Result<Self> {
         Self::build_inner(cache, clock, bank_address, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anchor_lang::AccountSerialize;
+    use pyth_solana_receiver_sdk::price_update::{PriceFeedMessage, VerificationLevel};
+    use scope_mocks::state::ScopeDatedPrice;
+
+    fn scope_account(entries: &[(usize, u64)]) -> Account {
+        let mut prices: ScopeOraclePrices = bytemuck::Zeroable::zeroed();
+        for &(index, unix_timestamp) in entries {
+            prices.prices[index] = ScopeDatedPrice {
+                unix_timestamp,
+                ..ScopeDatedPrice::default()
+            };
+        }
+        let mut data = SCOPE_ORACLE_PRICES_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(bytemuck::bytes_of(&prices));
+        Account {
+            owner: SCOPE_PROGRAM_ID,
+            data,
+            ..Account::default()
+        }
+    }
+
+    #[test]
+    fn scope_publish_time_reads_only_the_priced_entries() {
+        let account = scope_account(&[(3, 1_000), (12, 1_050), (40, 9_999)]);
+
+        assert_eq!(oracle_publish_time(&account, &[12]), Some(1_050));
+        assert_eq!(oracle_publish_time(&account, &[3, 12]), Some(1_050));
+        // Entries no bank uses are ignored.
+        assert_eq!(oracle_publish_time(&account, &[3]), Some(1_000));
+        // Never refreshed, out of range, or no entries.
+        assert_eq!(oracle_publish_time(&account, &[7]), None);
+        assert_eq!(oracle_publish_time(&account, &[600]), None);
+        assert_eq!(oracle_publish_time(&account, &[]), None);
+        // Not a valid i64 timestamp.
+        let account = scope_account(&[(12, u64::MAX)]);
+        assert_eq!(oracle_publish_time(&account, &[12]), None);
+    }
+
+    #[test]
+    fn scope_publish_time_rejects_foreign_accounts() {
+        let mut account = scope_account(&[(12, 1_050)]);
+        account.data[0] ^= 0xff;
+        assert_eq!(oracle_publish_time(&account, &[12]), None);
+
+        let mut account = scope_account(&[(12, 1_050)]);
+        account.owner = Pubkey::new_unique();
+        assert_eq!(oracle_publish_time(&account, &[12]), None);
+    }
+
+    #[test]
+    fn pyth_publish_time_is_read_from_the_price_message() {
+        let update = PriceUpdateV2 {
+            write_authority: Pubkey::new_unique(),
+            verification_level: VerificationLevel::Full,
+            price_message: PriceFeedMessage {
+                feed_id: [7; 32],
+                price: 100,
+                conf: 1,
+                exponent: -2,
+                publish_time: 1_234,
+                prev_publish_time: 1_233,
+                ema_price: 100,
+                ema_conf: 1,
+            },
+            posted_slot: 5,
+        };
+        let mut data = vec![];
+        update.try_serialize(&mut data).unwrap();
+        let account = Account {
+            data,
+            ..Account::default()
+        };
+
+        assert_eq!(oracle_publish_time(&account, &[]), Some(1_234));
+        assert_eq!(oracle_publish_time(&Account::default(), &[]), None);
     }
 }
