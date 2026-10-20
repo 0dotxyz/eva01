@@ -43,6 +43,20 @@ pub fn is_seizable_asset_tag(tag: u8) -> bool {
 
 /// Max serialized Solana transaction size on the wire.
 const MAX_TX_SIZE: usize = 1232;
+/// Runtime cap on accounts one transaction may load, LUT-resolved or not.
+const MAX_TX_ACCOUNT_LOCKS: usize = 64;
+
+/// Unique accounts the compiled transaction will lock: the payer, every program and every account
+/// meta. (The blockhash is not an account.)
+fn locked_accounts(signer_pk: &Pubkey, ixs: &[Instruction]) -> usize {
+    ixs.iter()
+        .flat_map(|ix| {
+            std::iter::once(ix.program_id).chain(ix.accounts.iter().map(|meta| meta.pubkey))
+        })
+        .chain(std::iter::once(*signer_pk))
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
 
 pub struct PreparedLiquidatableAccount {
     pub liquidatee_account: MarginfiAccountWrapper,
@@ -372,6 +386,17 @@ impl LiquidatorAccount {
         ixs: &[Instruction],
         luts: &mut Vec<AddressLookupTableAccount>,
     ) -> Result<(VersionedTransaction, Option<Pubkey>)> {
+        // Over the account-lock limit nothing helps, least of all a lookup table: fail before
+        // measuring sizes or paying for a table, so the caller can fall back to a smaller plan.
+        let locks = locked_accounts(signer_pk, ixs);
+        if locks > MAX_TX_ACCOUNT_LOCKS {
+            return Err(anyhow!(
+                "transaction loads {} accounts (max {})",
+                locks,
+                MAX_TX_ACCOUNT_LOCKS
+            ));
+        }
+
         let tx = self.compile_tx(signer_pk, ixs, luts)?;
         if bincode::serialize(&tx)?.len() <= MAX_TX_SIZE {
             return Ok((tx, None));
@@ -467,6 +492,32 @@ impl LiquidatorAccount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use solana_instruction::AccountMeta;
+
+    #[test]
+    fn locked_accounts_counts_unique_payer_programs_and_metas() {
+        let payer = Pubkey::new_unique();
+        let program = Pubkey::new_unique();
+        let shared = Pubkey::new_unique();
+        let ixs = [
+            Instruction::new_with_bytes(
+                program,
+                &[],
+                vec![
+                    AccountMeta::new(payer, true),
+                    AccountMeta::new(shared, false),
+                ],
+            ),
+            Instruction::new_with_bytes(
+                program,
+                &[],
+                vec![AccountMeta::new_readonly(shared, false)],
+            ),
+        ];
+        // payer + program + shared: duplicates and the payer meta collapse.
+        assert_eq!(locked_accounts(&payer, &ixs), 3);
+    }
 
     fn contains_stale_oracles(stale_oracles: &HashSet<Pubkey>, account_oracles: &[Pubkey]) -> bool {
         account_oracles
