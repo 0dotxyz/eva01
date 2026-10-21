@@ -49,12 +49,14 @@ fn buy_shortfall(repay_amount: I80F48, wallet_balance: u64) -> u64 {
 }
 
 /// Programs marginfi lets a swap call between the start and end of a receivership: the venues'
-/// routers, and the ATA program because a route may create intermediate token accounts.
-const RECEIVERSHIP_SWAP_PROGRAMS: [Pubkey; 4] = [
+/// routers. The ATA program is whitelisted there too, but marginfi's instruction check rejects
+/// any instruction with fewer than 8 bytes of data (`StartNotFirst`), which an ATA creation is,
+/// so a route that creates an intermediate token account can never land; leaving the ATA program
+/// out makes the aggregator pick a route without one instead.
+const RECEIVERSHIP_SWAP_PROGRAMS: [Pubkey; 3] = [
     Pubkey::from_str_const("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"),
     Pubkey::from_str_const("T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT"),
     Pubkey::from_str_const("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH"),
-    Pubkey::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"),
 ];
 
 pub struct InventoryStrategy {
