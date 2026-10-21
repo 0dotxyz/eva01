@@ -11,16 +11,49 @@ use solana_pubkey::Pubkey;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::{
     runtime::{Builder, Runtime},
-    sync::Semaphore,
+    sync::{Semaphore, SemaphorePermit},
 };
 
 /// Concurrent DEX operations allowed across the liquidation workers and the rebalancer. Each one
 /// costs several aggregator round-trips, so an unbounded burst trips the Jupiter rate limit (429)
 /// and the failing targets then sit in the executor's backoff.
 const MAX_CONCURRENT_DEX_CALLS: usize = 2;
+/// Minimum spacing between DEX operations starting. Two concurrent operations that each make
+/// two or three Jupiter requests still burst past its per-second gateway limit at startup; this
+/// keeps the request rate steady instead.
+const DEX_CALL_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Admission to the DEX aggregators: at most [`MAX_CONCURRENT_DEX_CALLS`] operations in flight,
+/// starting no closer together than [`DEX_CALL_MIN_INTERVAL`].
+pub struct DexGate {
+    semaphore: Semaphore,
+    last_grant: tokio::sync::Mutex<Instant>,
+}
+
+impl DexGate {
+    fn new() -> Self {
+        Self {
+            semaphore: Semaphore::new(MAX_CONCURRENT_DEX_CALLS),
+            last_grant: tokio::sync::Mutex::new(Instant::now() - DEX_CALL_MIN_INTERVAL),
+        }
+    }
+
+    /// Waits for a slot and for the spacing, then holds the slot until the permit is dropped.
+    pub async fn acquire(&self) -> anyhow::Result<SemaphorePermit<'_>> {
+        let permit = self.semaphore.acquire().await?;
+        let mut last_grant = self.last_grant.lock().await;
+        let since = last_grant.elapsed();
+        if since < DEX_CALL_MIN_INTERVAL {
+            tokio::time::sleep(DEX_CALL_MIN_INTERVAL - since).await;
+        }
+        *last_grant = Instant::now();
+        Ok(permit)
+    }
+}
 
 /// Don't bother selling a position worth less than this (USD); the swap fee/dust isn't worth it.
 const MIN_REBALANCE_VALUE: I80F48 = I80F48!(1.0);
@@ -38,7 +71,7 @@ pub struct Rebalancer {
     tokio_rt: Runtime,
     cache: Arc<Cache>,
     dex_client: Arc<DexSuperAggClient>,
-    dex_gate: Arc<Semaphore>,
+    dex_gate: Arc<DexGate>,
     empty_stake_banks: HashSet<Pubkey>,
     unsweepable_mints: HashMap<Pubkey, u64>,
 }
@@ -79,7 +112,7 @@ impl Rebalancer {
             tokio_rt,
             cache,
             dex_client,
-            dex_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_DEX_CALLS)),
+            dex_gate: Arc::new(DexGate::new()),
             empty_stake_banks: HashSet::new(),
             unsweepable_mints: HashMap::new(),
         })
@@ -89,7 +122,7 @@ impl Rebalancer {
         Arc::clone(&self.dex_client)
     }
 
-    pub fn dex_gate(&self) -> Arc<Semaphore> {
+    pub fn dex_gate(&self) -> Arc<DexGate> {
         Arc::clone(&self.dex_gate)
     }
 

@@ -27,12 +27,10 @@ use solana_dex_superagg::{DexSuperAggClient, RouteRequest};
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
-use tokio::{
-    runtime::{Builder, Runtime},
-    sync::Semaphore,
-};
+use tokio::runtime::{Builder, Runtime};
 
 use crate::clock_manager;
+use crate::rebalancer::DexGate;
 use crate::wrappers::{
     liquidator_account::{
         locked_accounts, LiquidatorAccount, PreparedLiquidatableAccount, MAX_TX_ACCOUNT_LOCKS,
@@ -62,7 +60,7 @@ const RECEIVERSHIP_SWAP_PROGRAMS: [Pubkey; 3] = [
 pub struct InventoryStrategy {
     liquidator_account: Arc<LiquidatorAccount>,
     dex_client: Arc<DexSuperAggClient>,
-    dex_gate: Arc<Semaphore>,
+    dex_gate: Arc<DexGate>,
     tokio_rt: Runtime,
     swap_mint: Pubkey,
     slippage_bps: u16,
@@ -74,7 +72,7 @@ impl InventoryStrategy {
         liquidator_account: Arc<LiquidatorAccount>,
         swap_mint: Pubkey,
         dex_client: Arc<DexSuperAggClient>,
-        dex_gate: Arc<Semaphore>,
+        dex_gate: Arc<DexGate>,
         slippage_bps: u16,
         min_profit: f64,
     ) -> Result<Self> {
