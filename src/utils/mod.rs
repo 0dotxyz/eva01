@@ -1,6 +1,7 @@
 pub mod healthcheck;
 pub mod integration_account_fetcher;
 pub mod jito;
+pub mod lut_registry;
 pub mod pyth_cranker;
 
 use anyhow::{anyhow, Error, Result};
@@ -12,14 +13,14 @@ use marginfi_type_crate::{
     types::{Bank, BankConfig, BankVaultType},
 };
 use rayon::{iter::ParallelIterator, slice::ParallelSlice};
-use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig};
+use solana_account::Account;
+use solana_account_decoder_client_types::{UiAccountEncoding, UiDataSliceConfig};
 use solana_client::{
     rpc_client::RpcClient,
     rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
     rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType},
 };
-use solana_program::pubkey::Pubkey;
-use solana_sdk::account::Account;
+use solana_pubkey::Pubkey;
 use std::sync::{atomic::AtomicUsize, Arc};
 use yellowstone_grpc_proto::geyser::SubscribeUpdateAccountInfo;
 
@@ -81,9 +82,8 @@ pub fn batch_get_multiple_accounts(
                 let chunk_res = backoff::retry(ExponentialBackoff::default(), move || {
                     let chunk = chunk.clone();
 
-                    #[allow(deprecated)]
                     rpc_client
-                        .get_multiple_accounts_with_config(
+                        .get_multiple_ui_accounts_with_config(
                             &chunk,
                             RpcAccountInfoConfig {
                                 encoding: Some(UiAccountEncoding::Base64Zstd),
@@ -92,7 +92,10 @@ pub fn batch_get_multiple_accounts(
                         )
                         .map_err(backoff::Error::transient)
                 })?
-                .value;
+                .value
+                .into_iter()
+                .map(|account| account.and_then(|account| account.to_account()))
+                .collect::<Vec<_>>();
 
                 let fetched_chunk_size = chunk_res.len();
 
@@ -278,8 +281,7 @@ pub fn marginfi_account_by_authority(
     rpc_client: &RpcClient,
     marginfi_group_id: Pubkey,
 ) -> anyhow::Result<Vec<Pubkey>> {
-    #[allow(deprecated)]
-    let marginfi_account_address = rpc_client.get_program_accounts_with_config(
+    let marginfi_account_address = rpc_client.get_program_ui_accounts_with_config(
         &marginfi_type_crate::ID,
         RpcProgramAccountsConfig {
             account_config: RpcAccountInfoConfig {
@@ -330,7 +332,7 @@ mod tests {
 
     use super::accessor;
     use marginfi_type_crate::types::{BankConfig, OracleSetup};
-    use solana_program::pubkey::Pubkey;
+    use solana_pubkey::Pubkey;
 
     #[test]
     fn test_accessor_amount_valid() {

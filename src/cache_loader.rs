@@ -1,10 +1,11 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use anchor_spl::associated_token;
 use anyhow::Ok;
 use log::{debug, error, info, warn};
 use marginfi_type_crate::types::{Bank, FeeState, MarginfiAccount, MarginfiGroup};
-use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig};
+use solana_account::Account;
+use solana_account_decoder_client_types::{UiAccountEncoding, UiDataSliceConfig};
 use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_client::{
     rpc_client::RpcClient,
@@ -12,18 +13,18 @@ use solana_client::{
     rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType},
 };
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
-use solana_sdk::{
-    account::Account, bs58, instruction::Instruction, message::AddressLookupTableAccount,
-    pubkey::Pubkey, signature::Keypair, signer::Signer,
-};
+use solana_instruction::Instruction;
+use solana_keypair::Keypair;
+use solana_message::AddressLookupTableAccount;
+use solana_pubkey::Pubkey;
+use solana_signer::Signer;
 
 use crate::{
-    cache::{Cache, GroupedLuts},
+    cache::Cache,
     geyser::AccountType,
     utils::{self, batch_get_multiple_accounts, BatchLoadingConfig},
     wrappers::marginfi_account::MarginfiAccountWrapper,
 };
-use anchor_client::Program;
 use anyhow::{anyhow, Result};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
@@ -32,7 +33,6 @@ const MAX_INIT_TA_IXS: usize = 10;
 
 pub struct CacheLoader {
     signer: Keypair,
-    rpc_url: String,
     rpc_client: RpcClient,
     lut_addresses_group1: Vec<Pubkey>,
     lut_addresses_group2: Vec<Pubkey>,
@@ -52,7 +52,6 @@ impl CacheLoader {
 
         Ok(Self {
             signer,
-            rpc_url,
             rpc_client,
             lut_addresses_group1,
             lut_addresses_group2,
@@ -105,12 +104,10 @@ impl CacheLoader {
             group3.len()
         );
 
-        *cache.luts.lock().unwrap() = GroupedLuts {
-            group1,
-            group2,
-            group3,
-            deactivating: vec![],
-        };
+        let mut extra = group1;
+        extra.extend(group2);
+        extra.extend(group3);
+        cache.luts.set_extra(extra)?;
 
         Ok(())
     }
@@ -192,8 +189,7 @@ impl CacheLoader {
         marginfi_group_address: &Pubkey,
     ) -> anyhow::Result<Vec<Pubkey>> {
         info!("Loading marginfi account addresses...");
-        #[allow(deprecated)]
-        let marginfi_account_addresses = &self.rpc_client.get_program_accounts_with_config(
+        let marginfi_account_addresses = &self.rpc_client.get_program_ui_accounts_with_config(
             &marginfi_type_crate::ID,
             RpcProgramAccountsConfig {
                 account_config: RpcAccountInfoConfig {
@@ -234,16 +230,8 @@ impl CacheLoader {
     }
 
     fn load_banks(&self, cache: &mut Cache) -> anyhow::Result<()> {
-        let anchor_client = anchor_client::Client::new(
-            anchor_client::Cluster::Custom(self.rpc_url.clone(), String::from("")),
-            Arc::new(Keypair::new()),
-        );
-
-        let program: Program<Arc<Keypair>> = anchor_client.program(marginfi_type_crate::ID)?;
-
         info!("Loading banks...");
-        #[allow(deprecated)]
-        let bank_accounts = program.rpc().get_program_accounts_with_config(
+        let bank_accounts = self.rpc_client.get_program_ui_accounts_with_config(
             &marginfi_type_crate::ID,
             RpcProgramAccountsConfig {
                 account_config: RpcAccountInfoConfig {
@@ -266,6 +254,9 @@ impl CacheLoader {
         )?;
 
         for (bank_address, bank_account) in bank_accounts.into_iter() {
+            let bank_account = bank_account
+                .to_account()
+                .ok_or_else(|| anyhow!("Undecodable Bank account {}", bank_address))?;
             let bank = utils::decode_bank(&bank_account.data)
                 .map_err(|e| anyhow!("Failed to deserialize Bank {}: {:?}", bank_address, e))?;
             cache.banks.try_insert(bank_address, bank, bank_account)?;
@@ -436,7 +427,7 @@ impl CacheLoader {
             .try_for_each(|chunk| {
                 let ixs = chunk.iter().map(|ix| (*ix).clone()).collect::<Vec<_>>();
 
-                let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+                let tx = solana_transaction::Transaction::new_signed_with_payer(
                     &ixs,
                     Some(&self.signer.pubkey()),
                     &[&self.signer],

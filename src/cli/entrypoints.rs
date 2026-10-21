@@ -10,7 +10,9 @@ use crate::{
 };
 use log::{error, info, warn};
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{signature::Keypair, signer::Signer};
+use solana_commitment_config::CommitmentConfig;
+use solana_keypair::Keypair;
+use solana_signer::Signer;
 use std::{
     sync::{atomic::AtomicBool, Arc, Mutex},
     thread,
@@ -48,6 +50,12 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     )?;
     cache_loader.load_cache(&mut cache)?;
 
+    let signer = Keypair::try_from(config.wallet_keypair.as_slice())?;
+    let rpc_client =
+        RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
+    let owned_luts = cache.luts.discover(&rpc_client, &wallet_pubkey)?;
+    info!("Found {owned_luts} owned lookup table(s).");
+
     let accounts_to_track = get_accounts_to_track(&cache)?;
     let integration_fetcher_rpc_url = config.rpc_url.clone();
 
@@ -61,6 +69,15 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         config.marginfi_group_key,
         cache.clone(),
     )?);
+
+    // Every address a liquidation can reference must be in a lookup table, or the transaction
+    // won't fit. Done before any service runs; a no-op once the tables hold them.
+    info!("Covering the banks' accounts with the owned lookup tables...");
+    let added =
+        cache
+            .luts
+            .ensure_covered(&rpc_client, &signer, &liquidator_account.static_accounts())?;
+    info!("Lookup tables ready ({added} address(es) added).");
 
     let mut liquidator = Liquidator::new(
         config.clone(),
@@ -118,15 +135,13 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
 
     thread::spawn(move || {
         if let Err(e) = liquidator.start() {
-            error!("The Liquidator service failed! {:?}", e);
-            panic!("Fatal error in the Liquidator service!");
+            exit_on_fatal("The Liquidator service", e);
         }
     });
 
     thread::spawn(move || {
         if let Err(e) = geyser_service.start() {
-            error!("GeyserService failed! {:?}", e);
-            panic!("Fatal error in GeyserService!");
+            exit_on_fatal("GeyserService", e);
         }
     });
 
@@ -137,4 +152,11 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     info!("The Main loop stopped.");
 
     Ok(())
+}
+
+/// A service thread that dies leaves the process up but deaf: panicking would only end that
+/// thread. Exit instead, so the supervisor restarts eva with a fresh cache.
+fn exit_on_fatal(service: &str, error: anyhow::Error) -> ! {
+    error!("{} failed, exiting: {:?}", service, error);
+    std::process::exit(1);
 }

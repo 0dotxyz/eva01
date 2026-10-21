@@ -8,7 +8,8 @@ use marginfi_type_crate::{
     constants::{ASSET_TAG_JUPLEND, ASSET_TAG_KAMINO},
     types::{is_marginfi_asset_tag, Bank, OracleSetup},
 };
-use solana_sdk::{account::Account, pubkey::Pubkey};
+use solana_account::Account;
+use solana_pubkey::Pubkey;
 use std::{
     collections::{HashMap, HashSet},
     sync::RwLock,
@@ -39,6 +40,16 @@ impl BanksCache {
             inner.mint_to_p0_bank.insert(bank.mint, bank_address);
         }
         Ok(())
+    }
+
+    pub fn get_addresses(&self) -> Vec<Pubkey> {
+        self.inner
+            .read()
+            .expect("banks cache lock poisoned")
+            .banks
+            .keys()
+            .copied()
+            .collect()
     }
 
     pub fn try_get_bank(&self, address: &Pubkey) -> Result<BankWrapper> {

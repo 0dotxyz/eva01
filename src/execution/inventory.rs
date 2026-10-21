@@ -1,21 +1,21 @@
 //! Inventory-funded liquidation strategy.
 //!
-//! Funds each liquidation just-in-time: it buys the *shortfall* of the liability token (from the
-//! swap_mint reserve, e.g. USDC) via a separate DEX **ExactIn** swap tx, then liquidates. The
-//! seized collateral — and any liability bought in excess of what the repay consumes — is sold
-//! back to swap_mint by the rebalancer on a later pass. No pre-held per-liability inventory is
-//! required beyond the swap_mint reserve.
+//! Preferred plan, one transaction: start the receivership, withdraw the seized collateral, sell
+//! it for the liability on a DEX, repay, end. The swap must guarantee enough liability to cover
+//! the whole repay plus `min_profit` from the seized collateral alone, and the transaction must
+//! fit and simulate. The liability left over is the profit; the rebalancer sells it to swap_mint
+//! later.
 //!
-//! ExactIn (rather than ExactOut) because many routes don't support ExactOut: we size the
-//! swap_mint input from the liability's oracle price (+ a buffer), then let the DEX aggregator
-//! verify the quote actually yields at least the shortfall, bumping the input once if it falls
-//! short.
+//! Fallback, two transactions: buy the liability shortfall from the swap_mint reserve (USDC) in a
+//! separate DEX swap, then liquidate. The buy is ExactIn, since many routes don't support ExactOut:
+//! the input is sized from the liability's oracle price plus a buffer, and the aggregator raises
+//! it if the quote falls short. It never spends more than the shortfall's oracle value plus the
+//! liquidation's margin above `min_profit`. The rebalancer sells the seized collateral and any
+//! excess liability afterwards.
 //!
-//! The buy never spends more than the shortfall's oracle value plus the liquidation's margin above
-//! `min_profit`: anything the DEX charges above the oracle comes out of that margin.
-//!
-//! Produces an ordered plan `[buy?] [liquidate]`; the executor handles simulate-first cranking,
-//! the Jito tip, and submission.
+//! A sandwich touches no wallet inventory, so the executor runs sandwiches in parallel and sends
+//! each directly over RPC. The fallback spends the wallet, so the executor assembles and lands one
+//! at a time, as a Jito bundle with a sequential RPC fallback.
 
 use std::sync::Arc;
 
@@ -23,40 +23,47 @@ use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
 use log::{debug, info};
 use marginfi_type_crate::constants::ASSET_TAG_STAKED;
-use solana_dex_superagg::DexSuperAggClient;
-use solana_program::pubkey::Pubkey;
-use solana_sdk::transaction::VersionedTransaction;
-use tokio::{
-    runtime::{Builder, Runtime},
-    sync::Semaphore,
-};
+use solana_dex_superagg::{DexSuperAggClient, RouteRequest};
+use solana_pubkey::Pubkey;
+use solana_signer::Signer;
+use solana_transaction::versioned::VersionedTransaction;
+use tokio::runtime::{Builder, Runtime};
 
 use crate::clock_manager;
-use crate::rebalancer::MIN_SELL_PRICE_VS_ORACLE;
+use crate::rebalancer::DexGate;
 use crate::wrappers::{
-    liquidator_account::{LiquidatorAccount, PreparedLiquidatableAccount},
+    liquidator_account::{
+        locked_accounts, LiquidatorAccount, PreparedLiquidatableAccount, MAX_TX_ACCOUNT_LOCKS,
+    },
     oracle::OracleWrapper,
     token_account::TokenAccountWrapper,
 };
 
 use super::{ExecutionPlan, LiquidationStrategy};
 
-/// Extra margin over the oracle-derived input estimate, to absorb the oracle/market price gap and
-/// rounding so the first ExactIn quote usually already covers the shortfall (the quote is still
-/// verified, and the input bumped, if it doesn't).
-const INPUT_BUFFER: f64 = 1.02;
-
 /// Liability still to buy: `repay_amount` truncated like the repay ix, minus what the wallet holds.
 fn buy_shortfall(repay_amount: I80F48, wallet_balance: u64) -> u64 {
     repay_amount.to_num::<u64>().saturating_sub(wallet_balance)
 }
 
+/// Programs marginfi lets a swap call between the start and end of a receivership: the venues'
+/// routers. The ATA program is whitelisted there too, but marginfi's instruction check rejects
+/// any instruction with fewer than 8 bytes of data (`StartNotFirst`), which an ATA creation is,
+/// so a route that creates an intermediate token account can never land; leaving the ATA program
+/// out makes the aggregator pick a route without one instead.
+const RECEIVERSHIP_SWAP_PROGRAMS: [Pubkey; 3] = [
+    Pubkey::from_str_const("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"),
+    Pubkey::from_str_const("T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT"),
+    Pubkey::from_str_const("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH"),
+];
+
 pub struct InventoryStrategy {
     liquidator_account: Arc<LiquidatorAccount>,
     dex_client: Arc<DexSuperAggClient>,
-    dex_gate: Arc<Semaphore>,
+    dex_gate: Arc<DexGate>,
     tokio_rt: Runtime,
     swap_mint: Pubkey,
+    slippage_bps: u16,
     min_profit: f64,
 }
 
@@ -65,7 +72,8 @@ impl InventoryStrategy {
         liquidator_account: Arc<LiquidatorAccount>,
         swap_mint: Pubkey,
         dex_client: Arc<DexSuperAggClient>,
-        dex_gate: Arc<Semaphore>,
+        dex_gate: Arc<DexGate>,
+        slippage_bps: u16,
         min_profit: f64,
     ) -> Result<Self> {
         // Multi-threaded so concurrent liquidations can `block_on` DEX quotes at the same time —
@@ -83,6 +91,7 @@ impl InventoryStrategy {
             dex_client,
             tokio_rt,
             swap_mint,
+            slippage_bps,
             min_profit,
         })
     }
@@ -103,13 +112,15 @@ impl InventoryStrategy {
         })
     }
 
-    /// Refuse collateral the rebalancer couldn't sell afterwards (at [`MIN_SELL_PRICE_VS_ORACLE`] of
-    /// its oracle value). For staked collateral: single-validator LSTs often have no DEX market.
-    fn check_exit_liquidity(&self, asset_mint: Pubkey, asset_amount: u64) -> Result<()> {
-        let asset_value = self
-            .value_wrapper(&asset_mint)?
-            .get_value_for_amount(I80F48::from_num(asset_amount))?;
-
+    /// Refuse collateral that could not be sold afterwards for the repay plus `min_profit`. For
+    /// staked collateral: single-validator LSTs often have no DEX market.
+    fn check_exit_liquidity(
+        &self,
+        asset_mint: Pubkey,
+        asset_amount: u64,
+        liab_mint: Pubkey,
+        repay_amount: u64,
+    ) -> Result<()> {
         let quotes = self
             .tokio_rt
             .block_on(async {
@@ -120,118 +131,163 @@ impl InventoryStrategy {
             })
             .map_err(|e| anyhow!("no exit route for {} {}: {}", asset_amount, asset_mint, e))?;
 
-        let best_out = quotes
-            .first()
-            .map(|(_, out_amount)| *out_amount)
-            .unwrap_or(0);
         let exit_value = self
             .value_wrapper(&self.swap_mint)?
-            .get_value_for_amount(I80F48::from_num(best_out))?;
-        if exit_value < asset_value * MIN_SELL_PRICE_VS_ORACLE {
+            .get_value_for_amount(I80F48::from_num(quotes[0].min_out_amount))?;
+        let repay_value = self
+            .value_wrapper(&liab_mint)?
+            .get_value_for_amount(I80F48::from_num(repay_amount))?;
+        if exit_value < repay_value + I80F48::from_num(self.min_profit) {
             return Err(anyhow!(
-                "seized {} {} would sell for ${:.6} vs ${:.6} at the oracle; not seizing collateral \
-                 the rebalancer can't exit",
+                "seized {} {} would sell for ${:.6} against a ${:.6} repay; not seizing collateral \
+                 that can't be exited at a profit",
                 asset_amount,
                 asset_mint,
                 exit_value.to_num::<f64>(),
-                asset_value.to_num::<f64>()
+                repay_value.to_num::<f64>()
             ));
         }
         Ok(())
     }
 
-    /// Build a signed `swap_mint -> output_mint` **ExactIn** buy tx that yields at least `min_out`
-    /// of `output_mint`. Sizes the input from oracle prices, then delegates quoting, the capped
-    /// input bump, transaction request, and signing to `solana-dex-superagg`.
-    ///
-    /// `profit_budget` is how much over-oracle cost (USD) the liquidation can absorb and still clear
-    /// `min_profit`; the buy never spends more than the shortfall's oracle value plus that.
+    /// Builds a signed ExactIn buy of `output_mint`, spending the oracle value of `amount` in
+    /// swap_mint. Returns the transaction and how much it guarantees to deliver, which may be less
+    /// than `amount` when the market is worse than the oracle.
     fn build_buy_tx(
         &self,
         output_mint: Pubkey,
-        min_out: u64,
-        profit_budget: I80F48,
-    ) -> Result<VersionedTransaction> {
-        // Size the swap_mint input from oracle prices: value(min_out of liab) -> swap_mint amount.
-        let needed_value = self
+        amount: u64,
+    ) -> Result<(VersionedTransaction, u64)> {
+        let value = self
             .value_wrapper(&output_mint)?
-            .get_value_for_amount(I80F48::from_num(min_out))?;
-        let swap_wrapper = self.value_wrapper(&self.swap_mint)?;
-        let to_swap_amount = |value: I80F48| -> Result<u64> {
-            Ok(swap_wrapper.get_amount_from_value(value)?.to_num::<u64>())
-        };
-
-        let max_input = to_swap_amount(needed_value + profit_budget.max(I80F48::ZERO))?;
-        let buffered_value = needed_value
-            .checked_mul(I80F48::from_num(INPUT_BUFFER))
-            .ok_or_else(|| anyhow!("input sizing overflow"))?;
-        let input_amount = to_swap_amount(buffered_value)?.min(max_input);
+            .get_value_for_amount(I80F48::from_num(amount))?;
+        let input_amount: u64 = self
+            .value_wrapper(&self.swap_mint)?
+            .get_amount_from_value(value)?
+            .to_num();
         if input_amount == 0 {
             return Err(anyhow!(
                 "computed zero swap_mint input for buying {} {}",
-                min_out,
+                amount,
                 output_mint
             ));
         }
 
-        // One permit for the whole sequence: the min-out flow quotes, maybe re-quotes, then builds.
         let prepared = self
             .tokio_rt
             .block_on(async {
                 let _permit = self.dex_gate.acquire().await?;
                 self.dex_client
-                    .build_swap_transaction(
-                        self.swap_mint,
-                        output_mint,
-                        input_amount,
-                        min_out,
-                        Some(max_input),
-                    )
+                    .build_swap_transaction(self.swap_mint, output_mint, input_amount, 0)
                     .await
             })
-            .map_err(|e| anyhow!("JIT buy of {} {}: {}", min_out, output_mint, e))?;
+            .map_err(|e| anyhow!("JIT buy of {} {}: {}", amount, output_mint, e))?;
         debug!(
-            "InventoryStrategy: ExactIn spends {} {} for {} {} via {:?} (need {}, cap {})",
+            "InventoryStrategy: spending {} {} for at least {} {} via {:?} (wanted {})",
             prepared.in_amount,
             self.swap_mint,
-            prepared.out_amount,
+            prepared.min_out_amount,
             output_mint,
             prepared.aggregator,
-            min_out,
-            max_input
+            amount
         );
-
-        Ok(prepared.transaction)
-    }
-}
-
-impl LiquidationStrategy for InventoryStrategy {
-    fn name(&self) -> &'static str {
-        "inventory"
+        Ok((prepared.transaction, prepared.min_out_amount))
     }
 
-    fn assemble(&self, intent: &PreparedLiquidatableAccount) -> Result<Option<ExecutionPlan>> {
-        let liab_bank = self
-            .liquidator_account
-            .cache
-            .banks
-            .try_get_bank(&intent.liab_bank)?;
-        let liab_mint = liab_bank.bank.mint;
-
+    /// Builds and simulates the one-transaction plan: the liquidation with the seized collateral
+    /// sold for the liability inside it. The swap must guarantee the repay plus `min_profit` for
+    /// at most the seized amount, and may only add as many accounts as the liquidation leaves
+    /// under the account-lock limit, so the route is rejected by the aggregator rather than by
+    /// the chain.
+    fn build_sandwich_tx(
+        &self,
+        intent: &PreparedLiquidatableAccount,
+        asset_mint: Pubkey,
+        liab_mint: Pubkey,
+    ) -> Result<VersionedTransaction> {
+        // What the withdraw hands the wallet, which is what the swap can sell.
         let asset_bank = self
             .liquidator_account
             .cache
             .banks
             .try_get_bank(&intent.asset_bank)?;
-        if asset_bank.bank.config.asset_tag == ASSET_TAG_STAKED {
-            self.check_exit_liquidity(asset_bank.bank.mint, intent.asset_amount.to_num())?;
-        }
+        let asset_amount: u64 = self
+            .liquidator_account
+            .seized_underlying_amount(&asset_bank, intent.asset_amount)?;
+        let repay_amount: u64 = intent.liab_amount.to_num();
+        let min_profit: u64 = self
+            .value_wrapper(&liab_mint)?
+            .get_amount_from_value(I80F48::from_num(self.min_profit))?
+            .to_num();
 
-        // JIT-buy covers the liability, so we always liquidate the full amount (no proportional
-        // reduction). The repay ix consumes `repay_amount` of the liab token; the premium is
-        // already the gap between the two amounts (see `compute_max_liquidatable_amounts_with_banks`).
-        let asset_amount = intent.asset_amount;
-        let repay_amount = intent.liab_amount;
+        let (liquidation_ixs, _) = self.liquidator_account.liquidation_ixs(
+            intent,
+            intent.asset_amount,
+            intent.liab_amount,
+            None,
+        )?;
+        let transaction_accounts: Vec<Pubkey> =
+            locked_accounts(&self.liquidator_account.signer.pubkey(), &liquidation_ixs)
+                .into_iter()
+                .collect();
+        let max_accounts = MAX_TX_ACCOUNT_LOCKS.saturating_sub(transaction_accounts.len());
+
+        let request = RouteRequest {
+            allowed_programs: Some(RECEIVERSHIP_SWAP_PROGRAMS.to_vec()),
+            max_accounts,
+            transaction_accounts,
+            ..RouteRequest::new(
+                self.liquidator_account.signer.pubkey(),
+                asset_mint,
+                liab_mint,
+                asset_amount,
+                repay_amount.saturating_add(min_profit),
+                self.slippage_bps,
+            )
+        };
+        let swap = self
+            .tokio_rt
+            .block_on(async {
+                let _permit = self.dex_gate.acquire().await?;
+                self.dex_client.build_swap_instructions(&request).await
+            })?
+            .swap_remove(0);
+        info!(
+            "InventoryStrategy: selling {} {} for at least {} {} in-tx via {:?} (repaying {})",
+            asset_amount, asset_mint, swap.min_out_amount, liab_mint, swap.aggregator, repay_amount
+        );
+        let tx = self.liquidator_account.build_liquidate_tx(
+            intent,
+            intent.asset_amount,
+            intent.liab_amount,
+            Some(&swap),
+        )?;
+        // A failure caught here falls back to the buy plan; the RPC preflight checks it again.
+        self.liquidator_account.simulate_tx(&tx)?;
+        Ok(tx)
+    }
+
+    /// Builds the fallback plan: buy the liability shortfall from swap_mint, then liquidate. When
+    /// the buy guarantees less than the shortfall, the liquidation shrinks to what the wallet will
+    /// hold: the repay, and with it the seized collateral, since `end_liquidation` caps the latter
+    /// at the repay plus the premium.
+    fn build_buy_plan(
+        &self,
+        intent: &PreparedLiquidatableAccount,
+        asset_mint: Pubkey,
+        asset_tag: u8,
+        liab_mint: Pubkey,
+    ) -> Result<ExecutionPlan> {
+        let mut asset_amount = intent.asset_amount;
+        let mut repay_amount = intent.liab_amount;
+        if asset_tag == ASSET_TAG_STAKED {
+            self.check_exit_liquidity(
+                asset_mint,
+                asset_amount.to_num(),
+                liab_mint,
+                repay_amount.to_num(),
+            )?;
+        }
 
         let wallet_liab = self
             .liquidator_account
@@ -240,7 +296,6 @@ impl LiquidationStrategy for InventoryStrategy {
         let shortfall = buy_shortfall(repay_amount, wallet_liab);
 
         let mut txs = Vec::new();
-        let mut temp_luts = Vec::new();
         if shortfall > 0 {
             info!(
                 "InventoryStrategy: buying shortfall of {} {} (have {}, need {})",
@@ -249,8 +304,36 @@ impl LiquidationStrategy for InventoryStrategy {
                 wallet_liab,
                 repay_amount.to_num::<u64>()
             );
-            let profit_budget = intent.profit - I80F48::from_num(self.min_profit);
-            txs.push(self.build_buy_tx(liab_mint, shortfall, profit_budget)?);
+            let (buy_tx, bought) = self.build_buy_tx(liab_mint, shortfall)?;
+            txs.push(buy_tx);
+
+            if bought < shortfall {
+                let covered = I80F48::from_num(wallet_liab + bought);
+                let ratio = covered / repay_amount;
+                // The liability not bought was still paid for, at the oracle price.
+                let missing_value = self
+                    .value_wrapper(&liab_mint)?
+                    .get_value_for_amount(I80F48::from_num(shortfall - bought))?;
+                let profit = intent.profit * ratio - missing_value;
+                if profit < I80F48::from_num(self.min_profit) {
+                    return Err(anyhow!(
+                        "buying {} {} only guarantees {}; the liquidation it covers would make ${:.6}",
+                        shortfall,
+                        liab_mint,
+                        bought,
+                        profit.to_num::<f64>()
+                    ));
+                }
+                info!(
+                    "InventoryStrategy: the buy guarantees {} of {} {}; liquidating {:.4} of the plan",
+                    bought,
+                    shortfall,
+                    liab_mint,
+                    ratio.to_num::<f64>()
+                );
+                asset_amount *= ratio;
+                repay_amount = covered;
+            }
         } else {
             debug!(
                 "InventoryStrategy: wallet already covers {} {}; no buy needed",
@@ -259,15 +342,53 @@ impl LiquidationStrategy for InventoryStrategy {
             );
         }
 
-        let (liquidate_tx, temp_lut) =
+        let liquidate_tx =
             self.liquidator_account
-                .build_liquidate_tx(intent, asset_amount, repay_amount)?;
+                .build_liquidate_tx(intent, asset_amount, repay_amount, None)?;
         txs.push(liquidate_tx);
-        if let Some(lut_key) = temp_lut {
-            temp_luts.push(lut_key);
-        }
 
-        Ok(Some(ExecutionPlan { txs, temp_luts }))
+        Ok(ExecutionPlan { txs })
+    }
+}
+
+impl LiquidationStrategy for InventoryStrategy {
+    fn name(&self) -> &'static str {
+        "inventory"
+    }
+
+    fn assemble_sandwich(
+        &self,
+        intent: &PreparedLiquidatableAccount,
+    ) -> Result<Option<ExecutionPlan>> {
+        let cache = &self.liquidator_account.cache;
+        let liab_mint = cache.banks.try_get_bank(&intent.liab_bank)?.bank.mint;
+        let asset_mint = cache.banks.try_get_bank(&intent.asset_bank)?.bank.mint;
+
+        match self.build_sandwich_tx(intent, asset_mint, liab_mint) {
+            Ok(tx) => Ok(Some(ExecutionPlan { txs: vec![tx] })),
+            Err(e) => {
+                info!(
+                    "InventoryStrategy: not selling the collateral in-tx for {} ({}); buying the liability instead",
+                    intent.liquidatee_account.address, e
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    fn assemble_with_inventory(
+        &self,
+        intent: &PreparedLiquidatableAccount,
+    ) -> Result<ExecutionPlan> {
+        let cache = &self.liquidator_account.cache;
+        let liab_mint = cache.banks.try_get_bank(&intent.liab_bank)?.bank.mint;
+        let asset_bank = cache.banks.try_get_bank(&intent.asset_bank)?;
+        self.build_buy_plan(
+            intent,
+            asset_bank.bank.mint,
+            asset_bank.bank.config.asset_tag,
+            liab_mint,
+        )
     }
 }
 

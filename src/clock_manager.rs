@@ -1,7 +1,7 @@
 use log::{debug, error, info};
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::clock::Clock;
-use solana_sdk::sysvar::{self};
+use solana_clock::Clock;
+use solana_sdk_ids::sysvar;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -48,7 +48,10 @@ impl ClockManager {
                 Ok(clock) => {
                     match self.clock.lock() {
                         Ok(mut clock_guard) => {
+                            // Oracle updates may have moved the timestamp past the fetched one.
+                            let newest = clock_guard.unix_timestamp.max(clock.unix_timestamp);
                             *clock_guard = clock;
+                            clock_guard.unix_timestamp = newest;
                         }
                         Err(err) => {
                             error!("Failed to lock the clock mutex for update: {:?}", err);
@@ -71,9 +74,37 @@ pub fn fetch_clock(rpc_client: &RpcClient) -> anyhow::Result<Clock> {
         .deserialize_data()?)
 }
 
+/// Moves the clock forward to `timestamp` (e.g. an oracle's publish time) if it is newer.
+pub fn advance_to(clock: &Arc<Mutex<Clock>>, timestamp: i64) -> anyhow::Result<()> {
+    let mut clock_guard = clock
+        .lock()
+        .map_err(|e| anyhow::anyhow!("Failed to obtain the Clock lock: {:?}", e))?;
+    clock_guard.unix_timestamp = clock_guard.unix_timestamp.max(timestamp);
+    Ok(())
+}
+
 pub fn get_clock(clock: &Arc<Mutex<Clock>>) -> anyhow::Result<Clock> {
     let clock_guard = clock
         .lock()
         .map_err(|e| anyhow::anyhow!("Failed to obtain the Clock lock: {:?}", e))?;
     Ok(clock_guard.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advance_to_only_moves_forward() {
+        let clock = Arc::new(Mutex::new(Clock {
+            unix_timestamp: 1_000,
+            ..Clock::default()
+        }));
+
+        advance_to(&clock, 1_010).unwrap();
+        assert_eq!(get_clock(&clock).unwrap().unix_timestamp, 1_010);
+
+        advance_to(&clock, 990).unwrap();
+        assert_eq!(get_clock(&clock).unwrap().unix_timestamp, 1_010);
+    }
 }

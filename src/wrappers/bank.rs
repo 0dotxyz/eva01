@@ -2,8 +2,8 @@ use crate::wrappers::oracle::OracleWrapperTrait;
 use fixed::types::I80F48;
 use marginfi::state::marginfi_account::{calc_amount, calc_value};
 use marginfi_type_crate::types::{BalanceSide, Bank, OraclePriceType, PriceBias, RequirementType};
-use solana_program::pubkey::Pubkey;
-use solana_sdk::account::Account;
+use solana_account::Account;
+use solana_pubkey::Pubkey;
 
 #[derive(Clone)]
 pub struct BankWrapper {

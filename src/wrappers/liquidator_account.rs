@@ -1,4 +1,7 @@
-use super::marginfi_account::{MarginfiAccountWrapper, ObservationAccounts};
+use super::{
+    bank::BankWrapper,
+    marginfi_account::{MarginfiAccountWrapper, ObservationAccounts},
+};
 use crate::{
     cache::Cache,
     config::Eva01Config,
@@ -13,24 +16,26 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use marginfi_type_crate::constants::{
     ASSET_TAG_DEFAULT, ASSET_TAG_JUPLEND, ASSET_TAG_KAMINO, ASSET_TAG_SOL, ASSET_TAG_STAKED,
 };
+use solana_account::ReadableAccount;
+use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_client::rpc_client::RpcClient;
-
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
-use solana_program::pubkey::Pubkey;
-use solana_sdk::{
-    account::ReadableAccount,
-    instruction::Instruction,
-    message::{v0::Message, AddressLookupTableAccount, VersionedMessage},
-    signature::{Keypair, Signature},
-    signer::Signer,
-    transaction::VersionedTransaction,
-};
+use solana_dex_superagg::SwapInstructions;
+use solana_instruction::Instruction;
+use solana_keypair::Keypair;
+use solana_message::{v0::Message, AddressLookupTableAccount, VersionedMessage};
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use solana_signer::Signer;
+use solana_transaction::versioned::VersionedTransaction;
 use std::{collections::HashSet, sync::Arc};
+
+use super::oracle::oracle_account_keys;
 
 /// Collateral tags `build_liquidate_tx` can withdraw. Staked banks hold a plain SPL LST, so they go
 /// through the standard withdraw like DEFAULT/SOL.
@@ -43,6 +48,41 @@ pub fn is_seizable_asset_tag(tag: u8) -> bool {
 
 /// Max serialized Solana transaction size on the wire.
 const MAX_TX_SIZE: usize = 1232;
+/// Runtime cap on accounts one transaction may load, LUT-resolved or not.
+pub const MAX_TX_ACCOUNT_LOCKS: usize = 64;
+
+/// JupLend's `token_exchange_price` is scaled by this: underlying = fTokens * price / 1e12.
+const JUPLEND_EXCHANGE_PRICE_PRECISION: u128 = 1_000_000_000_000;
+
+/// Underlying tokens that `f_tokens` of a JupLend position redeem to, rounded down so the program's
+/// `ceil(underlying * 1e12 / price)` burns no more fTokens than the position holds.
+fn juplend_underlying_amount(f_tokens: I80F48, token_exchange_price: u64) -> u64 {
+    let f_tokens: u128 = f_tokens.to_num::<u64>().into();
+    u64::try_from(f_tokens * u128::from(token_exchange_price) / JUPLEND_EXCHANGE_PRICE_PRECISION)
+        .unwrap_or(u64::MAX)
+}
+
+/// Unique accounts the compiled transaction will lock: the payer, every program and every account
+/// meta. (The blockhash is not an account.)
+pub fn locked_accounts(signer_pk: &Pubkey, ixs: &[Instruction]) -> HashSet<Pubkey> {
+    ixs.iter()
+        .flat_map(|ix| {
+            std::iter::once(ix.program_id).chain(ix.accounts.iter().map(|meta| meta.pubkey))
+        })
+        .chain(std::iter::once(*signer_pk))
+        .collect()
+}
+
+/// Account metas of `ixs` that the compiler may resolve through a lookup table: everything but
+/// the invoked programs (and the payer, which must stay static).
+fn lookupable_accounts(signer_pk: &Pubkey, ixs: &[Instruction]) -> Vec<Pubkey> {
+    let programs: HashSet<Pubkey> = ixs.iter().map(|ix| ix.program_id).collect();
+    let mut seen = HashSet::new();
+    ixs.iter()
+        .flat_map(|ix| ix.accounts.iter().map(|meta| meta.pubkey))
+        .filter(|key| key != signer_pk && !programs.contains(key) && seen.insert(*key))
+        .collect()
+}
 
 pub struct PreparedLiquidatableAccount {
     pub liquidatee_account: MarginfiAccountWrapper,
@@ -58,6 +98,7 @@ pub struct LiquidatorAccount {
     pub signer: Keypair,
     group: Pubkey,
     rpc_client: RpcClient,
+    rpc_url: String,
     cu_limit_ix: Instruction,
     /// Priority-fee instruction (from `COMPUTE_UNIT_PRICE_MICRO_LAMPORTS`). Without it the heavy
     /// liquidation tx carries a CU limit but no price, so it confirms slowly under load — the
@@ -84,6 +125,7 @@ impl LiquidatorAccount {
             signer,
             group: marginfi_group_id,
             rpc_client,
+            rpc_url: config.rpc_url.clone(),
             cu_limit_ix: ComputeBudgetInstruction::set_compute_unit_limit(1400000),
             cu_price_ix: ComputeBudgetInstruction::set_compute_unit_price(
                 config.compute_unit_price_micro_lamports,
@@ -92,15 +134,40 @@ impl LiquidatorAccount {
         })
     }
 
-    /// Assemble (compile + sign) the liquidation transaction for the given account and amounts.
-    /// Pure tx construction used by the execution-layer `InventoryStrategy`. Returns the signed tx
-    /// and an optional temporary-LUT key created to fit an oversized tx.
+    /// Compiles and signs the liquidation transaction. With `swap`, its instructions (selling the
+    /// seized collateral for the liability) go between the withdraw and the repay.
     pub fn build_liquidate_tx(
         &self,
         account: &PreparedLiquidatableAccount,
         asset_amount: I80F48,
         liab_amount: I80F48,
-    ) -> Result<(VersionedTransaction, Option<Pubkey>)> {
+        swap: Option<&SwapInstructions>,
+    ) -> Result<VersionedTransaction> {
+        let (ixs, mut luts) = self.liquidation_ixs(account, asset_amount, liab_amount, swap)?;
+        if let Some(swap) = swap {
+            luts.extend(self.fetch_luts(&swap.address_lookup_tables)?);
+        }
+        // Whatever doesn't fit gets learned for next time, except the liquidatee's own account and
+        // record, which no other liquidation references.
+        let liquidatee = account.liquidatee_account.address;
+        let record = match account.liquidatee_account.account.liquidation_record {
+            record if record == Pubkey::default() => {
+                make_init_liquidation_record_ix(liquidatee, self.signer.pubkey()).1
+            }
+            record => record,
+        };
+        self.compile_tx_fit(&ixs, &luts, &[liquidatee, record])
+    }
+
+    /// The liquidation's instructions, in order, plus the lookup tables that cover them (the
+    /// venue's tables for a swap are added by the caller).
+    pub fn liquidation_ixs(
+        &self,
+        account: &PreparedLiquidatableAccount,
+        asset_amount: I80F48,
+        liab_amount: I80F48,
+        swap: Option<&SwapInstructions>,
+    ) -> Result<(Vec<Instruction>, Vec<AddressLookupTableAccount>)> {
         let PreparedLiquidatableAccount {
             liquidatee_account,
             observation_accounts,
@@ -142,13 +209,6 @@ impl LiquidatorAccount {
             } else {
                 (None, liquidatee_account.account.liquidation_record)
             };
-
-        let all_tags: Vec<u8> = liquidatee_banks
-            .iter()
-            .filter_map(|pk| self.cache.banks.try_get_bank(pk).ok())
-            .map(|b| b.bank.config.asset_tag)
-            .collect();
-        let mut luts = self.cache.luts.lock().unwrap().select_for_tags(&all_tags);
 
         let mut ixs = Vec::new();
         ixs.push(self.cu_limit_ix.clone());
@@ -216,7 +276,7 @@ impl LiquidatorAccount {
                     &asset_mint_wrapper,
                     &lending_state,
                     liquidatee_observation_accounts.as_ref(),
-                    asset_amount.to_num(),
+                    juplend_underlying_amount(asset_amount, lending_state.token_exchange_price),
                     false,
                 )
             }
@@ -231,6 +291,9 @@ impl LiquidatorAccount {
         ixs.extend(init_record_ix);
         ixs.push(start_ix);
         ixs.push(withdraw_ix);
+        if let Some(swap) = swap {
+            ixs.extend(swap.instructions.iter().cloned());
+        }
 
         let liab_mint_wrapper = self.cache.mints.try_get_account(&liab_mint)?;
         let repay_ix = make_repay_ix(
@@ -255,7 +318,162 @@ impl LiquidatorAccount {
         );
         ixs.push(end_ix);
 
-        self.compile_tx_with_lut_fit(&signer_pk, &ixs, &mut luts)
+        Ok((ixs, self.cache.luts.tables()))
+    }
+
+    /// The underlying tokens the wallet receives for seizing `bank_units` of `bank`'s collateral:
+    /// the amount a swap of that collateral can sell. Bank balances are venue shares: a JupLend
+    /// balance is fTokens, redeemed at the lending state's exchange price (and its withdraw takes
+    /// the underlying amount). A Kamino balance is collateral tokens, which its withdraw takes
+    /// directly and redeems at a rate of at least one, so the share count is a safe lower bound.
+    pub fn seized_underlying_amount(&self, bank: &BankWrapper, bank_units: I80F48) -> Result<u64> {
+        if bank.bank.config.asset_tag == ASSET_TAG_JUPLEND {
+            let lending = self
+                .cache
+                .try_get_juplend_lending_state(&bank.bank.integration_acc_1)?;
+            return Ok(juplend_underlying_amount(
+                bank_units,
+                lending.token_exchange_price,
+            ));
+        }
+        Ok(bank_units.to_num())
+    }
+
+    /// Every address the liquidation instructions can reference for `bank_pk`, independent of the
+    /// liquidatee: the bank, its oracles and vaults, the venue accounts, the mint, our token account
+    /// and the programs. These go into the owned lookup tables so every liquidation fits.
+    pub fn static_accounts_for_bank(&self, bank_pk: &Pubkey) -> Vec<Pubkey> {
+        let signer_pk = self.signer.pubkey();
+        let liquidatee = Pubkey::new_unique();
+        let record = Pubkey::new_unique();
+        let mut ixs = vec![self.cu_limit_ix.clone(), self.cu_price_ix.clone()];
+        ixs.push(make_init_liquidation_record_ix(liquidatee, signer_pk).0);
+
+        let bank_wrapper = match self.cache.banks.try_get_bank(bank_pk) {
+            Ok(bank) => bank,
+            Err(e) => {
+                warn!("Skipping the bank {bank_pk} for the lookup tables: {e}");
+                return Vec::new();
+            }
+        };
+        let mut observation = vec![*bank_pk];
+        match oracle_account_keys(&bank_wrapper.bank, bank_pk) {
+            Ok(oracles) => observation.extend(oracles),
+            Err(e) => debug!("No oracle accounts for the bank {bank_pk}: {e}"),
+        }
+        ixs.push(make_start_liquidate_ix(
+            self.group,
+            liquidatee,
+            signer_pk,
+            record,
+            &observation,
+            &[*bank_pk],
+        ));
+        ixs.push(make_end_liquidate_ix(
+            self.group,
+            liquidatee,
+            signer_pk,
+            record,
+            self.cache.global_fee_state_key,
+            self.cache.global_fee_wallet,
+            &[*bank_pk],
+        ));
+
+        if let Ok(mint_wrapper) = self.cache.mints.try_get_account(&bank_wrapper.bank.mint) {
+            ixs.push(make_repay_ix(
+                self.group,
+                liquidatee,
+                signer_pk,
+                &bank_wrapper,
+                &mint_wrapper,
+                1,
+                false,
+            ));
+            let tag = bank_wrapper.bank.config.asset_tag;
+            let venue = bank_wrapper.bank.integration_acc_1;
+            match tag {
+                ASSET_TAG_DEFAULT | ASSET_TAG_SOL | ASSET_TAG_STAKED => {
+                    ixs.push(make_withdraw_ix(
+                        self.group,
+                        liquidatee,
+                        signer_pk,
+                        &bank_wrapper,
+                        &mint_wrapper,
+                        &observation,
+                        1,
+                        false,
+                    ));
+                }
+                ASSET_TAG_KAMINO => match self.cache.try_get_kamino_reserve(&venue) {
+                    Ok(reserve) => {
+                        ixs.push(make_refresh_reserve_ix(venue, &reserve));
+                        ixs.push(make_refresh_obligation_ix(
+                            bank_wrapper.bank.integration_acc_2,
+                            reserve.reserve.lending_market,
+                            &[venue],
+                        ));
+                        ixs.push(make_kamino_withdraw_ix(
+                            self.group,
+                            liquidatee,
+                            signer_pk,
+                            &bank_wrapper,
+                            &mint_wrapper,
+                            bank_wrapper.bank.integration_acc_2,
+                            &reserve,
+                            &observation,
+                            1,
+                            false,
+                        ));
+                    }
+                    Err(e) => debug!("No Kamino reserve for the bank {bank_pk}: {e}"),
+                },
+                ASSET_TAG_JUPLEND => match self.cache.try_get_juplend_lending_state(&venue) {
+                    Ok(lending) => {
+                        ixs.push(make_update_lending_rate_ix(venue, &lending));
+                        ixs.push(make_juplend_withdraw_ix(
+                            self.group,
+                            liquidatee,
+                            signer_pk,
+                            &bank_wrapper,
+                            &mint_wrapper,
+                            &lending,
+                            &observation,
+                            1,
+                            false,
+                        ));
+                    }
+                    Err(e) => debug!("No JupLend lending state for the bank {bank_pk}: {e}"),
+                },
+                _ => {}
+            }
+        }
+
+        lookupable_accounts(&signer_pk, &ixs)
+            .into_iter()
+            .filter(|key| *key != liquidatee && *key != record)
+            .collect()
+    }
+
+    /// [`Self::static_accounts_for_bank`] over every bank in the cache.
+    pub fn static_accounts(&self) -> Vec<Pubkey> {
+        let mut seen = HashSet::new();
+        self.cache
+            .banks
+            .get_addresses()
+            .iter()
+            .flat_map(|bank| self.static_accounts_for_bank(bank))
+            .filter(|key| seen.insert(*key))
+            .collect()
+    }
+
+    /// Adds `bank`'s addresses to the owned lookup tables on a background thread.
+    pub fn cover_bank_in_background(&self, bank: &Pubkey) {
+        let keys = self.static_accounts_for_bank(bank);
+        self.cache.luts.cover_in_background(
+            self.rpc_url.clone(),
+            self.signer.to_bytes().to_vec(),
+            keys,
+        );
     }
 
     /// Kamino and JupLend venue accounts must be refreshed in the same slot as any health
@@ -300,7 +518,6 @@ impl LiquidatorAccount {
     ) -> Result<Signature> {
         let ObservationAccounts {
             observation_accounts: liquidatee_observation_accounts,
-            bank_pks: liquidatee_banks,
             kamino_reserves,
             juplend_states,
             ..
@@ -314,44 +531,105 @@ impl LiquidatorAccount {
             liquidatee_observation_accounts,
         ));
 
-        let all_tags: Vec<u8> = liquidatee_banks
-            .iter()
-            .filter_map(|pk| self.cache.banks.try_get_bank(pk).ok())
-            .map(|b| b.bank.config.asset_tag)
-            .collect();
-        let luts = self.cache.luts.lock().unwrap().select_for_tags(&all_tags);
+        let luts = self.cache.luts.tables();
         let tx = self.compile_tx(&self.signer.pubkey(), &ixs, &luts)?;
         Ok(self.rpc_client.send_and_confirm_transaction(&tx)?)
     }
 
-    fn compile_tx_with_lut_fit(
-        &self,
-        signer_pk: &Pubkey,
-        ixs: &[Instruction],
-        luts: &mut Vec<AddressLookupTableAccount>,
-    ) -> Result<(VersionedTransaction, Option<Pubkey>)> {
-        let mut tx = self.compile_tx(signer_pk, ixs, luts)?;
-        let mut temp_lut: Option<Pubkey> = None;
+    /// Simulates `tx`. On failure returns the program error with the last log lines.
+    pub fn simulate_tx(&self, tx: &VersionedTransaction) -> Result<()> {
+        let result = self.rpc_client.simulate_transaction(tx)?.value;
+        match result.err {
+            None => Ok(()),
+            Some(err) => {
+                let logs = result.logs.unwrap_or_default();
+                let tail = logs.len().saturating_sub(5);
+                Err(anyhow!(
+                    "simulation failed: {:?}; logs: {:?}",
+                    err,
+                    &logs[tail..]
+                ))
+            }
+        }
+    }
 
-        // Proactive LUT fit: if the tx exceeds the wire-size limit, pack its accounts into a
-        // freshly-created targeted LUT and recompile. The caller deactivates the temp LUT once
-        // the tx lands. (The 64-account-lock cap can't be fixed by a LUT, so that still fails.)
-        if bincode::serialize(&tx)?.len() > MAX_TX_SIZE {
-            let all_accounts: Vec<Pubkey> = ixs
-                .iter()
-                .flat_map(|ix| ix.accounts.iter().map(|a| a.pubkey))
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            let lut = self
-                .cache
-                .get_targeted_lut(&self.rpc_client, &self.signer, all_accounts)?;
-            temp_lut = Some(lut.key);
-            luts.push(lut);
-            tx = self.compile_tx(signer_pk, ixs, luts)?;
+    fn fetch_luts(&self, keys: &[Pubkey]) -> Result<Vec<AddressLookupTableAccount>> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+        self.rpc_client
+            .get_multiple_accounts(keys)?
+            .into_iter()
+            .zip(keys)
+            .map(|(account, key)| {
+                let account = account.ok_or_else(|| anyhow!("Lookup table {} not found", key))?;
+                Ok(AddressLookupTableAccount {
+                    key: *key,
+                    addresses: AddressLookupTable::deserialize(&account.data)?
+                        .addresses
+                        .to_vec(),
+                })
+            })
+            .collect()
+    }
+
+    /// Compiles and signs `ixs` with every lookup table that applies. Over the account-lock limit
+    /// nothing helps, so that fails first. Over the byte limit, the transaction fails too, and the
+    /// addresses no table holds (except `per_target`, which only this liquidation references) are
+    /// added to the owned tables in the background, so the next attempt fits.
+    fn compile_tx_fit(
+        &self,
+        ixs: &[Instruction],
+        luts: &[AddressLookupTableAccount],
+        per_target: &[Pubkey],
+    ) -> Result<VersionedTransaction> {
+        let signer_pk = self.signer.pubkey();
+        let locks = locked_accounts(&signer_pk, ixs).len();
+        if locks > MAX_TX_ACCOUNT_LOCKS {
+            return Err(anyhow!(
+                "transaction loads {} accounts (max {})",
+                locks,
+                MAX_TX_ACCOUNT_LOCKS
+            ));
         }
 
-        Ok((tx, temp_lut))
+        let tx = self.compile_tx(&signer_pk, ixs, luts)?;
+        let size = bincode::serialize(&tx)?.len();
+        if size <= MAX_TX_SIZE {
+            return Ok(tx);
+        }
+
+        let in_tables: HashSet<Pubkey> = luts
+            .iter()
+            .flat_map(|table| table.addresses.iter().copied())
+            .collect();
+        let uncovered: Vec<Pubkey> = lookupable_accounts(&signer_pk, ixs)
+            .into_iter()
+            .filter(|key| !in_tables.contains(key))
+            .collect();
+        let learnable: Vec<Pubkey> = uncovered
+            .iter()
+            .filter(|key| !per_target.contains(key))
+            .copied()
+            .collect();
+        if !learnable.is_empty() {
+            self.cache.luts.cover_in_background(
+                self.rpc_url.clone(),
+                self.signer.to_bytes().to_vec(),
+                learnable.clone(),
+            );
+        }
+        Err(anyhow!(
+            "transaction is {} bytes (max {}) with {} account(s) no lookup table holds{}",
+            size,
+            MAX_TX_SIZE,
+            uncovered.len(),
+            if learnable.is_empty() {
+                String::new()
+            } else {
+                format!("; adding {} of them", learnable.len())
+            }
+        ))
     }
 
     fn compile_tx(
@@ -393,6 +671,53 @@ impl LiquidatorAccount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use solana_instruction::AccountMeta;
+
+    #[test]
+    fn juplend_underlying_never_burns_more_shares_than_held() {
+        let precision = JUPLEND_EXCHANGE_PRICE_PRECISION;
+        for (shares, price) in [
+            (535_916u64, 1_054_321_987_654u64),
+            (1u64, 1_999_999_999_999u64),
+            (170_782u64, 1_000_000_000_001u64),
+            (123_456_789u64, 999_999_999_999u64),
+        ] {
+            let underlying = juplend_underlying_amount(I80F48::from_num(shares), price);
+            // The program burns ceil(underlying * 1e12 / price) fTokens.
+            let burned = (u128::from(underlying) * precision).div_ceil(u128::from(price));
+            assert!(
+                burned <= u128::from(shares),
+                "{shares} @ {price}: burns {burned}"
+            );
+            // And never leaves more than one share's worth on the table.
+            assert!(u128::from(shares) - burned <= 1);
+        }
+    }
+
+    #[test]
+    fn locked_accounts_counts_unique_payer_programs_and_metas() {
+        let payer = Pubkey::new_unique();
+        let program = Pubkey::new_unique();
+        let shared = Pubkey::new_unique();
+        let ixs = [
+            Instruction::new_with_bytes(
+                program,
+                &[],
+                vec![
+                    AccountMeta::new(payer, true),
+                    AccountMeta::new(shared, false),
+                ],
+            ),
+            Instruction::new_with_bytes(
+                program,
+                &[],
+                vec![AccountMeta::new_readonly(shared, false)],
+            ),
+        ];
+        // payer + program + shared: duplicates and the payer meta collapse.
+        assert_eq!(locked_accounts(&payer, &ixs).len(), 3);
+    }
 
     fn contains_stale_oracles(stale_oracles: &HashSet<Pubkey>, account_oracles: &[Pubkey]) -> bool {
         account_oracles

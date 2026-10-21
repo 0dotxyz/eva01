@@ -1,5 +1,6 @@
 use anchor_lang::{self, declare_program};
 use env_logger::Builder;
+use env_logger::Target;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::{
     backtrace::Backtrace,
@@ -10,7 +11,7 @@ use std::{
     },
 };
 #[cfg(not(feature = "pretty_logs"))]
-use {env_logger::Target, log::Level, std::io::Write as _};
+use {log::Level, std::io::Write as _};
 
 #[cfg(all(feature = "network-mainnet", feature = "network-staging"))]
 compile_error!("Enable only one network feature: network-mainnet or network-staging");
@@ -80,11 +81,39 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn init_logging() {
     let mut b = Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+
+    // LOG_FILE=<path>: also append every log line to that file (for post-mortems of a run).
+    let file = std::env::var("LOG_FILE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap_or_else(|e| panic!("Failed to open LOG_FILE {path}: {e}"))
+        });
+
     #[cfg(feature = "pretty_logs")]
-    b.init();
+    {
+        if let Some(file) = file {
+            b.target(Target::Pipe(Box::new(Tee {
+                console: std::io::stderr(),
+                file,
+            })));
+        }
+        b.init();
+    }
     #[cfg(not(feature = "pretty_logs"))]
-    b.target(Target::Stdout)
-        .format(|buf, record| {
+    {
+        match file {
+            Some(file) => b.target(Target::Pipe(Box::new(Tee {
+                console: std::io::stdout(),
+                file,
+            }))),
+            None => b.target(Target::Stdout),
+        };
+        b.format(|buf, record| {
             use serde_json::json;
 
             let level = match record.level() {
@@ -103,4 +132,47 @@ fn init_logging() {
             writeln!(buf, "{}", line)
         })
         .init();
+    }
+}
+
+/// Writes every log line to the console and to the log file.
+struct Tee<C: std::io::Write> {
+    console: C,
+    file: std::fs::File,
+}
+
+impl<C: std::io::Write> std::io::Write for Tee<C> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.console.write_all(buf)?;
+        self.file.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.console.flush()?;
+        self.file.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Tee;
+    use std::io::Write;
+
+    #[test]
+    fn tee_writes_console_and_file() {
+        let path = std::env::temp_dir().join(format!("eva01-tee-{}.log", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut tee = Tee {
+            console: Vec::new(),
+            file,
+        };
+        tee.write_all(b"line one\n").unwrap();
+        tee.write_all(b"line two\n").unwrap();
+        tee.flush().unwrap();
+
+        assert_eq!(tee.console, b"line one\nline two\n");
+        assert_eq!(std::fs::read(&path).unwrap(), b"line one\nline two\n");
+        std::fs::remove_file(path).unwrap();
+    }
 }

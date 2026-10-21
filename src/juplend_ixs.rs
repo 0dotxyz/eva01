@@ -1,6 +1,7 @@
 use anchor_lang::{Id, InstructionData, ToAccountMetas};
 
-use solana_sdk::{instruction::Instruction, pubkey::Pubkey};
+use solana_instruction::Instruction;
+use solana_pubkey::Pubkey;
 
 use crate::juplend_earn::{accounts::Lending, client as juplend, program};
 
