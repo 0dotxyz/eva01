@@ -1,6 +1,7 @@
 pub mod healthcheck;
 pub mod integration_account_fetcher;
 pub mod jito;
+pub mod lut_registry;
 pub mod pyth_cranker;
 
 use anyhow::{anyhow, Error, Result};

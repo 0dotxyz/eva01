@@ -2,7 +2,8 @@ use crate::{cache::Cache, config::Eva01Config, utils::accessor};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{error, info, warn};
-use solana_commitment_config::CommitmentLevel;
+use solana_client::rpc_client::RpcClient;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_dex_superagg::{
     ClientConfig, DexSuperAggClient, DflowConfig, JupiterConfig, TitanConfig,
 };
@@ -37,6 +38,7 @@ pub struct Rebalancer {
     swap_mint: Pubkey,
     tokio_rt: Runtime,
     cache: Arc<Cache>,
+    rpc_client: RpcClient,
     dex_client: Arc<DexSuperAggClient>,
     dex_gate: Arc<Semaphore>,
     empty_stake_banks: HashSet<Pubkey>,
@@ -78,6 +80,10 @@ impl Rebalancer {
             swap_mint,
             tokio_rt,
             cache,
+            rpc_client: RpcClient::new_with_commitment(
+                config.rpc_url.clone(),
+                CommitmentConfig::confirmed(),
+            ),
             dex_client,
             dex_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_DEX_CALLS)),
             empty_stake_banks: HashSet::new(),
@@ -96,6 +102,10 @@ impl Rebalancer {
     /// Sell every non-swap-mint token the wallet holds (above the dust floor) back to the swap mint.
     pub fn run(&mut self) -> anyhow::Result<()> {
         info!("Running the Rebalancing process...");
+        // The sweep runs right after liquidations landed; the cached balances are still pre-landing.
+        if let Err(e) = self.cache.refresh_wallet_tokens(&self.rpc_client) {
+            warn!("Rebalancer: failed to refresh the wallet balances, using cached ones: {e}");
+        }
 
         for mint in self.cache.mints.get_mints() {
             if mint == self.swap_mint || self.empty_stake_banks.contains(&mint) {

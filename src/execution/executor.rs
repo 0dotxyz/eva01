@@ -1,9 +1,12 @@
 //! Submission + orchestration engine for the execution layer.
 //!
 //! `try_execute()` turns a prepared liquidation into a landed liquidation:
-//! 1. ask the strategy to assemble the txs (`[liquidate]` or `[buy] [liquidate]`),
-//! 2. simulate-first: skip the target when the program reports the liquidation would fail,
-//! 3. submit as an atomic Jito bundle (with a tip), falling back to sequential RPC sends.
+//! 1. ask the strategy for a sandwich (`[liquidate]`, self-funded): a single tx that touches no
+//!    wallet inventory, sent directly over RPC; any number of these run in parallel;
+//! 2. otherwise take the inventory lock and ask for the inventory plan (`[buy] [liquidate]`, or
+//!    `[liquidate]` paid from holdings): simulate-first, then an atomic Jito bundle (with a tip),
+//!    falling back to sequential RPC sends. The lock is held until the plan has landed or failed
+//!    and the wallet balances are re-read, so the next plan is sized against real holdings.
 //!
 //! The tip is added only on the bundle path; the sequential fallback sends the core txs as-is.
 
@@ -19,7 +22,10 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use log::{debug, info, warn};
-use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
+use solana_client::{
+    rpc_client::RpcClient,
+    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
+};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
@@ -133,6 +139,10 @@ pub struct Executor {
     backoffs: Mutex<HashMap<Pubkey, BackoffState>>,
     /// Count sequential fallback uses so logs reveal how often the non-bundle path is exercised.
     sequential_fallbacks: AtomicU64,
+    /// Held from assembling an inventory plan until it has landed or failed: plans spending the
+    /// wallet must not be sized against the same balance, and the block engine admits one bundle
+    /// at a time anyway.
+    inventory_lock: Mutex<()>,
 }
 
 impl Executor {
@@ -156,6 +166,7 @@ impl Executor {
             tip_estimator: TipEstimator::new(tip_max_lamports),
             backoffs: Mutex::new(HashMap::new()),
             sequential_fallbacks: AtomicU64::new(0),
+            inventory_lock: Mutex::new(()),
         }
     }
 
@@ -186,16 +197,48 @@ impl Executor {
             return Ok(());
         }
 
-        let plan = match strategy.assemble(intent) {
-            Ok(Some(plan)) => plan,
-            Ok(None) => {
-                debug!(
-                    "Strategy '{}' cannot handle {}; skipping",
-                    strategy.name(),
-                    liquidatee
-                );
-                return Ok(());
+        // A sandwich funds itself from the seized collateral: no wallet inventory, no bundle, no
+        // serialization. Simulated during assembly; the RPC preflight is the second check.
+        match strategy.assemble_sandwich(intent) {
+            Ok(Some(ExecutionPlan { txs })) => {
+                let result = self.send_over_rpc(&txs, "Sandwich");
+                self.note_outcome(&liquidatee, result.is_err());
+                return result;
             }
+            Ok(None) => {}
+            Err(e) => {
+                self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
+                return Err(e);
+            }
+        }
+
+        // Inventory plans run one at a time, end to end.
+        debug!(
+            "{}: no sandwich for {}; waiting for the inventory lock",
+            strategy.name(),
+            liquidatee
+        );
+        let _inventory = self
+            .inventory_lock
+            .lock()
+            .map_err(|_| anyhow!("inventory lock poisoned"))?;
+        let result = self.execute_with_inventory(strategy, intent, liab_mint);
+        if let Err(e) = self.cache.refresh_wallet_tokens(&self.rpc_client) {
+            warn!("Failed to refresh the wallet balances after an inventory plan: {e}");
+        }
+        result
+    }
+
+    /// Assemble and land a plan that spends wallet inventory. Caller holds the inventory lock.
+    fn execute_with_inventory(
+        &self,
+        strategy: &dyn LiquidationStrategy,
+        intent: &PreparedLiquidatableAccount,
+        liab_mint: Pubkey,
+    ) -> Result<()> {
+        let liquidatee = intent.liquidatee_account.address;
+        let plan = match strategy.assemble_with_inventory(intent) {
+            Ok(plan) => plan,
             Err(e) => {
                 // Record a quarantine/backoff so we stop hammering this target, then propagate so
                 // the caller logs + counts the failure once (subsequent cycles skip silently).
@@ -208,8 +251,7 @@ impl Executor {
         //  - ran & ok                 -> bundle send
         //  - ran & program error      -> skip (doomed on-chain; don't burn tip+fees)
         //  - couldn't run (infra err) -> sequential RPC send (no bundle)
-        // Temp LUTs created during assembly are always cleaned up afterwards, whatever the path.
-        let ExecutionPlan { txs, temp_luts } = plan;
+        let ExecutionPlan { txs } = plan;
         let mut attempt_failed = false;
         let result = match self.jito.simulate_bundle(
             &self.rpc_url,
@@ -237,16 +279,18 @@ impl Executor {
             }
         };
 
-        // Back off a target whose execution failed just like a failed assembly: every retry
-        // re-quotes the DEX and creates + deactivates a temporary LUT without landing anything.
-        if attempt_failed || result.is_err() {
-            self.note_execution_failure(&liquidatee);
-        } else {
-            self.clear_target_backoff(&liquidatee);
-        }
-
-        self.deactivate_temp_luts(temp_luts);
+        self.note_outcome(&liquidatee, attempt_failed || result.is_err());
         result
+    }
+
+    /// Back off a target whose execution failed just like a failed assembly: every retry
+    /// re-quotes the DEX without landing anything.
+    fn note_outcome(&self, liquidatee: &Pubkey, failed: bool) {
+        if failed {
+            self.note_execution_failure(liquidatee);
+        } else {
+            self.clear_target_backoff(liquidatee);
+        }
     }
 
     /// The liability mint for an intent, looked up via the bank cache.
@@ -318,35 +362,6 @@ impl Executor {
         if let Ok(mut guard) = self.backoffs.lock() {
             bump_target_backoff(&mut guard, target, EXECUTION_BACKOFF_BASE, "execution");
         }
-    }
-
-    /// Deactivate any temporary LUTs created during assembly (best-effort; logs on failure), and
-    /// close earlier deactivated LUTs whose cooldown has elapsed to reclaim their rent.
-    fn deactivate_temp_luts(&self, temp_luts: Vec<Pubkey>) {
-        if temp_luts.is_empty() {
-            return;
-        }
-        let cache = self.cache.clone();
-        let rpc_url = self.rpc_url.clone();
-        let signer_bytes = self.signer.to_bytes();
-        thread::spawn(move || {
-            let signer = match Keypair::try_from(signer_bytes.as_slice()) {
-                Ok(signer) => signer,
-                Err(e) => {
-                    warn!("Failed to rebuild signer for temporary LUT cleanup: {e}");
-                    return;
-                }
-            };
-            let rpc_client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
-            cache.try_close_deactivated_luts(&rpc_client, &signer);
-            // Deactivate exactly the LUT(s) this liquidation created — by key, no shared slot — so
-            // concurrent liquidations never step on each other's LUTs.
-            for lut_key in temp_luts {
-                if let Err(e) = cache.deactivate_lut(&rpc_client, &signer, lut_key) {
-                    warn!("Failed to deactivate temporary LUT {lut_key}: {e}");
-                }
-            }
-        });
     }
 
     /// Land the ordered transactions as an atomic Jito bundle (with a tip). Only fall back to
@@ -464,8 +479,35 @@ impl Executor {
             fallback_count,
             txs.len()
         );
+        self.send_over_rpc(txs, "Sequential")
+    }
+
+    /// Send each transaction over RPC in order, with preflight, confirming before moving on.
+    fn send_over_rpc(&self, txs: &[VersionedTransaction], label: &str) -> Result<()> {
         for (i, tx) in txs.iter().enumerate() {
-            let sig = self
+            let sig = tx.signatures.first().copied().unwrap_or_default();
+            let size = bincode::serialize(tx).map(|b| b.len()).unwrap_or(0);
+            let loaded = tx.message.static_account_keys().len()
+                + tx.message
+                    .address_table_lookups()
+                    .map(|lookups| {
+                        lookups
+                            .iter()
+                            .map(|l| l.writable_indexes.len() + l.readonly_indexes.len())
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0);
+            info!(
+                "{} tx {}/{}: sending {} ({} bytes, {} accounts, blockhash {})",
+                label,
+                i + 1,
+                txs.len(),
+                sig,
+                size,
+                loaded,
+                tx.message.recent_blockhash()
+            );
+            match self
                 .rpc_client
                 .send_and_confirm_transaction_with_spinner_and_config(
                     tx,
@@ -475,17 +517,53 @@ impl Executor {
                         preflight_commitment: Some(CommitmentLevel::Processed),
                         ..Default::default()
                     },
-                )
-                .map_err(|e| {
-                    anyhow!(
-                        "Sequential send failed at tx {}/{}: {}",
+                ) {
+                Ok(sig) => info!("{} tx {}/{} confirmed: {}", label, i + 1, txs.len(), sig),
+                Err(e) => {
+                    // A tx that passed preflight but never landed leaves no trace on-chain; the
+                    // only diagnosis is to re-simulate it now and record what the chain says.
+                    self.log_vanished_tx(tx, &sig);
+                    return Err(anyhow!(
+                        "{} send failed at tx {}/{}: {}",
+                        label,
                         i + 1,
                         txs.len(),
                         e
-                    )
-                })?;
-            info!("Sequential tx {}/{} confirmed: {}", i + 1, txs.len(), sig);
+                    ));
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Diagnostics for a tx the RPC accepted but that never confirmed: its on-chain status (with
+    /// history search) and a fresh simulation at confirmed commitment.
+    fn log_vanished_tx(&self, tx: &VersionedTransaction, sig: &Signature) {
+        let status = self
+            .rpc_client
+            .get_signature_statuses_with_history(&[*sig])
+            .map(|resp| format!("{:?}", resp.value.first().cloned().flatten()))
+            .unwrap_or_else(|e| format!("status lookup failed: {e}"));
+        let sim = self
+            .rpc_client
+            .simulate_transaction_with_config(
+                tx,
+                RpcSimulateTransactionConfig {
+                    sig_verify: false,
+                    replace_recent_blockhash: true,
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..Default::default()
+                },
+            )
+            .map(|resp| {
+                let logs = resp.value.logs.unwrap_or_default();
+                let tail = logs.len().saturating_sub(6);
+                format!("err {:?}; logs tail {:?}", resp.value.err, &logs[tail..])
+            })
+            .unwrap_or_else(|e| format!("re-simulation failed: {e}"));
+        warn!(
+            "Tx {} did not land: status {}; re-simulated now: {}",
+            sig, status, sim
+        );
     }
 }

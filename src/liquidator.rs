@@ -409,7 +409,11 @@ impl Liquidator {
             }
             AccountType::Bank => {
                 let bank = utils::decode_bank(&account.data)?;
+                let is_new = self.cache.banks.try_get_bank(&address).is_err();
                 self.cache.banks.try_insert(address, bank, account)?;
+                if is_new {
+                    self.liquidator_account.cover_bank_in_background(&address);
+                }
 
                 self.add_accounts_for_bank(&address, account_addresses)?;
             }

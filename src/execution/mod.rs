@@ -12,29 +12,42 @@ pub mod inventory;
 
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 use anyhow::Result;
-use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
 
 /// An ordered set of transactions that, executed in sequence, perform one liquidation.
 ///
-/// For the inventory strategy this is `[liquidate]` (collateral sold inside the tx) or
-/// `[buy] [liquidate]`. The executor submits `txs` as a single atomic Jito bundle, falling back to
-/// sending them sequentially over RPC.
+/// For the inventory strategy this is `[liquidate]` (collateral sold inside the tx), sent directly
+/// over RPC, or `[buy] [liquidate]`, submitted as a single atomic Jito bundle with a sequential RPC
+/// fallback.
 pub struct ExecutionPlan {
     /// Transactions in execution order. Earlier txs' state is visible to later ones.
     pub txs: Vec<VersionedTransaction>,
-    /// Temporary LUTs created while assembling (e.g. to fit an oversized tx). The executor
-    /// deactivates these after submission.
-    pub temp_luts: Vec<Pubkey>,
 }
 
 /// A way of funding and assembling a liquidation. Each implementation is a fully-configured
 /// object (it owns the clients/cache it needs), so assembly only needs the intent.
+///
+/// Two kinds of plan, executed differently:
+/// - a *sandwich* funds the repay from the seized collateral inside the liquidation tx, touches no
+///   wallet inventory, and so can run in parallel with any other liquidation;
+/// - an *inventory* plan spends the wallet's holdings (a JIT buy from swap_mint, or liability
+///   already held), so only one may be assembled and landed at a time: sizing reads the wallet
+///   balance, and two plans sized against the same balance would both believe they own it.
 pub trait LiquidationStrategy {
     /// Stable name for logs/metrics (e.g. "inventory", "flashloan").
     fn name(&self) -> &'static str;
 
-    /// Assemble the transactions for this intent, or `None` if this strategy cannot handle it
-    /// (e.g. collateral whose extra refresh ixs won't fit) so the caller can skip or try another.
-    fn assemble(&self, intent: &PreparedLiquidatableAccount) -> Result<Option<ExecutionPlan>>;
+    /// Assemble the self-funded single-tx plan, or `None` when this intent can't be funded from its
+    /// own collateral (no route, doesn't fit, simulation fails) and the inventory plan is needed.
+    fn assemble_sandwich(
+        &self,
+        intent: &PreparedLiquidatableAccount,
+    ) -> Result<Option<ExecutionPlan>>;
+
+    /// Assemble the plan that spends wallet inventory. Called with the inventory lock held, so the
+    /// wallet balance it reads is stable until the plan has landed or failed.
+    fn assemble_with_inventory(
+        &self,
+        intent: &PreparedLiquidatableAccount,
+    ) -> Result<ExecutionPlan>;
 }

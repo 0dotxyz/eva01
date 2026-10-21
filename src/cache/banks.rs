@@ -42,6 +42,16 @@ impl BanksCache {
         Ok(())
     }
 
+    pub fn get_addresses(&self) -> Vec<Pubkey> {
+        self.inner
+            .read()
+            .expect("banks cache lock poisoned")
+            .banks
+            .keys()
+            .copied()
+            .collect()
+    }
+
     pub fn try_get_bank(&self, address: &Pubkey) -> Result<BankWrapper> {
         self.inner
             .read()

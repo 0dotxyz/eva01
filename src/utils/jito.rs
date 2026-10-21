@@ -43,6 +43,9 @@ const TIP_FLOOR_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_floor";
 /// How long to wait after submission before the first status poll, and between polls.
 const POLL_INITIAL_DELAY: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// The block engine admits one request per second per endpoint (`sendBundle` and
+/// `getBundleStatuses` alike); anything faster is rejected with `-32097`.
+const MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Outcome of a bundle that the block engine *accepted*. (Rejection / infra failure is an `Err`.)
 #[derive(Debug, Clone)]
@@ -58,6 +61,8 @@ pub struct JitoClient {
     http: Client,
     endpoint: String,
     api_key: Option<String>,
+    /// When the last block-engine request went out; see [`MIN_REQUEST_INTERVAL`].
+    last_request: Mutex<Instant>,
 }
 
 impl JitoClient {
@@ -66,7 +71,21 @@ impl JitoClient {
             http: Client::new(),
             endpoint: endpoint.unwrap_or_else(|| DEFAULT_BUNDLE_ENDPOINT.to_string()),
             api_key,
+            last_request: Mutex::new(Instant::now() - MIN_REQUEST_INTERVAL),
         }
+    }
+
+    /// Spaces block-engine requests out to the rate limit, across every caller.
+    fn throttle(&self) {
+        let mut last = match self.last_request.lock() {
+            Ok(last) => last,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let since = last.elapsed();
+        if since < MIN_REQUEST_INTERVAL {
+            thread::sleep(MIN_REQUEST_INTERVAL - since);
+        }
+        *last = Instant::now();
     }
 
     /// The block-engine URL with the optional auth uuid appended (matches p0-app).
@@ -90,6 +109,7 @@ impl JitoClient {
             "params": [encoded, { "encoding": "base64" }],
         });
 
+        self.throttle();
         let resp: Value = self.http.post(self.url()).json(&body).send()?.json()?;
         parse_send_bundle_result(&resp)
     }
@@ -102,6 +122,7 @@ impl JitoClient {
             "method": "getBundleStatuses",
             "params": [[bundle_id]],
         });
+        self.throttle();
         let resp: Value = self.http.post(self.url()).json(&body).send()?.json()?;
         parse_bundle_status(&resp)
     }

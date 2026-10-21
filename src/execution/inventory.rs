@@ -13,8 +13,9 @@
 //! liquidation's margin above `min_profit`. The rebalancer sells the seized collateral and any
 //! excess liability afterwards.
 //!
-//! Either way the result is an ordered plan, `[liquidate]` or `[buy] [liquidate]`, that the
-//! executor simulates, tips and submits.
+//! A sandwich touches no wallet inventory, so the executor runs sandwiches in parallel and sends
+//! each directly over RPC. The fallback spends the wallet, so the executor assembles and lands one
+//! at a time, as a Jito bundle with a sequential RPC fallback.
 
 use std::sync::Arc;
 
@@ -33,7 +34,9 @@ use tokio::{
 
 use crate::clock_manager;
 use crate::wrappers::{
-    liquidator_account::{LiquidatorAccount, PreparedLiquidatableAccount},
+    liquidator_account::{
+        locked_accounts, LiquidatorAccount, PreparedLiquidatableAccount, MAX_TX_ACCOUNT_LOCKS,
+    },
     oracle::OracleWrapper,
     token_account::TokenAccountWrapper,
 };
@@ -193,14 +196,14 @@ impl InventoryStrategy {
 
     /// Builds and simulates the one-transaction plan: the liquidation with the seized collateral
     /// sold for the liability inside it. The swap must guarantee the repay plus `min_profit` for
-    /// at most the seized amount. If a temporary LUT gets created, its key is pushed to `temp_luts`
-    /// even when this fails, so the caller can still deactivate it.
+    /// at most the seized amount, and may only add as many accounts as the liquidation leaves
+    /// under the account-lock limit, so the route is rejected by the aggregator rather than by
+    /// the chain.
     fn build_sandwich_tx(
         &self,
         intent: &PreparedLiquidatableAccount,
         asset_mint: Pubkey,
         liab_mint: Pubkey,
-        temp_luts: &mut Vec<Pubkey>,
     ) -> Result<VersionedTransaction> {
         let asset_amount: u64 = intent.asset_amount.to_num();
         let repay_amount: u64 = intent.liab_amount.to_num();
@@ -208,8 +211,23 @@ impl InventoryStrategy {
             .value_wrapper(&liab_mint)?
             .get_amount_from_value(I80F48::from_num(self.min_profit))?
             .to_num();
+
+        let (liquidation_ixs, _) = self.liquidator_account.liquidation_ixs(
+            intent,
+            intent.asset_amount,
+            intent.liab_amount,
+            None,
+        )?;
+        let transaction_accounts: Vec<Pubkey> =
+            locked_accounts(&self.liquidator_account.signer.pubkey(), &liquidation_ixs)
+                .into_iter()
+                .collect();
+        let max_accounts = MAX_TX_ACCOUNT_LOCKS.saturating_sub(transaction_accounts.len());
+
         let request = RouteRequest {
             allowed_programs: Some(RECEIVERSHIP_SWAP_PROGRAMS.to_vec()),
+            max_accounts,
+            transaction_accounts,
             ..RouteRequest::new(
                 self.liquidator_account.signer.pubkey(),
                 asset_mint,
@@ -230,14 +248,13 @@ impl InventoryStrategy {
             "InventoryStrategy: selling {} {} for at least {} {} in-tx via {:?} (repaying {})",
             asset_amount, asset_mint, swap.min_out_amount, liab_mint, swap.aggregator, repay_amount
         );
-        let (tx, temp_lut) = self.liquidator_account.build_liquidate_tx(
+        let tx = self.liquidator_account.build_liquidate_tx(
             intent,
             intent.asset_amount,
             intent.liab_amount,
             Some(&swap),
         )?;
-        temp_luts.extend(temp_lut);
-        // The executor simulates as well, but only a failure caught here falls back to the buy plan.
+        // A failure caught here falls back to the buy plan; the RPC preflight checks it again.
         self.liquidator_account.simulate_tx(&tx)?;
         Ok(tx)
     }
@@ -317,15 +334,12 @@ impl InventoryStrategy {
             );
         }
 
-        let (liquidate_tx, temp_lut) =
+        let liquidate_tx =
             self.liquidator_account
                 .build_liquidate_tx(intent, asset_amount, repay_amount, None)?;
         txs.push(liquidate_tx);
 
-        Ok(ExecutionPlan {
-            txs,
-            temp_luts: temp_lut.into_iter().collect(),
-        })
+        Ok(ExecutionPlan { txs })
     }
 }
 
@@ -334,40 +348,39 @@ impl LiquidationStrategy for InventoryStrategy {
         "inventory"
     }
 
-    fn assemble(&self, intent: &PreparedLiquidatableAccount) -> Result<Option<ExecutionPlan>> {
+    fn assemble_sandwich(
+        &self,
+        intent: &PreparedLiquidatableAccount,
+    ) -> Result<Option<ExecutionPlan>> {
+        let cache = &self.liquidator_account.cache;
+        let liab_mint = cache.banks.try_get_bank(&intent.liab_bank)?.bank.mint;
+        let asset_mint = cache.banks.try_get_bank(&intent.asset_bank)?.bank.mint;
+
+        match self.build_sandwich_tx(intent, asset_mint, liab_mint) {
+            Ok(tx) => Ok(Some(ExecutionPlan { txs: vec![tx] })),
+            Err(e) => {
+                info!(
+                    "InventoryStrategy: not selling the collateral in-tx for {} ({}); buying the liability instead",
+                    intent.liquidatee_account.address, e
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    fn assemble_with_inventory(
+        &self,
+        intent: &PreparedLiquidatableAccount,
+    ) -> Result<ExecutionPlan> {
         let cache = &self.liquidator_account.cache;
         let liab_mint = cache.banks.try_get_bank(&intent.liab_bank)?.bank.mint;
         let asset_bank = cache.banks.try_get_bank(&intent.asset_bank)?;
-
-        let mut temp_luts = Vec::new();
-        match self.build_sandwich_tx(intent, asset_bank.bank.mint, liab_mint, &mut temp_luts) {
-            Ok(tx) => {
-                return Ok(Some(ExecutionPlan {
-                    txs: vec![tx],
-                    temp_luts,
-                }))
-            }
-            Err(e) => info!(
-                "InventoryStrategy: not selling the collateral in-tx for {} ({}); buying the liability instead",
-                intent.liquidatee_account.address, e
-            ),
-        }
-
-        match self.build_buy_plan(
+        self.build_buy_plan(
             intent,
             asset_bank.bank.mint,
             asset_bank.bank.config.asset_tag,
             liab_mint,
-        ) {
-            Ok(mut plan) => {
-                plan.temp_luts.append(&mut temp_luts);
-                Ok(Some(plan))
-            }
-            Err(e) => {
-                self.liquidator_account.deactivate_luts(temp_luts);
-                Err(e)
-            }
-        }
+        )
     }
 }
 

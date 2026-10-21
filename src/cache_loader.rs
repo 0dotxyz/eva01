@@ -20,7 +20,7 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 
 use crate::{
-    cache::{Cache, GroupedLuts},
+    cache::Cache,
     geyser::AccountType,
     utils::{self, batch_get_multiple_accounts, BatchLoadingConfig},
     wrappers::marginfi_account::MarginfiAccountWrapper,
@@ -104,12 +104,10 @@ impl CacheLoader {
             group3.len()
         );
 
-        *cache.luts.lock().unwrap() = GroupedLuts {
-            group1,
-            group2,
-            group3,
-            deactivating: vec![],
-        };
+        let mut extra = group1;
+        extra.extend(group2);
+        extra.extend(group3);
+        cache.luts.set_extra(extra)?;
 
         Ok(())
     }

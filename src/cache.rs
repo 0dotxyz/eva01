@@ -15,69 +15,22 @@ use anyhow::{anyhow, Result};
 use banks::BanksCache;
 use fixed::types::I80F48;
 use marginfi_type_crate::{
-    constants::{ASSET_TAG_DEFAULT, ASSET_TAG_SOL, ASSET_TAG_STAKED, FEE_STATE_SEED},
-    pdas::derive_kamino_lending_market_authority,
-    types::MarginfiGroup,
+    constants::FEE_STATE_SEED, pdas::derive_kamino_lending_market_authority, types::MarginfiGroup,
 };
 use mints::MintsCache;
 use oracles::OraclesCache;
-use solana_address_lookup_table_interface::{instruction::*, state::AddressLookupTable};
-use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
+use solana_client::rpc_client::RpcClient;
 use solana_clock::Clock;
-use solana_commitment_config::CommitmentConfig;
-use solana_keypair::Keypair;
-use solana_message::AddressLookupTableAccount;
 use solana_pubkey::Pubkey;
-use solana_signer::Signer;
 use tokens::TokensCache;
 
 use crate::{
     clock_manager,
     juplend_earn::accounts::Lending,
     kamino_lending::accounts::Reserve,
-    utils::accessor,
+    utils::{accessor, lut_registry::LutRegistry},
     wrappers::{oracle::OracleWrapper, token_account::TokenAccountWrapper},
 };
-
-#[derive(Default, Clone)]
-pub struct GroupedLuts {
-    pub group1: Vec<AddressLookupTableAccount>,
-    pub group2: Vec<AddressLookupTableAccount>,
-    pub group3: Vec<AddressLookupTableAccount>,
-    /// LUTs pending closure: (address, slot at which deactivation was sent).
-    /// Closeable after 512-slot cooldown.
-    pub deactivating: Vec<(Pubkey, u64)>,
-}
-
-impl GroupedLuts {
-    /// Select LUT groups covering all asset tags present in a liquidation position.
-    /// - group1 included if any tag is DEFAULT(0) or SOL(1)
-    /// - group2 included if any tag is SOL(1) or STAKED(2)
-    /// - group3 included if any tag >= 3 (integration protocol)
-    pub fn select_for_tags(&self, tags: &[u8]) -> Vec<AddressLookupTableAccount> {
-        let has_staked = tags.contains(&ASSET_TAG_STAKED);
-        let needs_group1 = !has_staked
-            && tags
-                .iter()
-                .any(|&t| t == ASSET_TAG_DEFAULT || t == ASSET_TAG_SOL);
-        let needs_group2 = tags
-            .iter()
-            .any(|&t| t == ASSET_TAG_SOL || t == ASSET_TAG_STAKED);
-        let needs_group3 = tags.iter().any(|&t| t >= 3);
-
-        let mut result = Vec::new();
-        if needs_group1 {
-            result.extend_from_slice(&self.group1);
-        }
-        if needs_group2 {
-            result.extend_from_slice(&self.group2);
-        }
-        if needs_group3 {
-            result.extend_from_slice(&self.group3);
-        }
-        result
-    }
-}
 
 pub struct Cache {
     pub signer_pk: Pubkey,
@@ -89,7 +42,7 @@ pub struct Cache {
     pub oracles: OraclesCache,
     pub tokens: TokensCache,
     pub clock: Arc<Mutex<Clock>>,
-    pub luts: Arc<Mutex<GroupedLuts>>,
+    pub luts: Arc<LutRegistry>,
     pub global_fee_state_key: Pubkey,
     pub global_fee_wallet: Pubkey,
     pub liquidation_max_fee: I80F48,
@@ -121,7 +74,7 @@ impl Cache {
             oracles: OraclesCache::default(),
             tokens: TokensCache::default(),
             clock,
-            luts: Arc::new(Mutex::new(GroupedLuts::default())),
+            luts: Arc::new(LutRegistry::default()),
             global_fee_state_key,
             global_fee_wallet: Pubkey::default(),
             liquidation_max_fee: I80F48::ZERO,
@@ -182,190 +135,23 @@ impl Cache {
         })
     }
 
-    /// Creates a fresh, self-contained targeted LUT containing exactly `accounts` and returns it.
-    /// Used only by the tx-too-large ("heavy" tx) retry path — regular liquidations fit within the
-    /// predefined group LUTs and never call this. Each call creates its own LUT (no shared slot),
-    /// so concurrent liquidations never collide; the caller owns the returned key and deactivates
-    /// exactly that key via [`deactivate_lut`](Self::deactivate_lut) once the tx has landed.
-    pub fn get_targeted_lut(
-        &self,
-        rpc_client: &RpcClient,
-        signer_keypair: &Keypair,
-        accounts: Vec<Pubkey>,
-    ) -> anyhow::Result<AddressLookupTableAccount> {
-        create_lut(rpc_client, signer_keypair, accounts)
-    }
-
-    /// Deactivates a specific targeted LUT by key and queues it for closure once the 512-slot
-    /// cooldown has elapsed. Operates only on the passed key — no shared slot — so it is inherently
-    /// concurrency-safe: each liquidation deactivates the LUT it created. On failure the tx errors
-    /// out (LUT not queued) and the caller logs it; the next `try_close_deactivated_luts` sweep is
-    /// unaffected.
-    pub fn deactivate_lut(
-        &self,
-        rpc_client: &RpcClient,
-        signer_keypair: &Keypair,
-        lut_key: Pubkey,
-    ) -> anyhow::Result<()> {
-        let ix = deactivate_lookup_table(lut_key, signer_keypair.pubkey());
-        let recent_blockhash = rpc_client.get_latest_blockhash()?;
-        let tx = solana_transaction::Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&signer_keypair.pubkey()),
-            &[signer_keypair],
-            recent_blockhash,
-        );
-        rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-            &tx,
-            CommitmentConfig::confirmed(),
-            RpcSendTransactionConfig {
-                skip_preflight: true,
-                ..Default::default()
-            },
-        )?;
-
-        let slot = rpc_client.get_slot_with_commitment(CommitmentConfig::confirmed())?;
-        self.luts.lock().unwrap().deactivating.push((lut_key, slot));
-        Ok(())
-    }
-
-    /// Closes any deactivated LUTs that have passed the 512-slot cooldown, reclaiming rent.
-    pub fn try_close_deactivated_luts(&self, rpc_client: &RpcClient, signer_keypair: &Keypair) {
-        const DEACTIVATION_COOLDOWN: u64 = 512;
-
-        let current_slot = match rpc_client.get_slot_with_commitment(CommitmentConfig::confirmed())
-        {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("Failed to get slot for LUT cleanup: {e}");
-                return;
-            }
-        };
-
-        let ready: Vec<Pubkey> = {
-            let luts = self.luts.lock().unwrap();
-            luts.deactivating
-                .iter()
-                .filter(|(_, deactivated_at)| {
-                    current_slot >= deactivated_at + DEACTIVATION_COOLDOWN
-                })
-                .map(|(key, _)| *key)
-                .collect()
-        };
-
-        for lut_key in ready {
-            let ix = close_lookup_table(lut_key, signer_keypair.pubkey(), signer_keypair.pubkey());
-            let blockhash = match rpc_client.get_latest_blockhash() {
-                Ok(h) => h,
-                Err(e) => {
-                    log::warn!("Failed to get blockhash for closing LUT {lut_key}: {e}");
-                    continue;
-                }
-            };
-            let tx = solana_transaction::Transaction::new_signed_with_payer(
-                &[ix],
-                Some(&signer_keypair.pubkey()),
-                &[signer_keypair],
-                blockhash,
-            );
-            match rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-                &tx,
-                CommitmentConfig::confirmed(),
-                RpcSendTransactionConfig {
-                    skip_preflight: true,
-                    ..Default::default()
-                },
-            ) {
-                Ok(_) => {
-                    log::info!("Closed deactivated LUT {lut_key}, reclaimed rent.");
-                    self.luts
-                        .lock()
-                        .unwrap()
-                        .deactivating
-                        .retain(|(k, _)| *k != lut_key);
-                }
-                Err(e) => {
-                    log::warn!("Failed to close LUT {lut_key}: {e}");
+    /// Re-reads the wallet's token accounts from the chain. Geyser updates are applied only when the
+    /// liquidator loop drains them, so right after a liquidation lands the cached balances still show
+    /// the pre-liquidation state; anything that sizes a swap from them must refresh first.
+    pub fn refresh_wallet_tokens(&self, rpc_client: &RpcClient) -> Result<usize> {
+        let addresses = self.mints.get_tokens();
+        if addresses.is_empty() {
+            return Ok(0);
+        }
+        let mut refreshed = 0;
+        for chunk in addresses.chunks(100) {
+            for (address, account) in chunk.iter().zip(rpc_client.get_multiple_accounts(chunk)?) {
+                if let Some(account) = account {
+                    self.tokens.try_update_account(*address, account)?;
+                    refreshed += 1;
                 }
             }
         }
+        Ok(refreshed)
     }
-}
-
-fn create_lut(
-    rpc_client: &RpcClient,
-    signer_keypair: &Keypair,
-    addresses: Vec<Pubkey>,
-) -> anyhow::Result<AddressLookupTableAccount> {
-    // Derive the LUT from a FINALIZED slot, not the latest confirmed one. `create_lookup_table`
-    // requires `recent_slot` to be present in the on-chain `SlotHashes` when the tx executes; the
-    // latest confirmed slot can be a slot or two ahead of the node that processes the create tx
-    // (its future) → `InstructionError::InvalidArgument` ("invalid program argument"). A finalized
-    // slot is firmly in the past for every node and still well inside the 512-slot SlotHashes window.
-    let recent_slot = rpc_client.get_slot_with_commitment(CommitmentConfig::finalized())?;
-    let (create_ix, lut_address) = create_lookup_table(
-        signer_keypair.pubkey(),
-        signer_keypair.pubkey(),
-        recent_slot,
-    );
-
-    let recent_blockhash = rpc_client.get_latest_blockhash()?;
-    let tx = solana_transaction::Transaction::new_signed_with_payer(
-        &[create_ix],
-        Some(&signer_keypair.pubkey()),
-        &[signer_keypair],
-        recent_blockhash,
-    );
-    rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-        &tx,
-        CommitmentConfig::confirmed(),
-        RpcSendTransactionConfig {
-            skip_preflight: true,
-            ..Default::default()
-        },
-    )?;
-
-    let updated_addresses = extend_lut(rpc_client, signer_keypair, lut_address, addresses)?;
-    Ok(AddressLookupTableAccount {
-        key: lut_address,
-        addresses: updated_addresses,
-    })
-}
-
-fn extend_lut(
-    rpc_client: &RpcClient,
-    signer_keypair: &Keypair,
-    lut_address: Pubkey,
-    addresses: Vec<Pubkey>,
-) -> anyhow::Result<Vec<Pubkey>> {
-    const NEW_ADDRESSES_MAX: usize = 20;
-
-    for chunk in addresses.chunks(NEW_ADDRESSES_MAX) {
-        let ix = extend_lookup_table(
-            lut_address,
-            signer_keypair.pubkey(),
-            Some(signer_keypair.pubkey()),
-            chunk.to_vec(),
-        );
-
-        let recent_blockhash = rpc_client.get_latest_blockhash()?;
-        let tx = solana_transaction::Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&signer_keypair.pubkey()),
-            &[signer_keypair],
-            recent_blockhash,
-        );
-        rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-            &tx,
-            CommitmentConfig::confirmed(),
-            RpcSendTransactionConfig {
-                skip_preflight: true,
-                ..Default::default()
-            },
-        )?;
-    }
-
-    let lut_account = rpc_client.get_account(&lut_address)?;
-    let lut = AddressLookupTable::deserialize(&lut_account.data).unwrap();
-    Ok(lut.addresses.to_vec())
 }
