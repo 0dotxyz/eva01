@@ -133,19 +133,16 @@ impl LiquidatorAccount {
         if let Some(swap) = swap {
             luts.extend(self.fetch_luts(&swap.address_lookup_tables)?);
         }
-        // Only a sandwich can carry accounts no table knows (the swap route's); learn those, but
-        // never the liquidatee's own account and record, which no other liquidation references.
-        let per_target = swap.map(|_| {
-            let liquidatee = account.liquidatee_account.address;
-            let record = match account.liquidatee_account.account.liquidation_record {
-                record if record == Pubkey::default() => {
-                    make_init_liquidation_record_ix(liquidatee, self.signer.pubkey()).1
-                }
-                record => record,
-            };
-            vec![liquidatee, record]
-        });
-        self.compile_tx_fit(&ixs, &luts, per_target.as_deref())
+        // Whatever doesn't fit gets learned for next time, except the liquidatee's own account and
+        // record, which no other liquidation references.
+        let liquidatee = account.liquidatee_account.address;
+        let record = match account.liquidatee_account.account.liquidation_record {
+            record if record == Pubkey::default() => {
+                make_init_liquidation_record_ix(liquidatee, self.signer.pubkey()).1
+            }
+            record => record,
+        };
+        self.compile_tx_fit(&ixs, &luts, &[liquidatee, record])
     }
 
     /// The liquidation's instructions, in order, plus the lookup tables that cover them (the
@@ -545,14 +542,14 @@ impl LiquidatorAccount {
     }
 
     /// Compiles and signs `ixs` with every lookup table that applies. Over the account-lock limit
-    /// nothing helps, so that fails first. Over the byte limit, the transaction fails too, and with
-    /// `learn` (the per-target accounts to leave out) the other addresses no table holds are added
-    /// to the owned tables in the background, so the next attempt fits.
+    /// nothing helps, so that fails first. Over the byte limit, the transaction fails too, and the
+    /// addresses no table holds (except `per_target`, which only this liquidation references) are
+    /// added to the owned tables in the background, so the next attempt fits.
     fn compile_tx_fit(
         &self,
         ixs: &[Instruction],
         luts: &[AddressLookupTableAccount],
-        learn: Option<&[Pubkey]>,
+        per_target: &[Pubkey],
     ) -> Result<VersionedTransaction> {
         let signer_pk = self.signer.pubkey();
         let locks = locked_accounts(&signer_pk, ixs).len();
@@ -578,14 +575,11 @@ impl LiquidatorAccount {
             .into_iter()
             .filter(|key| !in_tables.contains(key))
             .collect();
-        let learnable: Vec<Pubkey> = match learn {
-            Some(per_target) => uncovered
-                .iter()
-                .filter(|key| !per_target.contains(key))
-                .copied()
-                .collect(),
-            None => Vec::new(),
-        };
+        let learnable: Vec<Pubkey> = uncovered
+            .iter()
+            .filter(|key| !per_target.contains(key))
+            .copied()
+            .collect();
         if !learnable.is_empty() {
             self.cache.luts.cover_in_background(
                 self.rpc_url.clone(),

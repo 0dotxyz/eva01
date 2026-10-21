@@ -203,6 +203,7 @@ impl Executor {
             Ok(Some(ExecutionPlan { txs })) => {
                 let result = self.send_over_rpc(&txs, "Sandwich");
                 self.note_outcome(&liquidatee, result.is_err());
+                self.refresh_wallet_balances();
                 return result;
             }
             Ok(None) => {}
@@ -223,10 +224,17 @@ impl Executor {
             .lock()
             .map_err(|_| anyhow!("inventory lock poisoned"))?;
         let result = self.execute_with_inventory(strategy, intent, liab_mint);
-        if let Err(e) = self.cache.refresh_wallet_tokens(&self.rpc_client) {
-            warn!("Failed to refresh the wallet balances after an inventory plan: {e}");
-        }
+        self.refresh_wallet_balances();
         result
+    }
+
+    /// A landed liquidation changed the wallet's balances, and the Geyser updates reporting that
+    /// are only applied when the liquidator loop drains them. Anything sizing a swap from the cache
+    /// before then (the next inventory plan, the rebalancer's sweep) needs the real balances.
+    fn refresh_wallet_balances(&self) {
+        if let Err(e) = self.cache.refresh_wallet_tokens(&self.rpc_client) {
+            warn!("Failed to refresh the wallet balances: {e}");
+        }
     }
 
     /// Assemble and land a plan that spends wallet inventory. Caller holds the inventory lock.
