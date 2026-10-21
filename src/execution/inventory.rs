@@ -205,7 +205,15 @@ impl InventoryStrategy {
         asset_mint: Pubkey,
         liab_mint: Pubkey,
     ) -> Result<VersionedTransaction> {
-        let asset_amount: u64 = intent.asset_amount.to_num();
+        // What the withdraw hands the wallet, which is what the swap can sell.
+        let asset_bank = self
+            .liquidator_account
+            .cache
+            .banks
+            .try_get_bank(&intent.asset_bank)?;
+        let asset_amount: u64 = self
+            .liquidator_account
+            .seized_underlying_amount(&asset_bank, intent.asset_amount)?;
         let repay_amount: u64 = intent.liab_amount.to_num();
         let min_profit: u64 = self
             .value_wrapper(&liab_mint)?

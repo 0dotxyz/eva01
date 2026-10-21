@@ -1,4 +1,7 @@
-use super::marginfi_account::{MarginfiAccountWrapper, ObservationAccounts};
+use super::{
+    bank::BankWrapper,
+    marginfi_account::{MarginfiAccountWrapper, ObservationAccounts},
+};
 use crate::{
     cache::Cache,
     config::Eva01Config,
@@ -47,6 +50,17 @@ pub fn is_seizable_asset_tag(tag: u8) -> bool {
 const MAX_TX_SIZE: usize = 1232;
 /// Runtime cap on accounts one transaction may load, LUT-resolved or not.
 pub const MAX_TX_ACCOUNT_LOCKS: usize = 64;
+
+/// JupLend's `token_exchange_price` is scaled by this: underlying = fTokens * price / 1e12.
+const JUPLEND_EXCHANGE_PRICE_PRECISION: u128 = 1_000_000_000_000;
+
+/// Underlying tokens that `f_tokens` of a JupLend position redeem to, rounded down so the program's
+/// `ceil(underlying * 1e12 / price)` burns no more fTokens than the position holds.
+fn juplend_underlying_amount(f_tokens: I80F48, token_exchange_price: u64) -> u64 {
+    let f_tokens: u128 = f_tokens.to_num::<u64>().into();
+    u64::try_from(f_tokens * u128::from(token_exchange_price) / JUPLEND_EXCHANGE_PRICE_PRECISION)
+        .unwrap_or(u64::MAX)
+}
 
 /// Unique accounts the compiled transaction will lock: the payer, every program and every account
 /// meta. (The blockhash is not an account.)
@@ -262,7 +276,7 @@ impl LiquidatorAccount {
                     &asset_mint_wrapper,
                     &lending_state,
                     liquidatee_observation_accounts.as_ref(),
-                    asset_amount.to_num(),
+                    juplend_underlying_amount(asset_amount, lending_state.token_exchange_price),
                     false,
                 )
             }
@@ -305,6 +319,24 @@ impl LiquidatorAccount {
         ixs.push(end_ix);
 
         Ok((ixs, self.cache.luts.tables()))
+    }
+
+    /// The underlying tokens the wallet receives for seizing `bank_units` of `bank`'s collateral:
+    /// the amount a swap of that collateral can sell. Bank balances are venue shares: a JupLend
+    /// balance is fTokens, redeemed at the lending state's exchange price (and its withdraw takes
+    /// the underlying amount). A Kamino balance is collateral tokens, which its withdraw takes
+    /// directly and redeems at a rate of at least one, so the share count is a safe lower bound.
+    pub fn seized_underlying_amount(&self, bank: &BankWrapper, bank_units: I80F48) -> Result<u64> {
+        if bank.bank.config.asset_tag == ASSET_TAG_JUPLEND {
+            let lending = self
+                .cache
+                .try_get_juplend_lending_state(&bank.bank.integration_acc_1)?;
+            return Ok(juplend_underlying_amount(
+                bank_units,
+                lending.token_exchange_price,
+            ));
+        }
+        Ok(bank_units.to_num())
     }
 
     /// Every address the liquidation instructions can reference for `bank_pk`, independent of the
@@ -641,6 +673,27 @@ mod tests {
     use super::*;
 
     use solana_instruction::AccountMeta;
+
+    #[test]
+    fn juplend_underlying_never_burns_more_shares_than_held() {
+        let precision = JUPLEND_EXCHANGE_PRICE_PRECISION;
+        for (shares, price) in [
+            (535_916u64, 1_054_321_987_654u64),
+            (1u64, 1_999_999_999_999u64),
+            (170_782u64, 1_000_000_000_001u64),
+            (123_456_789u64, 999_999_999_999u64),
+        ] {
+            let underlying = juplend_underlying_amount(I80F48::from_num(shares), price);
+            // The program burns ceil(underlying * 1e12 / price) fTokens.
+            let burned = (u128::from(underlying) * precision).div_ceil(u128::from(price));
+            assert!(
+                burned <= u128::from(shares),
+                "{shares} @ {price}: burns {burned}"
+            );
+            // And never leaves more than one share's worth on the table.
+            assert!(u128::from(shares) - burned <= 1);
+        }
+    }
 
     #[test]
     fn locked_accounts_counts_unique_payer_programs_and_metas() {

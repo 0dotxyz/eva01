@@ -50,6 +50,15 @@ const BUNDLE_CONFIRM_ATTEMPTS: usize = 3;
 const SIGNATURE_CONFIRM_ATTEMPTS: usize = 10;
 const SIGNATURE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// A transaction sent over RPC is re-sent this often until it confirms or its blockhash expires:
+/// a single send can be dropped on the way to the leader, which is indistinguishable from a slow
+/// confirmation, and the signature makes every re-send idempotent.
+const RESEND_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the status of an in-flight RPC send is polled.
+const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Hard ceiling on waiting for an RPC send, in case the blockhash validity check misbehaves.
+const SEND_MAX_WAIT: Duration = Duration::from_secs(90);
+
 /// Re-check a liability mint that has no swap route only after this long (routes can appear).
 const NO_ROUTE_QUARANTINE_TTL: Duration = Duration::from_secs(3600);
 
@@ -515,17 +524,7 @@ impl Executor {
                 loaded,
                 tx.message.recent_blockhash()
             );
-            match self
-                .rpc_client
-                .send_and_confirm_transaction_with_spinner_and_config(
-                    tx,
-                    CommitmentConfig::confirmed(),
-                    RpcSendTransactionConfig {
-                        skip_preflight: false,
-                        preflight_commitment: Some(CommitmentLevel::Processed),
-                        ..Default::default()
-                    },
-                ) {
+            match self.send_with_resend(tx) {
                 Ok(sig) => info!("{} tx {}/{} confirmed: {}", label, i + 1, txs.len(), sig),
                 Err(e) => {
                     // A tx that passed preflight but never landed leaves no trace on-chain; the
@@ -542,6 +541,71 @@ impl Executor {
             }
         }
         Ok(())
+    }
+
+    /// Sends `tx` with preflight, then re-sends it every [`RESEND_INTERVAL`] (without preflight)
+    /// while polling its status, until it is confirmed, reverts, or its blockhash expires.
+    fn send_with_resend(&self, tx: &VersionedTransaction) -> Result<Signature> {
+        let blockhash = *tx.message.recent_blockhash();
+        let sig = self.rpc_client.send_transaction_with_config(
+            tx,
+            RpcSendTransactionConfig {
+                skip_preflight: false,
+                preflight_commitment: Some(CommitmentLevel::Processed),
+                ..Default::default()
+            },
+        )?;
+
+        let started = Instant::now();
+        let mut last_sent = Instant::now();
+        let mut resends = 0u32;
+        loop {
+            thread::sleep(STATUS_POLL_INTERVAL);
+
+            match self.rpc_client.get_signature_statuses(&[sig]) {
+                Ok(resp) => {
+                    if let Some(Some(status)) = resp.value.into_iter().next() {
+                        if let Some(err) = status.err {
+                            return Err(anyhow!("{sig} reverted on-chain: {err:?}"));
+                        }
+                        if status.satisfies_commitment(CommitmentConfig::confirmed()) {
+                            if resends > 0 {
+                                debug!("{sig} confirmed after {resends} re-send(s)");
+                            }
+                            return Ok(sig);
+                        }
+                    }
+                }
+                Err(e) => debug!("status poll for {sig} failed: {e}"),
+            }
+
+            let blockhash_valid = self
+                .rpc_client
+                .is_blockhash_valid(&blockhash, CommitmentConfig::processed())
+                .unwrap_or(true);
+            if !blockhash_valid || started.elapsed() > SEND_MAX_WAIT {
+                return Err(anyhow!(
+                    "{sig} not confirmed after {}s and {resends} re-send(s) (blockhash valid: {blockhash_valid})",
+                    started.elapsed().as_secs()
+                ));
+            }
+
+            if last_sent.elapsed() >= RESEND_INTERVAL {
+                // Already-processed and similar rejections mean it landed or is landing; the
+                // status poll above settles it either way.
+                if let Err(e) = self.rpc_client.send_transaction_with_config(
+                    tx,
+                    RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        ..Default::default()
+                    },
+                ) {
+                    debug!("re-send of {sig} rejected: {e}");
+                }
+                last_sent = Instant::now();
+                resends += 1;
+            }
+        }
     }
 
     /// Diagnostics for a tx the RPC accepted but that never confirmed: its on-chain status (with
