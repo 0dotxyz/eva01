@@ -67,7 +67,7 @@ warp = "0.4.2"
 yellowstone-grpc-client = "10.2.0"
 yellowstone-grpc-proto = { version = "10.1.1", default-features = false, features = ["tonic", "tonic-compression"] }
 
-solana-dex-superagg = { git = "https://github.com/0dotxyz/solana-dex-superagg", rev = "260ebb8dd87f82b80369b8958e9f34ee4c2f8c66" }
+solana-dex-superagg = { git = "https://github.com/0dotxyz/solana-dex-superagg", rev = "fad8f15586b637f3d45d6e9b2609be6eb9d477a0" }
 pyth-solana-receiver-sdk = { git = "https://github.com/0dotxyz/pyth-crosschain", rev = "f170d205e47a6ea34ad30c424d9ec8cc61a1f1fc", features = ["pro-compatible"] }
 pythnet-sdk = { git = "https://github.com/0dotxyz/pyth-crosschain", rev = "f170d205e47a6ea34ad30c424d9ec8cc61a1f1fc" }
 
