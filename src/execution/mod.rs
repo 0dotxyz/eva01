@@ -37,17 +37,26 @@ pub trait LiquidationStrategy {
     /// Stable name for logs/metrics (e.g. "inventory", "flashloan").
     fn name(&self) -> &'static str;
 
-    /// Assemble the self-funded single-tx plan, or `None` when this intent can't be funded from its
-    /// own collateral (no route, doesn't fit, simulation fails) and the inventory plan is needed.
-    fn assemble_sandwich(
-        &self,
-        intent: &PreparedLiquidatableAccount,
-    ) -> Result<Option<ExecutionPlan>>;
+    /// Assemble the self-funded single-tx plan, or say why the inventory plan is needed instead.
+    fn assemble_sandwich(&self, intent: &PreparedLiquidatableAccount) -> Result<Sandwich>;
 
     /// Assemble the plan that spends wallet inventory. Called with the inventory lock held, so the
-    /// wallet balance it reads is stable until the plan has landed or failed.
+    /// wallet balance it reads is stable until the plan has landed or failed. `collateral_sellable`
+    /// is what the sandwich attempt learned: whether any venue quotes the seized collateral.
     fn assemble_with_inventory(
         &self,
         intent: &PreparedLiquidatableAccount,
+        collateral_sellable: bool,
     ) -> Result<ExecutionPlan>;
+}
+
+/// The outcome of trying to fund a liquidation from its own collateral.
+pub enum Sandwich {
+    Plan(ExecutionPlan),
+    /// No sandwich (no route, doesn't fit, simulation fails). `collateral_sellable` is false only
+    /// when no venue quoted the collateral at all, which an inventory plan must respect for
+    /// collateral the rebalancer could then never sell.
+    Unavailable {
+        collateral_sellable: bool,
+    },
 }

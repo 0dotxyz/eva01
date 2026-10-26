@@ -15,8 +15,7 @@
 //! current one is full. Referencing a table costs no account lock and ~34 bytes, and the compiler
 //! references only the tables it draws from, so every table is passed on every compile.
 //!
-//! Optional, read-only extra tables (the frontend's per-group tables from the env) are used the
-//! same way but never written.
+//! Optional, read-only extra tables (the per-group tables) are used the same way but never written.
 
 use std::{
     collections::HashSet,

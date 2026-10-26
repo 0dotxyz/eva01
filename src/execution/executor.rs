@@ -22,10 +22,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use log::{debug, info, warn};
-use solana_client::{
-    rpc_client::RpcClient,
-    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
-};
+use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
@@ -36,7 +33,7 @@ use crate::cache::Cache;
 use crate::utils::jito::{BundleOutcome, JitoClient, TipEstimator};
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 
-use super::{ExecutionPlan, LiquidationStrategy};
+use super::{ExecutionPlan, LiquidationStrategy, Sandwich};
 
 /// Number of Jito status polls before checking the chain directly. Kept small: the public status
 /// endpoint is frequently rate-limited, so the RPC signature check below is the real confirmation
@@ -208,19 +205,21 @@ impl Executor {
 
         // A sandwich funds itself from the seized collateral: no wallet inventory, no bundle, no
         // serialization. Simulated during assembly; the RPC preflight is the second check.
-        match strategy.assemble_sandwich(intent) {
-            Ok(Some(ExecutionPlan { txs })) => {
+        let collateral_sellable = match strategy.assemble_sandwich(intent) {
+            Ok(Sandwich::Plan(ExecutionPlan { txs })) => {
                 let result = self.send_over_rpc(&txs, "Sandwich");
                 self.note_outcome(&liquidatee, result.is_err());
                 self.refresh_wallet_balances();
                 return result;
             }
-            Ok(None) => {}
+            Ok(Sandwich::Unavailable {
+                collateral_sellable,
+            }) => collateral_sellable,
             Err(e) => {
                 self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
                 return Err(e);
             }
-        }
+        };
 
         // Inventory plans run one at a time, end to end.
         debug!(
@@ -232,7 +231,7 @@ impl Executor {
             .inventory_lock
             .lock()
             .map_err(|_| anyhow!("inventory lock poisoned"))?;
-        let result = self.execute_with_inventory(strategy, intent, liab_mint);
+        let result = self.execute_with_inventory(strategy, intent, liab_mint, collateral_sellable);
         self.refresh_wallet_balances();
         result
     }
@@ -252,9 +251,10 @@ impl Executor {
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
         liab_mint: Pubkey,
+        collateral_sellable: bool,
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
-        let plan = match strategy.assemble_with_inventory(intent) {
+        let plan = match strategy.assemble_with_inventory(intent, collateral_sellable) {
             Ok(plan) => plan,
             Err(e) => {
                 // Record a quarantine/backoff so we stop hammering this target, then propagate so
@@ -502,34 +502,9 @@ impl Executor {
     /// Send each transaction over RPC in order, with preflight, confirming before moving on.
     fn send_over_rpc(&self, txs: &[VersionedTransaction], label: &str) -> Result<()> {
         for (i, tx) in txs.iter().enumerate() {
-            let sig = tx.signatures.first().copied().unwrap_or_default();
-            let size = bincode::serialize(tx).map(|b| b.len()).unwrap_or(0);
-            let loaded = tx.message.static_account_keys().len()
-                + tx.message
-                    .address_table_lookups()
-                    .map(|lookups| {
-                        lookups
-                            .iter()
-                            .map(|l| l.writable_indexes.len() + l.readonly_indexes.len())
-                            .sum::<usize>()
-                    })
-                    .unwrap_or(0);
-            info!(
-                "{} tx {}/{}: sending {} ({} bytes, {} accounts, blockhash {})",
-                label,
-                i + 1,
-                txs.len(),
-                sig,
-                size,
-                loaded,
-                tx.message.recent_blockhash()
-            );
             match self.send_with_resend(tx) {
                 Ok(sig) => info!("{} tx {}/{} confirmed: {}", label, i + 1, txs.len(), sig),
                 Err(e) => {
-                    // A tx that passed preflight but never landed leaves no trace on-chain; the
-                    // only diagnosis is to re-simulate it now and record what the chain says.
-                    self.log_vanished_tx(tx, &sig);
                     return Err(anyhow!(
                         "{} send failed at tx {}/{}: {}",
                         label,
@@ -606,36 +581,5 @@ impl Executor {
                 resends += 1;
             }
         }
-    }
-
-    /// Diagnostics for a tx the RPC accepted but that never confirmed: its on-chain status (with
-    /// history search) and a fresh simulation at confirmed commitment.
-    fn log_vanished_tx(&self, tx: &VersionedTransaction, sig: &Signature) {
-        let status = self
-            .rpc_client
-            .get_signature_statuses_with_history(&[*sig])
-            .map(|resp| format!("{:?}", resp.value.first().cloned().flatten()))
-            .unwrap_or_else(|e| format!("status lookup failed: {e}"));
-        let sim = self
-            .rpc_client
-            .simulate_transaction_with_config(
-                tx,
-                RpcSimulateTransactionConfig {
-                    sig_verify: false,
-                    replace_recent_blockhash: true,
-                    commitment: Some(CommitmentConfig::confirmed()),
-                    ..Default::default()
-                },
-            )
-            .map(|resp| {
-                let logs = resp.value.logs.unwrap_or_default();
-                let tail = logs.len().saturating_sub(6);
-                format!("err {:?}; logs tail {:?}", resp.value.err, &logs[tail..])
-            })
-            .unwrap_or_else(|e| format!("re-simulation failed: {e}"));
-        warn!(
-            "Tx {} did not land: status {}; re-simulated now: {}",
-            sig, status, sim
-        );
     }
 }

@@ -7,11 +7,11 @@
 //! later.
 //!
 //! Fallback, two transactions: buy the liability shortfall from the swap_mint reserve (USDC) in a
-//! separate DEX swap, then liquidate. The buy is ExactIn, since many routes don't support ExactOut:
-//! the input is sized from the liability's oracle price plus a buffer, and the aggregator raises
-//! it if the quote falls short. It never spends more than the shortfall's oracle value plus the
-//! liquidation's margin above `min_profit`. The rebalancer sells the seized collateral and any
-//! excess liability afterwards.
+//! separate DEX swap, capped at what the wallet holds, then liquidate. The buy is ExactIn, since
+//! many routes don't support ExactOut: the input is sized from the liability's oracle price plus a
+//! buffer, and the aggregator raises it if the quote falls short. It never spends more than the
+//! shortfall's oracle value plus the liquidation's margin above `min_profit`. The rebalancer sells
+//! the seized collateral and any excess liability afterwards.
 //!
 //! A sandwich touches no wallet inventory, so the executor runs sandwiches in parallel and sends
 //! each directly over RPC. The fallback spends the wallet, so the executor assembles and lands one
@@ -39,11 +39,25 @@ use crate::wrappers::{
     token_account::TokenAccountWrapper,
 };
 
-use super::{ExecutionPlan, LiquidationStrategy};
+use super::{ExecutionPlan, LiquidationStrategy, Sandwich};
 
 /// Liability still to buy: `repay_amount` truncated like the repay ix, minus what the wallet holds.
 fn buy_shortfall(repay_amount: I80F48, wallet_balance: u64) -> u64 {
     repay_amount.to_num::<u64>().saturating_sub(wallet_balance)
+}
+
+/// Whether a failed sandwich means no venue would quote the collateral at all, as opposed to a
+/// route that exists but pays too little, doesn't fit, or fails to build.
+fn no_venue_quoted(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("No aggregator returned a quote") || text.contains("NO_ROUTES_FOUND")
+}
+
+/// swap_mint to spend on a buy: what the oracle says the shortfall costs, or everything the wallet
+/// holds when that is less. A smaller buy still liquidates, just a smaller share; refusing would
+/// liquidate nothing until the rebalancer refills the wallet.
+fn affordable_input(wanted: u64, wallet_swap_mint: u64) -> u64 {
+    wanted.min(wallet_swap_mint)
 }
 
 /// Programs marginfi lets a swap call between the start and end of a receivership: the venues'
@@ -112,65 +126,40 @@ impl InventoryStrategy {
         })
     }
 
-    /// Refuse collateral that could not be sold afterwards for the repay plus `min_profit`. For
-    /// staked collateral: single-validator LSTs often have no DEX market.
-    fn check_exit_liquidity(
-        &self,
-        asset_mint: Pubkey,
-        asset_amount: u64,
-        liab_mint: Pubkey,
-        repay_amount: u64,
-    ) -> Result<()> {
-        let quotes = self
-            .tokio_rt
-            .block_on(async {
-                let _permit = self.dex_gate.acquire().await?;
-                self.dex_client
-                    .quote(asset_mint, self.swap_mint, asset_amount)
-                    .await
-            })
-            .map_err(|e| anyhow!("no exit route for {} {}: {}", asset_amount, asset_mint, e))?;
-
-        let exit_value = self
-            .value_wrapper(&self.swap_mint)?
-            .get_value_for_amount(I80F48::from_num(quotes[0].min_out_amount))?;
-        let repay_value = self
-            .value_wrapper(&liab_mint)?
-            .get_value_for_amount(I80F48::from_num(repay_amount))?;
-        if exit_value < repay_value + I80F48::from_num(self.min_profit) {
-            return Err(anyhow!(
-                "seized {} {} would sell for ${:.6} against a ${:.6} repay; not seizing collateral \
-                 that can't be exited at a profit",
-                asset_amount,
-                asset_mint,
-                exit_value.to_num::<f64>(),
-                repay_value.to_num::<f64>()
-            ));
-        }
-        Ok(())
-    }
-
     /// Builds a signed ExactIn buy of `output_mint`, spending the oracle value of `amount` in
-    /// swap_mint. Returns the transaction and how much it guarantees to deliver, which may be less
-    /// than `amount` when the market is worse than the oracle.
+    /// swap_mint, or all of the `wallet_swap_mint` the wallet holds if that is less. Returns the
+    /// transaction and how much it guarantees to deliver, which may be less than `amount` when the
+    /// market is worse than the oracle or the wallet can't afford the whole buy; the caller
+    /// shrinks the liquidation to what it will hold.
     fn build_buy_tx(
         &self,
         output_mint: Pubkey,
         amount: u64,
+        wallet_swap_mint: u64,
     ) -> Result<(VersionedTransaction, u64)> {
         let value = self
             .value_wrapper(&output_mint)?
             .get_value_for_amount(I80F48::from_num(amount))?;
-        let input_amount: u64 = self
+        let wanted_input: u64 = self
             .value_wrapper(&self.swap_mint)?
             .get_amount_from_value(value)?
             .to_num();
+        let input_amount = affordable_input(wanted_input, wallet_swap_mint);
         if input_amount == 0 {
             return Err(anyhow!(
-                "computed zero swap_mint input for buying {} {}",
+                "no {} to buy {} {} with (wallet holds {}, wanted {})",
+                self.swap_mint,
                 amount,
-                output_mint
+                output_mint,
+                wallet_swap_mint,
+                wanted_input
             ));
+        }
+        if input_amount < wanted_input {
+            info!(
+                "InventoryStrategy: the wallet holds {} {}, short of the {} the buy wants; buying what it can",
+                wallet_swap_mint, self.swap_mint, wanted_input
+            );
         }
 
         let prepared = self
@@ -220,7 +209,7 @@ impl InventoryStrategy {
             .get_amount_from_value(I80F48::from_num(self.min_profit))?
             .to_num();
 
-        let (liquidation_ixs, _) = self.liquidator_account.liquidation_ixs(
+        let (liquidation_ixs, _, _) = self.liquidator_account.liquidation_ixs(
             intent,
             intent.asset_amount,
             intent.liab_amount,
@@ -277,21 +266,27 @@ impl InventoryStrategy {
         asset_mint: Pubkey,
         asset_tag: u8,
         liab_mint: Pubkey,
+        collateral_sellable: bool,
     ) -> Result<ExecutionPlan> {
         let mut asset_amount = intent.asset_amount;
         let mut repay_amount = intent.liab_amount;
-        if asset_tag == ASSET_TAG_STAKED {
-            self.check_exit_liquidity(
-                asset_mint,
-                asset_amount.to_num(),
-                liab_mint,
-                repay_amount.to_num(),
-            )?;
+        // Staked collateral is often a single-validator LST with no DEX market; seizing it would
+        // leave the rebalancer holding what it can't sell. The sandwich attempt just asked every
+        // venue for a quote, so its answer is reused rather than quoted again.
+        if asset_tag == ASSET_TAG_STAKED && !collateral_sellable {
+            return Err(anyhow!(
+                "no venue quotes the staked collateral {}; not seizing what can't be sold",
+                asset_mint
+            ));
         }
 
         let wallet_liab = self
             .liquidator_account
             .get_token_balance_for_mint(&liab_mint)
+            .unwrap_or(0);
+        let wallet_swap_mint = self
+            .liquidator_account
+            .get_token_balance_for_mint(&self.swap_mint)
             .unwrap_or(0);
         let shortfall = buy_shortfall(repay_amount, wallet_liab);
 
@@ -304,7 +299,7 @@ impl InventoryStrategy {
                 wallet_liab,
                 repay_amount.to_num::<u64>()
             );
-            let (buy_tx, bought) = self.build_buy_tx(liab_mint, shortfall)?;
+            let (buy_tx, bought) = self.build_buy_tx(liab_mint, shortfall, wallet_swap_mint)?;
             txs.push(buy_tx);
 
             if bought < shortfall {
@@ -356,22 +351,21 @@ impl LiquidationStrategy for InventoryStrategy {
         "inventory"
     }
 
-    fn assemble_sandwich(
-        &self,
-        intent: &PreparedLiquidatableAccount,
-    ) -> Result<Option<ExecutionPlan>> {
+    fn assemble_sandwich(&self, intent: &PreparedLiquidatableAccount) -> Result<Sandwich> {
         let cache = &self.liquidator_account.cache;
         let liab_mint = cache.banks.try_get_bank(&intent.liab_bank)?.bank.mint;
         let asset_mint = cache.banks.try_get_bank(&intent.asset_bank)?.bank.mint;
 
         match self.build_sandwich_tx(intent, asset_mint, liab_mint) {
-            Ok(tx) => Ok(Some(ExecutionPlan { txs: vec![tx] })),
+            Ok(tx) => Ok(Sandwich::Plan(ExecutionPlan { txs: vec![tx] })),
             Err(e) => {
                 info!(
                     "InventoryStrategy: not selling the collateral in-tx for {} ({}); buying the liability instead",
                     intent.liquidatee_account.address, e
                 );
-                Ok(None)
+                Ok(Sandwich::Unavailable {
+                    collateral_sellable: !no_venue_quoted(&e),
+                })
             }
         }
     }
@@ -379,6 +373,7 @@ impl LiquidationStrategy for InventoryStrategy {
     fn assemble_with_inventory(
         &self,
         intent: &PreparedLiquidatableAccount,
+        collateral_sellable: bool,
     ) -> Result<ExecutionPlan> {
         let cache = &self.liquidator_account.cache;
         let liab_mint = cache.banks.try_get_bank(&intent.liab_bank)?.bank.mint;
@@ -388,6 +383,7 @@ impl LiquidationStrategy for InventoryStrategy {
             asset_bank.bank.mint,
             asset_bank.bank.config.asset_tag,
             liab_mint,
+            collateral_sellable,
         )
     }
 }
@@ -396,6 +392,32 @@ impl LiquidationStrategy for InventoryStrategy {
 mod tests {
     use super::*;
     use fixed_macro::types::I80F48;
+
+    #[test]
+    fn only_a_missing_quote_marks_collateral_unsellable() {
+        assert!(no_venue_quoted(&anyhow!(
+            "No aggregator returned a quote (Jupiter: 429; Titan: timeout)"
+        )));
+        assert!(no_venue_quoted(&anyhow!(
+            "Jupiter quote failed: NO_ROUTES_FOUND"
+        )));
+        assert!(!no_venue_quoted(&anyhow!(
+            "No route pays 541005 X for at most 535916 Y"
+        )));
+        assert!(!no_venue_quoted(&anyhow!(
+            "transaction loads 75 accounts (max 64)"
+        )));
+        assert!(!no_venue_quoted(&anyhow!(
+            "Could not build swap instructions on any venue (Jupiter: adds 27 accounts)"
+        )));
+    }
+
+    #[test]
+    fn affordable_input_is_capped_by_the_wallet() {
+        assert_eq!(affordable_input(1_000, 1_500), 1_000);
+        assert_eq!(affordable_input(1_000, 400), 400);
+        assert_eq!(affordable_input(1_000, 0), 0);
+    }
 
     #[test]
     fn test_buy_shortfall_partial() {
