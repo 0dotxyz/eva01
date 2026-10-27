@@ -6,11 +6,11 @@ use crate::{
 use anchor_lang::AccountDeserialize;
 use anyhow::Result;
 use crossbeam::channel::Sender;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use marginfi_type_crate::types::MarginfiAccount;
-use solana_program::pubkey::Pubkey;
-use solana_sdk::account::Account;
+use solana_account::Account;
+use solana_pubkey::Pubkey;
 use std::{
     collections::HashMap,
     sync::{
@@ -26,6 +26,9 @@ use yellowstone_grpc_proto::prelude::*;
 const RATE_LIMIT_LOG_INTERVAL_SECS: u64 = 60;
 const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+/// A stream silent for this long is dead: the slot subscription alone delivers several messages a
+/// second.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct GeyserUpdate {
@@ -134,11 +137,10 @@ impl GeyserService {
                     .tls_config(tls_config.clone())?
                     .connect()
                     .await?;
-                let (_, stream) = client.subscribe_with_request(Some(sub_req.clone())).await?;
-                Ok::<_, anyhow::Error>(stream)
+                Ok::<_, anyhow::Error>(client.subscribe_with_request(Some(sub_req.clone())).await?)
             });
 
-            let mut stream = match connect_result {
+            let (mut sink, mut stream) = match connect_result {
                 // Don't reset the backoff yet: a server can accept the connection and then
                 // immediately reset the stream (REFUSED_STREAM). Only treat the connection as
                 // healthy once it actually delivers a message (see below).
@@ -148,6 +150,7 @@ impl GeyserService {
                         "Failed to connect to Geyser, retrying in {:?}: {:?}",
                         backoff, e
                     ));
+                    Self::forget_unusable_slot(&mut from_slot, false);
                     self.sleep_interruptible(backoff);
                     backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
                     continue;
@@ -156,13 +159,44 @@ impl GeyserService {
 
             // TODO: use IndexerFlags
             info!("Entering the GeyserService loop");
-            while let Some(msg) = self.tokio_rt.block_on(stream.next()) {
+            let mut delivered = false;
+            loop {
+                let msg = match self.tokio_rt.block_on(async {
+                    tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await
+                }) {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => {
+                        warn!("The Geyser stream ended, reconnecting");
+                        break;
+                    }
+                    Err(_) => {
+                        warn!(
+                            "No Geyser message for {:?}, reconnecting",
+                            STREAM_IDLE_TIMEOUT
+                        );
+                        break;
+                    }
+                };
                 match msg {
                     Ok(msg) => {
                         // A delivered message proves the connection is healthy: reset the backoff.
                         backoff = INITIAL_RECONNECT_BACKOFF;
+                        delivered = true;
                         let update_oneof = ward!(msg.update_oneof, continue);
-                        if let subscribe_update::UpdateOneof::Account(account) = update_oneof {
+                        if let subscribe_update::UpdateOneof::Ping(_) = update_oneof {
+                            // As Yellowstone's reference client does, for load balancers that expect
+                            // client pings; Triton has not needed it so far:
+                            // https://github.com/rpcpool/yellowstone-grpc/blob/6cc3a99383414b6b84b1f51b91abf9766f355d18/examples/rust/src/bin/client.rs#L1044-L1053
+                            let pong = SubscribeRequest {
+                                ping: Some(SubscribeRequestPing { id: 1 }),
+                                ..Default::default()
+                            };
+                            if let Err(e) = self.tokio_rt.block_on(sink.send(pong)) {
+                                warn!("Failed to answer a Geyser ping, reconnecting: {:?}", e);
+                                break;
+                            }
+                        } else if let subscribe_update::UpdateOneof::Account(account) = update_oneof
+                        {
                             from_slot = Some(account.slot);
 
                             let account_update = ward!(&account.account, continue);
@@ -215,10 +249,25 @@ impl GeyserService {
                     break;
                 }
             }
+            Self::forget_unusable_slot(&mut from_slot, delivered);
         }
         info!("The GeyserService loop is stopped.");
 
         Ok(())
+    }
+
+    /// A connection that resumed from `from_slot` but delivered nothing may have been refused that
+    /// slot (it fell out of the provider's retention). Retrying it would fail the same way forever,
+    /// so the next attempt subscribes from the current slot instead, losing the gap.
+    fn forget_unusable_slot(from_slot: &mut Option<u64>, delivered: bool) {
+        if !delivered {
+            if let Some(slot) = from_slot.take() {
+                warn!(
+                    "Geyser delivered nothing when resuming from slot {}; resubscribing from now",
+                    slot
+                );
+            }
+        }
     }
 
     /// Sleeps up to `duration`, waking early if a stop is requested so the reconnect
@@ -271,8 +320,39 @@ impl GeyserService {
         );
 
         request.accounts = req;
+        // A steady heartbeat, so a silent stream can be told apart from a quiet market.
+        request.slots = HashMap::from([(
+            "heartbeat".to_string(),
+            SubscribeRequestFilterSlots {
+                filter_by_commitment: Some(true),
+                ..Default::default()
+            },
+        )]);
         request.from_slot = from_slot;
 
         request
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_replay_slot_is_dropped_once_it_yields_nothing() {
+        let mut from_slot = Some(42);
+        GeyserService::forget_unusable_slot(&mut from_slot, true);
+        assert_eq!(from_slot, Some(42));
+        GeyserService::forget_unusable_slot(&mut from_slot, false);
+        assert_eq!(from_slot, None);
+    }
+
+    #[test]
+    fn the_subscription_carries_a_slot_heartbeat() {
+        let request =
+            GeyserService::build_geyser_subscribe_request(&[Pubkey::new_unique()], Some(7));
+        assert_eq!(request.slots.len(), 1);
+        assert_eq!(request.from_slot, Some(7));
+        assert_eq!(request.accounts.len(), 2);
     }
 }

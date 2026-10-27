@@ -12,7 +12,7 @@ use crate::{
             is_seizable_asset_tag, LiquidatorAccount, PreparedLiquidatableAccount,
         },
         marginfi_account::{MarginfiAccountWrapper, ObservationAccounts},
-        oracle::{OracleWrapper, OracleWrapperTrait},
+        oracle::{oracle_publish_time, OracleWrapper, OracleWrapperTrait},
     },
 };
 use anchor_lang::AccountDeserialize;
@@ -35,14 +35,17 @@ use marginfi_type_crate::{
     constants::BANKRUPT_THRESHOLD,
     types::{
         reconcile_emode_configs, BalanceSide, BankOperationalState, EmodeConfig, HealthPriceMode,
-        MarginfiAccount, MarginfiGroup, RequirementType,
+        MarginfiAccount, MarginfiGroup, OracleSetup, RequirementType,
     },
 };
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use solana_account::Account;
+use solana_account_info::IntoAccountInfo;
 use solana_client::rpc_client::RpcClient;
+use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
-use solana_program::pubkey::Pubkey;
-use solana_sdk::{account_info::IntoAccountInfo, clock::Clock, signature::Keypair};
+use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
 use std::sync::atomic::Ordering;
 use std::{
     cmp::min,
@@ -186,6 +189,7 @@ impl Liquidator {
             config.swap_mint,
             dex_client,
             dex_gate,
+            config.slippage_bps,
             config.min_profit,
         )?;
 
@@ -279,10 +283,11 @@ impl Liquidator {
                     .collect();
 
                 // Hand ranked intents to the execution layer concurrently, bounded to
-                // MAX_CONCURRENT_LIQUIDATIONS in-flight. Each try_execute JIT-buys the liability
-                // shortfall, simulate-first cranks stale oracles, and lands a Jito bundle (with a
-                // sequential RPC fallback). Workers pull the next-highest-profit intent from the
-                // shared queue, so a burst of liquidatable accounts is worked in parallel.
+                // MAX_CONCURRENT_LIQUIDATIONS in-flight. Each try_execute sells the collateral
+                // for the liability in-tx (or JIT-buys the liability), simulates first, and lands
+                // a Jito bundle (with a sequential RPC fallback). Workers pull the next-highest-
+                // profit intent from the shared queue, so a burst of liquidatable accounts is
+                // worked in parallel.
                 if !intents.is_empty() {
                     let worker_count = MAX_CONCURRENT_LIQUIDATIONS.min(intents.len());
                     let queue = Mutex::new(intents.into_iter());
@@ -342,6 +347,28 @@ impl Liquidator {
         }
     }
 
+    /// Our clock lags the chain, so a fresh Scope price can look "published in the future" and get
+    /// rejected. Moving the clock up to each new publish time prevents that.
+    fn advance_clock_to_oracle(&self, address: &Pubkey, account: &Account, banks: &[Pubkey]) {
+        let scope_entries: Vec<u16> = banks
+            .iter()
+            .filter_map(|bank| self.cache.banks.try_get_bank(bank).ok())
+            .filter(|wrapper| {
+                matches!(
+                    wrapper.bank.config.oracle_setup,
+                    OracleSetup::Scope | OracleSetup::ScopeKamino | OracleSetup::ScopeJuplend
+                ) && wrapper.bank.config.oracle_keys[0] == *address
+            })
+            .map(|wrapper| wrapper.bank.config.scope_entry_index)
+            .collect();
+
+        if let Some(publish_time) = oracle_publish_time(account, &scope_entries) {
+            if let Err(e) = clock_manager::advance_to(&self.cache.clock, publish_time) {
+                error!("Failed to advance the clock to the {address} publish time: {e}");
+            }
+        }
+    }
+
     fn handle_geyser_update(
         &self,
         update: GeyserUpdate,
@@ -357,9 +384,11 @@ impl Liquidator {
 
         match account_type {
             AccountType::Oracle => {
+                let banks = self.cache.banks.get_banks_for_oracle(&address)?;
+                self.advance_clock_to_oracle(&address, &account, &banks);
                 self.cache.oracles.try_update(&address, account)?;
 
-                for bank in self.cache.banks.get_banks_for_oracle(&address)? {
+                for bank in banks {
                     self.add_accounts_for_bank(&bank, account_addresses)?;
                 }
             }
@@ -380,7 +409,11 @@ impl Liquidator {
             }
             AccountType::Bank => {
                 let bank = utils::decode_bank(&account.data)?;
+                let is_new = self.cache.banks.try_get_bank(&address).is_err();
                 self.cache.banks.try_insert(address, bank, account)?;
+                if is_new {
+                    self.liquidator_account.cover_bank_in_background(&address);
+                }
 
                 self.add_accounts_for_bank(&address, account_addresses)?;
             }
@@ -550,7 +583,7 @@ impl Liquidator {
             liab_bank: liab_bank_pk,
             asset_amount: slippage_adjusted_asset_amount,
             liab_amount: slippage_adjusted_liab_amount,
-            profit: liquidation_amounts.liquidator_profit,
+            profit: liquidation_amounts.liquidator_profit * I80F48!(0.90),
         })))
     }
 

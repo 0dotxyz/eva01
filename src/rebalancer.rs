@@ -6,39 +6,72 @@ use solana_commitment_config::CommitmentLevel;
 use solana_dex_superagg::{
     ClientConfig, DexSuperAggClient, DflowConfig, JupiterConfig, TitanConfig,
 };
-use solana_program::pubkey::Pubkey;
-use solana_sdk::signature::Keypair;
+use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::{
     runtime::{Builder, Runtime},
-    sync::Semaphore,
+    sync::{Semaphore, SemaphorePermit},
 };
 
 /// Concurrent DEX operations allowed across the liquidation workers and the rebalancer. Each one
 /// costs several aggregator round-trips, so an unbounded burst trips the Jupiter rate limit (429)
 /// and the failing targets then sit in the executor's backoff.
 const MAX_CONCURRENT_DEX_CALLS: usize = 2;
+/// Minimum spacing between DEX operations starting. Two concurrent operations that each make
+/// two or three Jupiter requests still burst past its per-second gateway limit at startup; this
+/// keeps the request rate steady instead.
+const DEX_CALL_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Admission to the DEX aggregators: at most [`MAX_CONCURRENT_DEX_CALLS`] operations in flight,
+/// starting no closer together than [`DEX_CALL_MIN_INTERVAL`].
+pub struct DexGate {
+    semaphore: Semaphore,
+    last_grant: tokio::sync::Mutex<Instant>,
+}
+
+impl DexGate {
+    fn new() -> Self {
+        Self {
+            semaphore: Semaphore::new(MAX_CONCURRENT_DEX_CALLS),
+            last_grant: tokio::sync::Mutex::new(Instant::now() - DEX_CALL_MIN_INTERVAL),
+        }
+    }
+
+    /// Waits for a slot and for the spacing, then holds the slot until the permit is dropped.
+    pub async fn acquire(&self) -> anyhow::Result<SemaphorePermit<'_>> {
+        let permit = self.semaphore.acquire().await?;
+        let mut last_grant = self.last_grant.lock().await;
+        let since = last_grant.elapsed();
+        if since < DEX_CALL_MIN_INTERVAL {
+            tokio::time::sleep(DEX_CALL_MIN_INTERVAL - since).await;
+        }
+        *last_grant = Instant::now();
+        Ok(permit)
+    }
+}
 
 /// Don't bother selling a position worth less than this (USD); the swap fee/dust isn't worth it.
 const MIN_REBALANCE_VALUE: I80F48 = I80F48!(1.0);
 
 /// Never sell for less than this fraction of the oracle value: further off, the market (or a pushed
 /// pool) is wrong and holding until the next pass beats dumping. Within the ~8.5% liquidation margin.
-pub const MIN_SELL_PRICE_VS_ORACLE: I80F48 = I80F48!(0.95);
+const MIN_SELL_PRICE_VS_ORACLE: I80F48 = I80F48!(0.95);
 
-/// The rebalancer keeps the liquidator holding only the swap mint (USDC): every other token it ends
-/// up with — seized collateral from a liquidation, or a JIT-buy overshoot — is sold back to USDC on
-/// the next pass. There is no inventory to maintain and nothing is bought here (liabilities are
-/// funded just-in-time during liquidation), so it is a pure sell-to-USDC sweep.
+/// The rebalancer keeps the liquidator holding only the swap mint (USDC). Every other token it
+/// ends up with (a liquidation's leftover liability or seized collateral, or a JIT-buy overshoot)
+/// is sold back to USDC on the next pass. Nothing is bought here and no inventory is maintained:
+/// liabilities are funded during the liquidation itself, so this is a pure sell-to-USDC sweep.
 pub struct Rebalancer {
     swap_mint: Pubkey,
     tokio_rt: Runtime,
     cache: Arc<Cache>,
     dex_client: Arc<DexSuperAggClient>,
-    dex_gate: Arc<Semaphore>,
+    dex_gate: Arc<DexGate>,
     empty_stake_banks: HashSet<Pubkey>,
     unsweepable_mints: HashMap<Pubkey, u64>,
 }
@@ -79,7 +112,7 @@ impl Rebalancer {
             tokio_rt,
             cache,
             dex_client,
-            dex_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_DEX_CALLS)),
+            dex_gate: Arc::new(DexGate::new()),
             empty_stake_banks: HashSet::new(),
             unsweepable_mints: HashMap::new(),
         })
@@ -89,7 +122,7 @@ impl Rebalancer {
         Arc::clone(&self.dex_client)
     }
 
-    pub fn dex_gate(&self) -> Arc<Semaphore> {
+    pub fn dex_gate(&self) -> Arc<DexGate> {
         Arc::clone(&self.dex_gate)
     }
 
@@ -216,10 +249,9 @@ impl Rebalancer {
 
         let (prepared, signature) = self.tokio_rt.block_on(async {
             let _permit = self.dex_gate.acquire().await?;
-            // `max_in = amount`: sell exactly the balance, never bump the input.
             let prepared = self
                 .dex_client
-                .build_swap_transaction(input_mint, output_mint, amount, min_out, Some(amount))
+                .build_swap_transaction(input_mint, output_mint, amount, min_out)
                 .await?;
             let signature = self
                 .dex_client
@@ -229,10 +261,10 @@ impl Rebalancer {
         })?;
 
         info!(
-            "Swap successful via {:?}! Transaction: {}, Output: {} tokens of mint {}",
-            prepared.aggregator, signature, prepared.out_amount, output_mint
+            "Swap successful via {:?}! Transaction: {}, at least {} tokens of mint {}",
+            prepared.aggregator, signature, prepared.min_out_amount, output_mint
         );
 
-        Ok(prepared.out_amount)
+        Ok(prepared.min_out_amount)
     }
 }

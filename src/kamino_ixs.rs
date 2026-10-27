@@ -1,6 +1,7 @@
 use anchor_lang::{prelude::AccountMeta, Id, InstructionData, ToAccountMetas};
 
-use solana_sdk::{instruction::Instruction, pubkey::Pubkey};
+use solana_instruction::Instruction;
+use solana_pubkey::Pubkey;
 
 use crate::{
     cache::KaminoReserve,

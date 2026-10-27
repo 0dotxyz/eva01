@@ -1,4 +1,5 @@
-use solana_sdk::{account::Account, pubkey::Pubkey};
+use solana_account::Account;
+use solana_pubkey::Pubkey;
 
 #[derive(Clone)]
 pub struct MintWrapper {

@@ -2,7 +2,7 @@ use crate::cache::Cache;
 
 use crate::wrappers::bank::BankWrapper;
 use marginfi::state::bank::BankImpl;
-use solana_sdk::clock::Clock;
+use solana_clock::Clock;
 
 use super::oracle::{oracle_account_keys, OracleWrapperTrait};
 use anyhow::Result;
@@ -14,7 +14,7 @@ use marginfi_type_crate::{
         MarginfiAccount, OracleSetup,
     },
 };
-use solana_program::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 use std::collections::HashSet;
 
 /// Principal plus outstanding and accrued premium (zero unless the bank has `PREMIUM_ACTIVE`).
@@ -135,12 +135,22 @@ impl MarginfiAccountWrapper {
 
         bank_pks.extend(include_banks.iter());
 
-        let mut bank_pks = bank_pks
+        let bank_pks = bank_pks
             .into_iter()
             .filter(|bank_pk| !exclude_banks.contains(bank_pk))
             .collect::<Vec<_>>();
 
-        // Sort all bank_pks in descending order
+        for bank_pk in &bank_pks {
+            T::build(cache, clock, bank_pk)?;
+        }
+        ObservationAccounts::for_banks(cache, bank_pks)
+    }
+}
+
+impl ObservationAccounts {
+    /// The observation layout for `bank_pks`: each bank followed by its oracle accounts, banks in
+    /// descending key order, plus the venue states that must be refreshed in the same transaction.
+    pub fn for_banks(cache: &Cache, mut bank_pks: Vec<Pubkey>) -> Result<Self> {
         bank_pks.sort_by(|a, b| b.cmp(a));
 
         let mut observation_accounts: Vec<Pubkey> = vec![];
@@ -149,12 +159,9 @@ impl MarginfiAccountWrapper {
 
         for bank_pk in bank_pks.iter() {
             let bank_wrapper = cache.banks.try_get_bank(bank_pk)?;
-            T::build(cache, clock, bank_pk)?;
-
-            let setup = bank_wrapper.bank.config.oracle_setup;
             let oracle_keys = oracle_account_keys(&bank_wrapper.bank, bank_pk)?;
 
-            match setup {
+            match bank_wrapper.bank.config.oracle_setup {
                 OracleSetup::KaminoPythPush
                 | OracleSetup::FixedKamino
                 | OracleSetup::KaminoMSOL

@@ -9,12 +9,9 @@ use marginfi_type_crate::{
         derive_juplend_rate_model, derive_kamino_user_state,
     },
 };
-use solana_sdk::{
-    instruction::{AccountMeta, Instruction},
-    pubkey::Pubkey,
-    sysvar,
-};
-use solana_sdk_ids::system_program;
+use solana_instruction::{AccountMeta, Instruction};
+use solana_pubkey::Pubkey;
+use solana_sdk_ids::{system_program, sysvar};
 
 use crate::{
     cache::KaminoReserve,
@@ -235,10 +232,7 @@ fn maybe_add_bank_mint(accounts: &mut Vec<AccountMeta>, mint: Pubkey, token_prog
     }
 }
 
-fn mark_signer(
-    accounts: &mut [solana_sdk::instruction::AccountMeta],
-    signer: solana_sdk::pubkey::Pubkey,
-) {
+fn mark_signer(accounts: &mut [AccountMeta], signer: Pubkey) {
     for m in accounts.iter_mut() {
         m.is_signer = m.pubkey == signer;
     }

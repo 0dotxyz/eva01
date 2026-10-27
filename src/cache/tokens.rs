@@ -3,7 +3,8 @@ use std::{collections::HashMap, sync::RwLock};
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use log::error;
-use solana_sdk::{account::Account, pubkey::Pubkey};
+use solana_account::Account;
+use solana_pubkey::Pubkey;
 
 //The Liquidator Token accounts
 #[derive(Default)]
