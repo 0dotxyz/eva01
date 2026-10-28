@@ -73,11 +73,14 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     // Every address a liquidation can reference must be in a lookup table, or the transaction
     // won't fit. Done before any service runs; a no-op once the tables hold them.
     info!("Covering the banks' accounts with the owned lookup tables...");
-    let added =
-        cache
-            .luts
-            .ensure_covered(&rpc_client, &signer, &liquidator_account.static_accounts())?;
-    info!("Lookup tables ready ({added} address(es) added).");
+    match cache
+        .luts
+        .ensure_covered(&rpc_client, &signer, &liquidator_account.static_accounts())
+    {
+        Ok(added) => info!("Lookup tables ready ({added} address(es) added)."),
+        // Not fatal: whatever is still uncovered gets learned when a transaction overflows.
+        Err(e) => warn!("Could not cover every bank's accounts with the lookup tables: {e}"),
+    }
 
     let mut liquidator = Liquidator::new(
         config.clone(),

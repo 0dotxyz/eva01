@@ -58,6 +58,8 @@ struct Tables {
     extra: Vec<AddressLookupTableAccount>,
     /// Every address in any table above.
     covered: HashSet<Pubkey>,
+    /// Owned tables the chain reported full, whatever the registry counts for them.
+    full: HashSet<Pubkey>,
 }
 
 #[derive(Default)]
@@ -175,24 +177,39 @@ impl LutRegistry {
             missing.len()
         );
 
-        let mut remaining = missing.as_slice();
+        let mut remaining = missing.clone();
         while !remaining.is_empty() {
             let (key, room) = match self.table_with_room()? {
                 Some(table) => table,
                 None => (self.create_table(rpc_client, signer)?, TABLE_CAPACITY),
             };
-            let (now, rest) = remaining.split_at(remaining.len().min(room));
-            for chunk in now.chunks(EXTEND_CHUNK) {
+            let take = remaining.len().min(room);
+            let mut added = 0;
+            for chunk in remaining[..take].chunks(EXTEND_CHUNK) {
                 let ix = extend_lookup_table(
                     key,
                     signer.pubkey(),
                     Some(signer.pubkey()),
                     chunk.to_vec(),
                 );
-                send_confirmed(rpc_client, signer, ix)?;
+                match send_confirmed(rpc_client, signer, ix) {
+                    Ok(()) => {
+                        self.record_extended(key, chunk)?;
+                        added += chunk.len();
+                    }
+                    // The registry's count was behind the chain: this table takes no more.
+                    Err(e) if is_table_full(&e) => {
+                        warn!("Lookup table {key} is full; continuing in the next one.");
+                        self.mark_full(key)?;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            self.reload_table(rpc_client, key)?;
-            remaining = rest;
+            if let Err(e) = self.reload_table(rpc_client, key) {
+                warn!("Failed to re-read the lookup table {key}: {e}");
+            }
+            remaining.drain(..added);
         }
 
         info!(
@@ -259,12 +276,30 @@ impl LutRegistry {
 
     /// The owned table that still has room, with that room.
     fn table_with_room(&self) -> Result<Option<(Pubkey, usize)>> {
-        Ok(self
-            .lock_tables()?
+        let tables = self.lock_tables()?;
+        Ok(tables
             .owned
             .iter()
-            .find(|table| table.addresses.len() < TABLE_CAPACITY)
+            .find(|table| {
+                table.addresses.len() < TABLE_CAPACITY && !tables.full.contains(&table.key)
+            })
             .map(|table| (table.key, TABLE_CAPACITY - table.addresses.len())))
+    }
+
+    /// Counts a confirmed extend at once, so the registry doesn't depend on a re-read that may
+    /// come from a node still behind the confirmation.
+    fn record_extended(&self, key: Pubkey, addresses: &[Pubkey]) -> Result<()> {
+        let mut tables = self.lock_tables()?;
+        if let Some(table) = tables.owned.iter_mut().find(|table| table.key == key) {
+            table.addresses.extend_from_slice(addresses);
+        }
+        tables.covered.extend(addresses.iter().copied());
+        Ok(())
+    }
+
+    fn mark_full(&self, key: Pubkey) -> Result<()> {
+        self.lock_tables()?.full.insert(key);
+        Ok(())
     }
 
     fn create_table(&self, rpc_client: &RpcClient, signer: &Keypair) -> Result<Pubkey> {
@@ -291,7 +326,10 @@ impl LutRegistry {
             .to_vec();
         let mut tables = self.lock_tables()?;
         match tables.owned.iter_mut().find(|table| table.key == key) {
-            Some(table) => table.addresses = addresses,
+            // A node behind the confirmation returns a prefix of what was extended; keep the
+            // longer view, which the registry built from confirmed extends.
+            Some(table) if addresses.len() >= table.addresses.len() => table.addresses = addresses,
+            Some(_) => {}
             None => tables
                 .owned
                 .push(AddressLookupTableAccount { key, addresses }),
@@ -307,6 +345,15 @@ impl LutRegistry {
         );
         Ok(())
     }
+}
+
+/// The lookup table program's answer to an extend past 256 addresses: `InvalidArgument`, logged as
+/// "Lookup table is full".
+fn is_table_full(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("full")
+        || text.contains("InvalidArgument")
+        || text.contains("invalid program argument")
 }
 
 fn send_confirmed(
