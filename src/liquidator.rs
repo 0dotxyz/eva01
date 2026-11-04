@@ -35,7 +35,7 @@ use marginfi_type_crate::{
     constants::BANKRUPT_THRESHOLD,
     types::{
         reconcile_emode_configs, BalanceSide, BankOperationalState, EmodeConfig, HealthPriceMode,
-        MarginfiAccount, MarginfiGroup, OracleSetup, RequirementType,
+        MarginfiAccount, MarginfiGroup, OracleSetup, ReconciledEmodeConfig, RequirementType,
     },
 };
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -66,6 +66,10 @@ const IDLE_REBALANCE_INTERVAL: Duration = Duration::from_secs(60);
 /// Taken off the premium `end_liquidation` allows, so price moves between evaluation and landing
 /// cannot push the seizure over the cap.
 const PREMIUM_SAFETY_MARGIN: I80F48 = I80F48!(0.005);
+
+/// Liquidations are sized to this share of the most the program allows, leaving room for price
+/// moves between evaluation and landing; profit is judged on the same share.
+const LIQUIDATION_SIZE_HAIRCUT: I80F48 = I80F48!(0.90);
 
 /// Minimum time between tag attempts on the same account, so a failing tag is not resent on every
 /// update.
@@ -107,6 +111,18 @@ impl LiquidationAmounts {
     }
 }
 
+/// A bank's maintenance price over its equity price on one side.
+fn maintenance_to_equity_price(
+    bank: &BankWrapper,
+    oracle: &OracleWrapper,
+    side: impl Fn() -> BalanceSide,
+) -> Result<I80F48> {
+    let equity = bank.price(oracle, side(), RequirementType::Equity)?;
+    bank.price(oracle, side(), RequirementType::Maintenance)?
+        .checked_div(equity)
+        .ok_or_else(|| anyhow!("no equity price for the bank {}", bank.address))
+}
+
 /// What `end_liquidation` bounds a receivership by: USD values at equity prices, health at
 /// maintenance weights.
 struct RepayBounds {
@@ -117,6 +133,9 @@ struct RepayBounds {
     maintenance_health: I80F48,
     asset_weight_maint: I80F48,
     liab_weight_maint: I80F48,
+    /// Maintenance price over equity price, per side: turns equity dollars into health dollars.
+    asset_price_ratio: I80F48,
+    liab_price_ratio: I80F48,
     above_closeout: bool,
 }
 
@@ -125,17 +144,17 @@ impl RepayBounds {
     /// * the seizure fits the collateral and the repayment fits the debt;
     /// * an account that started solvent must stay solvent, i.e. the premium taken cannot exceed
     ///   its equity;
-    /// * above the closeout threshold the account must stay unhealthy. Each dollar repaid raises
-    ///   maintenance health by `l - w * (1 + premium)`; once that is no longer positive the
-    ///   liquidation cannot heal the account and this bound no longer applies.
+    /// * above the closeout threshold the account must stay unhealthy. Each equity dollar repaid
+    ///   raises maintenance health by `l * rl - w * (1 + premium) * ra`; once that is no longer
+    ///   positive the liquidation cannot heal the account and this bound no longer applies.
     fn max_repay(&self, premium: I80F48) -> I80F48 {
         let one_plus_premium = I80F48::ONE + premium;
         let mut max_repay = min(self.liab_value, self.asset_value / one_plus_premium);
         if self.equity >= I80F48::ZERO && premium > I80F48::ZERO {
             max_repay = min(max_repay, self.equity / premium);
         }
-        let health_gain_per_repaid =
-            self.liab_weight_maint - self.asset_weight_maint * one_plus_premium;
+        let health_gain_per_repaid = self.liab_weight_maint * self.liab_price_ratio
+            - self.asset_weight_maint * one_plus_premium * self.asset_price_ratio;
         if self.above_closeout && health_gain_per_repaid > I80F48::ZERO {
             max_repay = min(max_repay, -self.maintenance_health / health_gain_per_repaid);
         }
@@ -494,7 +513,7 @@ impl Liquidator {
                 .send_tag_tx(tag.address, &tag.observation_accounts)
             {
                 Ok(signature) => info!(
-                    "Tagged {} so its liquidation premium grows: {}",
+                    "Sent a tag for {} so its liquidation premium grows: {}",
                     tag.address, signature
                 ),
                 Err(err) => error!("Failed to tag {}: {:?}", tag.address, err),
@@ -526,14 +545,11 @@ impl Liquidator {
             RequirementType::Maintenance,
         )?;
 
-        let (asset_bank_pk, liab_bank_pk) =
+        let (asset_banks, liab_banks) =
             match self.find_liquidation_bank_candidates(deposit_values, liab_values)? {
                 Some(banks) => banks,
                 None => return Ok(None),
             };
-
-        let asset_bank_wrapper = self.cache.banks.try_get_bank(&asset_bank_pk)?;
-        let liab_bank_wrapper = self.cache.banks.try_get_bank(&liab_bank_pk)?;
 
         let banks_to_include: Vec<Pubkey> = vec![];
         let banks_to_exclude: Vec<Pubkey> = vec![];
@@ -546,15 +562,19 @@ impl Liquidator {
         )?;
 
         // Calculated max liquidatable amount is the defining factor for liquidation.
-        let liquidation_amounts = self.compute_max_liquidatable_amounts_with_banks(
-            &self.cache,
-            clock,
-            account,
-            &self.cache.marginfi_group,
-            observation_accounts.observation_accounts.as_slice(),
-            &asset_bank_wrapper,
-            &liab_bank_wrapper,
-        )?;
+        let Some((asset_bank_pk, liab_bank_pk, liquidation_amounts)) = self
+            .compute_max_liquidatable_amounts_with_banks(
+                &self.cache,
+                clock,
+                account,
+                &self.cache.marginfi_group,
+                observation_accounts.observation_accounts.as_slice(),
+                &asset_banks,
+                &liab_banks,
+            )?
+        else {
+            return Ok(None);
+        };
 
         if !liquidation_amounts.is_liquidatable() {
             if liquidation_amounts.taggable {
@@ -567,9 +587,9 @@ impl Liquidator {
         }
 
         let slippage_adjusted_asset_amount =
-            liquidation_amounts.max_liquidatable_asset_amount * I80F48!(0.90);
+            liquidation_amounts.max_liquidatable_asset_amount * LIQUIDATION_SIZE_HAIRCUT;
         let slippage_adjusted_liab_amount =
-            liquidation_amounts.max_liquidatable_liab_amount * I80F48!(0.90);
+            liquidation_amounts.max_liquidatable_liab_amount * LIQUIDATION_SIZE_HAIRCUT;
 
         debug!(
                 "asset_amount_to_liquidate: {:?}, slippage_adjusted_asset_amount: {:?}, slippage_adjusted_liab_amount: {:?}",
@@ -583,7 +603,7 @@ impl Liquidator {
             liab_bank: liab_bank_pk,
             asset_amount: slippage_adjusted_asset_amount,
             liab_amount: slippage_adjusted_liab_amount,
-            profit: liquidation_amounts.liquidator_profit * I80F48!(0.90),
+            profit: liquidation_amounts.liquidator_profit * LIQUIDATION_SIZE_HAIRCUT,
         })))
     }
 
@@ -591,7 +611,7 @@ impl Liquidator {
         &self,
         deposit_values: Vec<(I80F48, Pubkey)>,
         liab_values: Vec<(I80F48, Pubkey)>,
-    ) -> Result<Option<(Pubkey, Pubkey)>> {
+    ) -> Result<Option<(Vec<Pubkey>, Vec<Pubkey>)>> {
         if deposit_values.is_empty() || liab_values.is_empty() {
             debug!(
                 "No bank candidates: {} priced deposit(s), {} priced liability(-ies)",
@@ -613,27 +633,27 @@ impl Liquidator {
             return Ok(None);
         }
 
-        // Largest deposit we can seize and largest liability we can buy, so an unsupported or
-        // excluded position doesn't block an otherwise liquidatable account.
+        // Every deposit we can seize and every liability we can buy, so an unsupported or excluded
+        // position doesn't block an otherwise liquidatable account.
         let usable = |bank_pk: &Pubkey, collateral: bool| {
             self.cache.banks.try_get_bank(bank_pk).is_ok_and(|bank| {
                 !self.cache.mints.is_excluded(&bank.bank.mint)
                     && (!collateral || is_seizable_asset_tag(bank.bank.config.asset_tag))
             })
         };
-        let asset_bank = deposit_values
+        let asset_banks: Vec<Pubkey> = deposit_values
             .iter()
             .filter(|(_, bank_pk)| usable(bank_pk, true))
-            .max_by(|a, b| a.0.cmp(&b.0))
-            .map(|(_, bank_pk)| *bank_pk);
-        let liab_bank = liab_values
+            .map(|(_, bank_pk)| *bank_pk)
+            .collect();
+        let liab_banks: Vec<Pubkey> = liab_values
             .iter()
             .filter(|(_, bank_pk)| usable(bank_pk, false))
-            .max_by(|a, b| a.0.cmp(&b.0))
-            .map(|(_, bank_pk)| *bank_pk);
+            .map(|(_, bank_pk)| *bank_pk)
+            .collect();
 
-        match (asset_bank, liab_bank) {
-            (Some(asset_bank), Some(liab_bank)) => Ok(Some((asset_bank, liab_bank))),
+        match (asset_banks.is_empty(), liab_banks.is_empty()) {
+            (false, false) => Ok(Some((asset_banks, liab_banks))),
             _ => {
                 debug!(
                     "No bank candidates: no seizable deposit or no buyable liability \
@@ -651,9 +671,9 @@ impl Liquidator {
         account: &MarginfiAccountWrapper,
         group: &MarginfiGroup,
         banks_and_oracles: &[Pubkey],
-        asset_bank_wrapper: &BankWrapper,
-        liab_bank_wrapper: &BankWrapper,
-    ) -> Result<LiquidationAmounts> {
+        asset_banks: &[Pubkey],
+        liab_banks: &[Pubkey],
+    ) -> Result<Option<(Pubkey, Pubkey, LiquidationAmounts)>> {
         let mut accounts: Vec<_> = vec![];
         let mut bank_to_emode_config = HashMap::<Pubkey, EmodeConfig>::new();
         for pk in banks_and_oracles.iter() {
@@ -708,7 +728,7 @@ impl Liquidator {
                 account.address,
                 maintenance_health.to_num::<f64>()
             );
-            return Ok(LiquidationAmounts::none());
+            return Ok(None);
         }
 
         let (total_assets_equity, total_liabs_equity) = get_health_components(
@@ -720,8 +740,78 @@ impl Liquidator {
             HealthPriceMode::Client(clock.clone()),
             &mut None,
         )?;
-        let in_bad_debt = total_assets_equity < total_liabs_equity;
 
+        // Which collateral is seized and which debt is repaid decides how much the program lets a
+        // liquidation take, so every pair is sized and the most profitable one wins.
+        let mut best: Option<(Pubkey, Pubkey, LiquidationAmounts)> = None;
+        let mut any_taggable = false;
+        for asset_bank in asset_banks {
+            for liab_bank in liab_banks {
+                let amounts = cache
+                    .banks
+                    .try_get_bank(asset_bank)
+                    .and_then(|asset_bank_wrapper| {
+                        let liab_bank_wrapper = cache.banks.try_get_bank(liab_bank)?;
+                        self.size_pair(
+                            cache,
+                            clock.clone(),
+                            account,
+                            &asset_bank_wrapper,
+                            &liab_bank_wrapper,
+                            &reconciled_emode_config,
+                            maintenance_health,
+                            total_assets_equity,
+                            total_liabs_equity,
+                        )
+                    });
+                let amounts = match amounts {
+                    Ok(amounts) => amounts,
+                    Err(e) => {
+                        debug!(
+                            "Account {}: can't size seizing {} for {}: {}",
+                            account.address, asset_bank, liab_bank, e
+                        );
+                        continue;
+                    }
+                };
+                any_taggable |= amounts.taggable;
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, _, b)| amounts.liquidator_profit > b.liquidator_profit)
+                {
+                    best = Some((*asset_bank, *liab_bank, amounts));
+                }
+            }
+        }
+        // Tagging helps every pair, so it is worth it when any pair would profit from it.
+        Ok(best.map(|(asset_bank, liab_bank, amounts)| {
+            (
+                asset_bank,
+                liab_bank,
+                LiquidationAmounts {
+                    taggable: any_taggable,
+                    ..amounts
+                },
+            )
+        }))
+    }
+
+    /// How much seizing `asset_bank_wrapper` for `liab_bank_wrapper` may repay and earn, as
+    /// `end_liquidation` measures it.
+    #[allow(clippy::too_many_arguments)]
+    fn size_pair(
+        &self,
+        cache: &Cache,
+        clock: Clock,
+        account: &MarginfiAccountWrapper,
+        asset_bank_wrapper: &BankWrapper,
+        liab_bank_wrapper: &BankWrapper,
+        reconciled_emode_config: &ReconciledEmodeConfig,
+        maintenance_health: I80F48,
+        total_assets_equity: I80F48,
+        total_liabs_equity: I80F48,
+    ) -> Result<LiquidationAmounts> {
+        let in_bad_debt = total_assets_equity < total_liabs_equity;
         let asset_oracle_wrapper =
             OracleWrapper::build(&self.cache, &clock, &asset_bank_wrapper.address)?;
 
@@ -730,7 +820,7 @@ impl Liquidator {
 
         let asset_weight_maint: I80F48 = asset_bank_wrapper
             .bank
-            .get_asset_weight(RequirementType::Maintenance, &reconciled_emode_config);
+            .get_asset_weight(RequirementType::Maintenance, reconciled_emode_config);
         let liab_weight_maint: I80F48 = liab_bank_wrapper.bank.config.liability_weight_maint.into();
 
         // `end_liquidation` holds the premium at its base for e-mode-boosted accounts and for
@@ -772,6 +862,16 @@ impl Liquidator {
             maintenance_health,
             asset_weight_maint,
             liab_weight_maint,
+            asset_price_ratio: maintenance_to_equity_price(
+                asset_bank_wrapper,
+                &asset_oracle_wrapper,
+                || BalanceSide::Assets,
+            )?,
+            liab_price_ratio: maintenance_to_equity_price(
+                liab_bank_wrapper,
+                &liab_oracle_wrapper,
+                || BalanceSide::Liabilities,
+            )?,
             above_closeout: total_assets_equity >= LIQUIDATION_CLOSEOUT_DOLLAR_THRESHOLD,
         };
         let max_repay = bounds.max_repay(premium_taken);
@@ -780,10 +880,10 @@ impl Liquidator {
         // Tag only when the premium a tag can grow to would make the liquidation worth it.
         let taggable = tagged_at == 0 && !in_bad_debt && !emode_boosted && {
             let max_premium = LIQUIDATION_TAG_MAX_PREMIUM - PREMIUM_SAFETY_MARGIN;
-            bounds.max_repay(max_premium) * max_premium > self.min_profit
+            bounds.max_repay(max_premium) * max_premium * LIQUIDATION_SIZE_HAIRCUT > self.min_profit
         };
 
-        if liquidator_profit <= self.min_profit {
+        if liquidator_profit * LIQUIDATION_SIZE_HAIRCUT <= self.min_profit {
             debug!(
                 "Account {} profit ${:.6} <= min profit ${} at premium {:.4} (tagged_at {}, taggable {})",
                 account.address,
@@ -813,12 +913,12 @@ impl Liquidator {
             RequirementType::Equity,
         )?;
 
-        debug!("Account {:?} liquidability evaluation:\nTotal weighted Assets {:?}\nTotal weighted Liabilities {:?}\nMaintenance health {:?}\n\
+        debug!("Account {:?} liquidability evaluation:\nMaintenance health {:?}\n\
             Equity assets {:?}\nEquity liabilities {:?}\nPremium {:?} (base {:?}, tagged_at {}, emode boosted {})\n\
             Asset Bank {:?}\nAsset maint weight: {:?}\nAsset Amount {:?}\nAsset Value (USD) {:?}\n\
             Liab Bank {:?}\nLiab maint weight: {:?}\nLiab Amount {:?}\nLiab Value (USD) {:?}\n\
             Max Repay (USD) {:?}\nMax Liquidatable Asset Amount {:?}\nMax Liquidatable Liab Amount {:?}\nLiquidator profit (USD) {:?}",
-            account.address, total_weighted_assets, total_weighted_liabilities, maintenance_health,
+            account.address, maintenance_health,
             total_assets_equity, total_liabs_equity, premium_taken, base_premium, tagged_at, emode_boosted,
             asset_bank_wrapper.address, asset_weight_maint, asset_amount, asset_value,
             liab_bank_wrapper.address, liab_weight_maint, liab_amount, liab_value,
@@ -904,8 +1004,22 @@ mod repay_bounds_tests {
             maintenance_health: I80F48!(-5),
             asset_weight_maint: I80F48!(0.8),
             liab_weight_maint: I80F48!(1),
+            asset_price_ratio: I80F48::ONE,
+            liab_price_ratio: I80F48::ONE,
             above_closeout: true,
         }
+    }
+
+    #[test]
+    fn collateral_twap_above_spot_shrinks_the_stay_unhealthy_bound() {
+        // SOL falling: its time-weighted price sits 1% above spot, so each equity dollar seized
+        // removes only 0.99 health dollars: 1 - 0.8 * 1.05 * 0.99 = 0.1684 health per dollar.
+        let bounds = RepayBounds {
+            asset_price_ratio: I80F48!(0.99),
+            ..example()
+        };
+        let repay = bounds.max_repay(I80F48!(0.05));
+        assert!((repay - I80F48!(29.6912)).abs() < I80F48!(0.001));
     }
 
     #[test]
