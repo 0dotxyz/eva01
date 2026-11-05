@@ -410,7 +410,8 @@ impl LiquidatorAccount {
     }
 
     /// Tags an unhealthy account so the receivership premium it pays grows over time. Sent over RPC
-    /// and confirmed; there is no MEV to race for, since anyone may tag and the first tag wins.
+    /// without waiting for confirmation; there is no MEV to race for, since anyone may tag and the
+    /// first tag wins.
     pub fn send_tag_tx(
         &self,
         liquidatee: Pubkey,
@@ -433,7 +434,10 @@ impl LiquidatorAccount {
 
         let luts = self.cache.luts.tables();
         let tx = self.compile_tx(&self.signer.pubkey(), &ixs, &luts)?;
-        Ok(self.rpc_client.send_and_confirm_transaction(&tx)?)
+        // Sent, not confirmed: the liquidator loop runs tags inline, and waiting out a tag that
+        // never lands would hold up every liquidation behind it. Preflight still rejects a tag the
+        // program would refuse.
+        Ok(self.rpc_client.send_transaction(&tx)?)
     }
 
     /// Simulates `tx`. On failure returns the program error with the last log lines.
