@@ -283,23 +283,8 @@ impl Liquidator {
                 accounts.sort_by(|a, b| a.profit.cmp(&b.profit));
                 accounts.reverse();
 
-                // Drop below-min-profit intents up front so the parallel section only runs
-                // real work.
-                let intents: Vec<PreparedLiquidatableAccount> = accounts
-                    .into_iter()
-                    .filter(|acc| {
-                        let worth_it = acc.profit >= I80F48::from_num(self.min_profit);
-                        if !worth_it {
-                            info!(
-                                "Skipping {}: est profit ${:.6} < min ${}",
-                                acc.liquidatee_account.address,
-                                acc.profit.to_num::<f64>(),
-                                self.min_profit
-                            );
-                        }
-                        worth_it
-                    })
-                    .collect();
+                // Evaluation already dropped intents below the minimum profit.
+                let intents: Vec<PreparedLiquidatableAccount> = accounts;
 
                 // Hand ranked intents to the execution layer concurrently, bounded to
                 // MAX_CONCURRENT_LIQUIDATIONS in-flight. Each try_execute sells the collateral
