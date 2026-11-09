@@ -29,6 +29,8 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
 
     let clock = {
         let rpc_client = RpcClient::new(config.rpc_url.clone());
+        // Before anything prices staked collateral, which reads the Rent sysvar.
+        crate::utils::rent_sysvar::install_rent_sysvar(&rpc_client)?;
         Arc::new(Mutex::new(clock_manager::fetch_clock(&rpc_client)?))
     };
     let mut clock_manager = ClockManager::new(clock.clone(), config.rpc_url.clone())?;

@@ -4,6 +4,7 @@ pub mod jito;
 pub mod lut_registry;
 pub mod pyth_cranker;
 pub mod rate_limiter;
+pub mod rent_sysvar;
 
 use anyhow::{anyhow, Error, Result};
 use backoff::ExponentialBackoff;
