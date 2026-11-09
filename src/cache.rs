@@ -21,6 +21,7 @@ use mints::MintsCache;
 use oracles::OraclesCache;
 use solana_client::rpc_client::RpcClient;
 use solana_clock::Clock;
+use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use tokens::TokensCache;
 
@@ -145,7 +146,12 @@ impl Cache {
         }
         let mut refreshed = 0;
         for chunk in addresses.chunks(100) {
-            for (address, account) in chunk.iter().zip(rpc_client.get_multiple_accounts(chunk)?) {
+            // At processed commitment, like the Geyser stream: a confirmed read would be older than
+            // what Geyser may already have applied, and would roll a balance back.
+            let accounts = rpc_client
+                .get_multiple_accounts_with_commitment(chunk, CommitmentConfig::processed())?
+                .value;
+            for (address, account) in chunk.iter().zip(accounts) {
                 if let Some(account) = account {
                     self.tokens.try_update_account(*address, account)?;
                     refreshed += 1;

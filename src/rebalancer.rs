@@ -1,7 +1,12 @@
-use crate::{cache::Cache, config::Eva01Config, utils::accessor};
+use crate::{
+    cache::Cache,
+    config::Eva01Config,
+    utils::{accessor, rate_limiter::RateLimiter},
+};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{error, info, warn};
+use marginfi_type_crate::constants::ASSET_TAG_STAKED;
 use solana_commitment_config::CommitmentLevel;
 use solana_dex_superagg::{
     ClientConfig, DexSuperAggClient, DflowConfig, JupiterConfig, TitanConfig,
@@ -62,6 +67,10 @@ const MIN_REBALANCE_VALUE: I80F48 = I80F48!(1.0);
 /// pool) is wrong and holding until the next pass beats dumping. Within the ~8.5% liquidation margin.
 const MIN_SELL_PRICE_VS_ORACLE: I80F48 = I80F48!(0.95);
 
+/// A token the sweep cannot price (e.g. a bank whose oracle is disabled) is reported this often,
+/// not on every pass.
+const SKIP_WARN_INTERVAL: Duration = Duration::from_secs(1200);
+
 /// The rebalancer keeps the liquidator holding only the swap mint (USDC). Every other token it
 /// ends up with (a liquidation's leftover liability or seized collateral, or a JIT-buy overshoot)
 /// is sold back to USDC on the next pass. Nothing is bought here and no inventory is maintained:
@@ -74,6 +83,10 @@ pub struct Rebalancer {
     dex_gate: Arc<DexGate>,
     empty_stake_banks: HashSet<Pubkey>,
     unsweepable_mints: HashMap<Pubkey, u64>,
+    /// Staked collateral held, by mint, as last reported.
+    held_stake: HashMap<Pubkey, u64>,
+    /// Reports each unpriceable token at most once per [`SKIP_WARN_INTERVAL`].
+    skip_warnings: RateLimiter<Pubkey>,
 }
 
 impl Rebalancer {
@@ -115,6 +128,8 @@ impl Rebalancer {
             dex_gate: Arc::new(DexGate::new()),
             empty_stake_banks: HashSet::new(),
             unsweepable_mints: HashMap::new(),
+            held_stake: HashMap::new(),
+            skip_warnings: RateLimiter::new(SKIP_WARN_INTERVAL),
         })
     }
 
@@ -127,7 +142,9 @@ impl Rebalancer {
     }
 
     /// Sell every non-swap-mint token the wallet holds (above the dust floor) back to the swap mint.
-    pub fn run(&mut self) -> anyhow::Result<()> {
+    /// Returns how many sells were attempted: each may have changed the wallet, even a failed one.
+    pub fn run(&mut self) -> anyhow::Result<usize> {
+        let mut sells = 0;
         info!("Running the Rebalancing process...");
 
         for mint in self.cache.mints.get_mints() {
@@ -144,13 +161,7 @@ impl Rebalancer {
             // prices the raw SPL token, so they can never be swept.
             // Expected to only ever happen on staging.
             if self.cache.banks.try_get_account_for_mint(&mint).is_err() {
-                let balance = self
-                    .cache
-                    .tokens
-                    .try_get_account(&token)
-                    .ok()
-                    .and_then(|account| accessor::amount(&account.data).ok())
-                    .unwrap_or(0);
+                let balance = self.token_balance(&token);
                 // The condition is permanent, so report a mint only when its held amount changes.
                 if self.unsweepable_mints.insert(mint, balance) != Some(balance) {
                     if balance > 0 {
@@ -168,13 +179,26 @@ impl Rebalancer {
                 continue;
             }
 
+            // Seized stake is kept, not sold: a single-validator LST rarely has a DEX market, and
+            // liquidations seizing it are rare enough to just hold what they leave.
+            if self.is_staked_collateral(&mint) {
+                let balance = self.token_balance(&token);
+                if balance > 0 && self.held_stake.insert(mint, balance) != Some(balance) {
+                    info!(
+                        "Keeping {} of the staked collateral {}: seized stake is held, not sold.",
+                        balance, mint
+                    );
+                }
+                continue;
+            }
+
             let wrapper = match self.cache.try_get_token_wrapper_lenient(&mint, &token) {
                 Ok(wrapper) => wrapper,
                 Err(e) => {
                     // Ignore empty stake banks.
                     if e.to_string().contains("Stake pool supply is zero") {
                         self.empty_stake_banks.insert(mint);
-                    } else {
+                    } else if self.skip_warnings.allow(mint, Instant::now()) {
                         warn!("Skipping the token {} in rebalancing: {}", mint, e);
                     }
                     continue;
@@ -188,10 +212,12 @@ impl Rebalancer {
             let value = match wrapper.get_value() {
                 Ok(value) => value,
                 Err(e) => {
-                    warn!(
-                        "Skipping the token {} in rebalancing (price unavailable): {}",
-                        mint, e
-                    );
+                    if self.skip_warnings.allow(mint, Instant::now()) {
+                        warn!(
+                            "Skipping the token {} in rebalancing (price unavailable): {}",
+                            mint, e
+                        );
+                    }
                     continue;
                 }
             };
@@ -206,6 +232,7 @@ impl Rebalancer {
                 mint,
                 value.to_num::<f64>()
             );
+            sells += 1;
             if let Err(e) = self.swap(wrapper.balance, mint, self.swap_mint, value) {
                 error!("Rebalance swap failed for {}: {}", mint, e);
             }
@@ -213,7 +240,25 @@ impl Rebalancer {
 
         info!("The Rebalancing process is complete.");
 
-        Ok(())
+        Ok(sells)
+    }
+
+    /// Whether `mint` is the LST of a staked collateral bank.
+    fn is_staked_collateral(&self, mint: &Pubkey) -> bool {
+        self.cache
+            .banks
+            .try_get_account_for_mint(mint)
+            .and_then(|bank| self.cache.banks.try_get_bank(&bank))
+            .is_ok_and(|bank| bank.bank.config.asset_tag == ASSET_TAG_STAKED)
+    }
+
+    fn token_balance(&self, token: &Pubkey) -> u64 {
+        self.cache
+            .tokens
+            .try_get_account(token)
+            .ok()
+            .and_then(|account| accessor::amount(&account.data).ok())
+            .unwrap_or(0)
     }
 
     /// Swap `amount` of `input_mint` (worth `value` USD at the oracle) for `output_mint`, refusing
@@ -248,11 +293,14 @@ impl Rebalancer {
         );
 
         let (prepared, signature) = self.tokio_rt.block_on(async {
-            let _permit = self.dex_gate.acquire().await?;
-            let prepared = self
-                .dex_client
-                .build_swap_transaction(input_mint, output_mint, amount, min_out)
-                .await?;
+            // The gate admits aggregator calls only; waiting for the confirmation must not hold a
+            // slot the liquidation workers need for their quotes.
+            let prepared = {
+                let _permit = self.dex_gate.acquire().await?;
+                self.dex_client
+                    .build_swap_transaction(input_mint, output_mint, amount, min_out)
+                    .await?
+            };
             let signature = self
                 .dex_client
                 .send_and_confirm(&prepared.transaction, CommitmentLevel::Confirmed)

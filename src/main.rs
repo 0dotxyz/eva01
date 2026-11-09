@@ -31,6 +31,7 @@ mod kamino_ixs;
 mod liquidator;
 mod marginfi_ixs;
 mod rebalancer;
+mod tag_policy;
 mod utils;
 #[warn(clippy::type_complexity)]
 mod wrappers;

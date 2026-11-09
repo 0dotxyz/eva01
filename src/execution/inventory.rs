@@ -22,7 +22,6 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
 use log::{debug, info};
-use marginfi_type_crate::constants::ASSET_TAG_STAKED;
 use solana_dex_superagg::{DexSuperAggClient, RouteRequest};
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
@@ -44,13 +43,6 @@ use super::{ExecutionPlan, LiquidationStrategy, Sandwich};
 /// Liability still to buy: `repay_amount` truncated like the repay ix, minus what the wallet holds.
 fn buy_shortfall(repay_amount: I80F48, wallet_balance: u64) -> u64 {
     repay_amount.to_num::<u64>().saturating_sub(wallet_balance)
-}
-
-/// Whether a failed sandwich means no venue would quote the collateral at all, as opposed to a
-/// route that exists but pays too little, doesn't fit, or fails to build.
-fn no_venue_quoted(error: &anyhow::Error) -> bool {
-    let text = error.to_string();
-    text.contains("No aggregator returned a quote") || text.contains("NO_ROUTES_FOUND")
 }
 
 /// swap_mint to spend on a buy: what the oracle says the shortfall costs, or everything the wallet
@@ -260,25 +252,17 @@ impl InventoryStrategy {
     /// the buy guarantees less than the shortfall, the liquidation shrinks to what the wallet will
     /// hold: the repay, and with it the seized collateral, since `end_liquidation` caps the latter
     /// at the repay plus the premium.
+    ///
+    /// The seized collateral stays in the wallet for the rebalancer to sell, except staked
+    /// collateral: a single-validator LST rarely has a DEX market, so it is kept as it is. Accounts
+    /// holding staked collateral can only borrow SOL, so such a plan buys SOL and keeps the LST.
     fn build_buy_plan(
         &self,
         intent: &PreparedLiquidatableAccount,
-        asset_mint: Pubkey,
-        asset_tag: u8,
         liab_mint: Pubkey,
-        collateral_sellable: bool,
     ) -> Result<ExecutionPlan> {
         let mut asset_amount = intent.asset_amount;
         let mut repay_amount = intent.liab_amount;
-        // Staked collateral is often a single-validator LST with no DEX market; seizing it would
-        // leave the rebalancer holding what it can't sell. The sandwich attempt just asked every
-        // venue for a quote, so its answer is reused rather than quoted again.
-        if asset_tag == ASSET_TAG_STAKED && !collateral_sellable {
-            return Err(anyhow!(
-                "no venue quotes the staked collateral {}; not seizing what can't be sold",
-                asset_mint
-            ));
-        }
 
         let wallet_liab = self
             .liquidator_account
@@ -363,9 +347,7 @@ impl LiquidationStrategy for InventoryStrategy {
                     "InventoryStrategy: not selling the collateral in-tx for {} ({}); buying the liability instead",
                     intent.liquidatee_account.address, e
                 );
-                Ok(Sandwich::Unavailable {
-                    collateral_sellable: !no_venue_quoted(&e),
-                })
+                Ok(Sandwich::Unavailable)
             }
         }
     }
@@ -373,18 +355,10 @@ impl LiquidationStrategy for InventoryStrategy {
     fn assemble_with_inventory(
         &self,
         intent: &PreparedLiquidatableAccount,
-        collateral_sellable: bool,
     ) -> Result<ExecutionPlan> {
         let cache = &self.liquidator_account.cache;
         let liab_mint = cache.banks.try_get_bank(&intent.liab_bank)?.bank.mint;
-        let asset_bank = cache.banks.try_get_bank(&intent.asset_bank)?;
-        self.build_buy_plan(
-            intent,
-            asset_bank.bank.mint,
-            asset_bank.bank.config.asset_tag,
-            liab_mint,
-            collateral_sellable,
-        )
+        self.build_buy_plan(intent, liab_mint)
     }
 }
 
@@ -392,25 +366,6 @@ impl LiquidationStrategy for InventoryStrategy {
 mod tests {
     use super::*;
     use fixed_macro::types::I80F48;
-
-    #[test]
-    fn only_a_missing_quote_marks_collateral_unsellable() {
-        assert!(no_venue_quoted(&anyhow!(
-            "No aggregator returned a quote (Jupiter: 429; Titan: timeout)"
-        )));
-        assert!(no_venue_quoted(&anyhow!(
-            "Jupiter quote failed: NO_ROUTES_FOUND"
-        )));
-        assert!(!no_venue_quoted(&anyhow!(
-            "No route pays 541005 X for at most 535916 Y"
-        )));
-        assert!(!no_venue_quoted(&anyhow!(
-            "transaction loads 75 accounts (max 64)"
-        )));
-        assert!(!no_venue_quoted(&anyhow!(
-            "Could not build swap instructions on any venue (Jupiter: adds 27 accounts)"
-        )));
-    }
 
     #[test]
     fn affordable_input_is_capped_by_the_wallet() {

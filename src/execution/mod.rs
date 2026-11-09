@@ -9,6 +9,7 @@
 
 pub mod executor;
 pub mod inventory;
+pub mod queue;
 
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 use anyhow::Result;
@@ -41,22 +42,16 @@ pub trait LiquidationStrategy {
     fn assemble_sandwich(&self, intent: &PreparedLiquidatableAccount) -> Result<Sandwich>;
 
     /// Assemble the plan that spends wallet inventory. Called with the inventory lock held, so the
-    /// wallet balance it reads is stable until the plan has landed or failed. `collateral_sellable`
-    /// is what the sandwich attempt learned: whether any venue quotes the seized collateral.
+    /// wallet balance it reads is stable until the plan has landed or failed.
     fn assemble_with_inventory(
         &self,
         intent: &PreparedLiquidatableAccount,
-        collateral_sellable: bool,
     ) -> Result<ExecutionPlan>;
 }
 
 /// The outcome of trying to fund a liquidation from its own collateral.
 pub enum Sandwich {
     Plan(ExecutionPlan),
-    /// No sandwich (no route, doesn't fit, simulation fails). `collateral_sellable` is false only
-    /// when no venue quoted the collateral at all, which an inventory plan must respect for
-    /// collateral the rebalancer could then never sell.
-    Unavailable {
-        collateral_sellable: bool,
-    },
+    /// No sandwich (no route, doesn't fit, simulation fails): the inventory plan is next.
+    Unavailable,
 }

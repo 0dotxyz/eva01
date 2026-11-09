@@ -6,7 +6,8 @@
 //! 2. otherwise take the inventory lock and ask for the inventory plan (`[buy] [liquidate]`, or
 //!    `[liquidate]` paid from holdings): simulate-first, then an atomic Jito bundle (with a tip),
 //!    falling back to sequential RPC sends. The lock is held until the plan has landed or failed
-//!    and the wallet balances are re-read, so the next plan is sized against real holdings.
+//!    and the wallet balances are re-read, so the next plan is sized against real holdings. The
+//!    wait for the lock can be long, so the intent is re-sized on the current state once it is held.
 //!
 //! The tip is added only on the bundle path; the sequential fallback sends the core txs as-is.
 
@@ -14,7 +15,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
     },
     thread,
     time::{Duration, Instant},
@@ -176,11 +177,31 @@ impl Executor {
         }
     }
 
-    /// Assemble, gate, simulate-first, and land a single liquidation.
+    /// Held while anything spends or sells wallet tokens: an inventory plan, or the rebalancer's
+    /// sweep, which must not sell the tokens a plan was sized against.
+    ///
+    /// A plan that panicked poisons the lock, but the lock guards no data: the wallet balances are
+    /// re-read before every plan, so the next holder can safely proceed.
+    pub fn lock_inventory(&self) -> MutexGuard<'_, ()> {
+        self.inventory_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether `try_execute` would skip `intent` for now: its liability mint has no swap route, or
+    /// the target failed recently.
+    pub fn is_on_hold(&self, intent: &PreparedLiquidatableAccount) -> Result<bool> {
+        Ok(self.is_backed_off(&self.intent_liab_mint(intent)?)?
+            || self.is_backed_off(&intent.liquidatee_account.address)?)
+    }
+
+    /// Assemble, gate, simulate-first, and land a single liquidation. `refresh` re-sizes the
+    /// intent on the current state, `None` when the account is no longer worth liquidating.
     pub fn try_execute(
         &self,
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
+        refresh: &dyn Fn() -> Result<Option<PreparedLiquidatableAccount>>,
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
 
@@ -205,16 +226,14 @@ impl Executor {
 
         // A sandwich funds itself from the seized collateral: no wallet inventory, no bundle, no
         // serialization. Simulated during assembly; the RPC preflight is the second check.
-        let collateral_sellable = match strategy.assemble_sandwich(intent) {
+        match strategy.assemble_sandwich(intent) {
             Ok(Sandwich::Plan(ExecutionPlan { txs })) => {
                 let result = self.send_over_rpc(&txs, "Sandwich");
                 self.note_outcome(&liquidatee, result.is_err());
                 self.refresh_wallet_balances();
                 return result;
             }
-            Ok(Sandwich::Unavailable {
-                collateral_sellable,
-            }) => collateral_sellable,
+            Ok(Sandwich::Unavailable) => {}
             Err(e) => {
                 self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
                 return Err(e);
@@ -227,19 +246,39 @@ impl Executor {
             strategy.name(),
             liquidatee
         );
-        let _inventory = self
-            .inventory_lock
-            .lock()
-            .map_err(|_| anyhow!("inventory lock poisoned"))?;
-        let result = self.execute_with_inventory(strategy, intent, liab_mint, collateral_sellable);
+        let _inventory = self.lock_inventory();
+        // Other plans or a rebalance may have held the lock for a while; competitors may have
+        // taken the account meanwhile.
+        let intent = match refresh()? {
+            Some(fresh)
+                if fresh.asset_bank == intent.asset_bank && fresh.liab_bank == intent.liab_bank =>
+            {
+                fresh
+            }
+            Some(_) => {
+                info!(
+                    "Leaving {} to the next attempt: its best bank pair changed while waiting for the inventory lock",
+                    liquidatee
+                );
+                return Ok(());
+            }
+            None => {
+                info!(
+                    "Dropping the liquidation of {}: no longer worth it after waiting for the inventory lock",
+                    liquidatee
+                );
+                return Ok(());
+            }
+        };
+        let result = self.execute_with_inventory(strategy, &intent, liab_mint);
         self.refresh_wallet_balances();
         result
     }
 
-    /// A landed liquidation changed the wallet's balances, and the Geyser updates reporting that
-    /// are only applied when the liquidator loop drains them. Anything sizing a swap from the cache
-    /// before then (the next inventory plan, the rebalancer's sweep) needs the real balances.
-    fn refresh_wallet_balances(&self) {
+    /// A landed liquidation or sell changed the wallet's balances, and the Geyser updates reporting
+    /// that are only applied when the liquidator loop drains them. Anything sizing a swap from the
+    /// cache before then (the next inventory plan, the rebalancer's sweep) needs the real balances.
+    pub fn refresh_wallet_balances(&self) {
         if let Err(e) = self.cache.refresh_wallet_tokens(&self.rpc_client) {
             warn!("Failed to refresh the wallet balances: {e}");
         }
@@ -251,10 +290,9 @@ impl Executor {
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
         liab_mint: Pubkey,
-        collateral_sellable: bool,
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
-        let plan = match strategy.assemble_with_inventory(intent, collateral_sellable) {
+        let plan = match strategy.assemble_with_inventory(intent) {
             Ok(plan) => plan,
             Err(e) => {
                 // Record a quarantine/backoff so we stop hammering this target, then propagate so

@@ -82,10 +82,9 @@ impl BanksCache {
 
     /// Derived on-ramp accounts for every StakedWithPythPush bank.
     ///
-    /// marginfi 0.1.9 consumes a 4th "on-ramp" account for staked pricing. In PreTransition mode
-    /// this account may not exist on-chain yet (the program doesn't read it then), so the loader
-    /// inserts an empty placeholder for any that are missing — keeping the 4-oracle count aligned
-    /// for both in-process pricing and the on-chain observation list.
+    /// Staked pricing takes a 4th "on-ramp" account, whose lamports count towards the pool's value.
+    /// A pool may not have created it yet, so the loader inserts an empty placeholder for any that
+    /// are missing, matching how the program reads a missing account.
     pub fn get_staked_onramps(&self) -> HashSet<Pubkey> {
         self.inner
             .read()

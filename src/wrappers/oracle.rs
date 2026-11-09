@@ -19,7 +19,6 @@ use solana_pubkey::Pubkey;
 use crate::{cache::Cache, utils::staked_onramp};
 
 const SOL_POOL_INDEX: usize = 2;
-const ONRAMP_INDEX: usize = 3;
 
 pub fn oracle_account_keys(bank: &Bank, bank_address: &Pubkey) -> Result<Vec<Pubkey>> {
     let key = |index: usize| -> Result<Pubkey> {
@@ -151,17 +150,10 @@ impl OracleWrapper {
         };
 
         let addresses = oracle_account_keys(bank, bank_address)?;
-        let staked = bank.config.oracle_setup == OracleSetup::StakedWithPythPush;
-
-        let mut accounts: Vec<Account> = Vec::with_capacity(addresses.len());
-        for (index, address) in addresses.iter().enumerate() {
-            let account = match cache.oracles.try_get_account(address) {
-                Ok(account) => account,
-                Err(_) if staked && index == ONRAMP_INDEX => accounts[SOL_POOL_INDEX].clone(),
-                Err(e) => return Err(e),
-            };
-            accounts.push(account);
-        }
+        let mut accounts = addresses
+            .iter()
+            .map(|address| cache.oracles.try_get_account(address))
+            .collect::<Result<Vec<Account>>>()?;
 
         let remaining_ais: Vec<_> = addresses
             .iter()
