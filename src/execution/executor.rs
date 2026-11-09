@@ -179,10 +179,20 @@ impl Executor {
 
     /// Held while anything spends or sells wallet tokens: an inventory plan, or the rebalancer's
     /// sweep, which must not sell the tokens a plan was sized against.
-    pub fn lock_inventory(&self) -> Result<MutexGuard<'_, ()>> {
+    ///
+    /// A plan that panicked poisons the lock, but the lock guards no data: the wallet balances are
+    /// re-read before every plan, so the next holder can safely proceed.
+    pub fn lock_inventory(&self) -> MutexGuard<'_, ()> {
         self.inventory_lock
             .lock()
-            .map_err(|_| anyhow!("inventory lock poisoned"))
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether `try_execute` would skip `intent` for now: its liability mint has no swap route, or
+    /// the target failed recently.
+    pub fn is_on_hold(&self, intent: &PreparedLiquidatableAccount) -> Result<bool> {
+        Ok(self.is_backed_off(&self.intent_liab_mint(intent)?)?
+            || self.is_backed_off(&intent.liquidatee_account.address)?)
     }
 
     /// Assemble, gate, simulate-first, and land a single liquidation. `refresh` re-sizes the
@@ -238,7 +248,7 @@ impl Executor {
             strategy.name(),
             liquidatee
         );
-        let _inventory = self.lock_inventory()?;
+        let _inventory = self.lock_inventory();
         // Other plans or a rebalance may have held the lock for a while; competitors may have
         // taken the account meanwhile.
         let intent = match refresh()? {

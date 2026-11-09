@@ -56,6 +56,7 @@ use std::sync::atomic::Ordering;
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},
+    panic::{self, AssertUnwindSafe},
     sync::{atomic::AtomicBool, Arc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -571,45 +572,68 @@ fn run_worker(
     strategy: &InventoryStrategy,
     rebalance: &Sender<()>,
 ) {
-    while let Some(QueuedIntent { intent, queued_at }) = queue.take() {
-        let liquidatee = intent.liquidatee_account.address;
-        // The intent was sized on the state at evaluation time. By now another liquidator may have
-        // taken a chunk of the account or prices may have moved, so it is re-sized on the current
-        // state and dropped if it is no longer worth it, instead of sending a transaction the
-        // program would reject.
-        let refresh = || evaluator.re_evaluate(&liquidatee);
-        match refresh() {
-            Ok(Some(fresh)) => {
-                info!(
-                    "Liquidating {}: seizing {} for {} (est. profit ${:.4}, ${:.4} when queued {} ms ago)",
-                    liquidatee,
-                    fresh.asset_bank,
-                    fresh.liab_bank,
-                    fresh.profit.to_num::<f64>(),
-                    intent.profit.to_num::<f64>(),
-                    queued_at.elapsed().as_millis()
-                );
-                if let Err(e) = executor.try_execute(strategy, &fresh, &refresh) {
-                    error!(
-                        "Failed to execute liquidation for {:?}: {:?}",
-                        liquidatee, e
-                    );
-                }
-                // The wallet may now hold seized collateral to sell. A request already pending
-                // covers this one.
-                let _ = rebalance.try_send(());
-            }
-            Ok(None) => info!(
-                "Dropping the liquidation of {}: no longer worth it on the current state ({} ms after it was queued)",
-                liquidatee,
-                queued_at.elapsed().as_millis()
-            ),
-            Err(e) => error!(
-                "Failed to re-evaluate {} before liquidating it: {:?}",
-                liquidatee, e
-            ),
+    while let Some(queued) = queue.take() {
+        let liquidatee = queued.intent.liquidatee_account.address;
+        // A panic would otherwise end the worker and leave the account marked in flight for good.
+        let attempt = panic::catch_unwind(AssertUnwindSafe(|| {
+            attempt_liquidation(queued, evaluator, executor, strategy, rebalance)
+        }));
+        if attempt.is_err() {
+            error!("The liquidation attempt on {} panicked.", liquidatee);
         }
         queue.release(liquidatee);
+    }
+}
+
+fn attempt_liquidation(
+    QueuedIntent { intent, queued_at }: QueuedIntent,
+    evaluator: &Evaluator,
+    executor: &Executor,
+    strategy: &InventoryStrategy,
+    rebalance: &Sender<()>,
+) {
+    let liquidatee = intent.liquidatee_account.address;
+    // The intent was sized on the state at evaluation time. By now another liquidator may have
+    // taken a chunk of the account or prices may have moved, so it is re-sized on the current
+    // state and dropped if it is no longer worth it, instead of sending a transaction the program
+    // would reject.
+    let refresh = || evaluator.re_evaluate(&liquidatee);
+    match refresh() {
+        Ok(Some(fresh)) if executor.is_on_hold(&fresh).unwrap_or(false) => {
+            debug!(
+                "Skipping {}: it or its liability mint is backed off after a recent failure",
+                liquidatee
+            );
+        }
+        Ok(Some(fresh)) => {
+            info!(
+                "Liquidating {}: seizing {} for {} (est. profit ${:.4}, ${:.4} when queued {} ms ago)",
+                liquidatee,
+                fresh.asset_bank,
+                fresh.liab_bank,
+                fresh.profit.to_num::<f64>(),
+                intent.profit.to_num::<f64>(),
+                queued_at.elapsed().as_millis()
+            );
+            if let Err(e) = executor.try_execute(strategy, &fresh, &refresh) {
+                error!(
+                    "Failed to execute liquidation for {:?}: {:?}",
+                    liquidatee, e
+                );
+            }
+            // The wallet may now hold seized collateral to sell. A request already pending
+            // covers this one.
+            let _ = rebalance.try_send(());
+        }
+        Ok(None) => info!(
+            "Dropping the liquidation of {}: no longer worth it on the current state ({} ms after it was queued)",
+            liquidatee,
+            queued_at.elapsed().as_millis()
+        ),
+        Err(e) => error!(
+            "Failed to re-evaluate {} before liquidating it: {:?}",
+            liquidatee, e
+        ),
     }
 }
 
@@ -620,15 +644,11 @@ fn run_rebalancer(mut rebalancer: Rebalancer, executor: &Executor, requests: &Re
     while let Ok(()) | Err(RecvTimeoutError::Timeout) =
         requests.recv_timeout(IDLE_REBALANCE_INTERVAL)
     {
-        let _inventory = match executor.lock_inventory() {
-            Ok(guard) => guard,
-            Err(error) => {
-                error!("Rebalancing skipped: {:?}", error);
-                continue;
-            }
-        };
-        if let Err(error) = rebalancer.run() {
-            error!("Rebalancing failed: {:?}", error);
+        let _inventory = executor.lock_inventory();
+        match panic::catch_unwind(AssertUnwindSafe(|| rebalancer.run())) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => error!("Rebalancing failed: {:?}", error),
+            Err(_) => error!("Rebalancing panicked."),
         }
     }
 }
@@ -1128,7 +1148,7 @@ impl Evaluator {
                 continue;
             }
 
-            if !bank_covers_its_borrows(&bank_wrapper.bank)? {
+            if !bank_covers_its_borrows(&bank_wrapper.bank).unwrap_or(false) {
                 debug!("Skipping bankrupt bank from evaluation: {}", bank_pk);
                 continue;
             }
@@ -1218,5 +1238,37 @@ mod repay_bounds_tests {
             ..example()
         };
         assert_eq!(bounds.max_repay(I80F48!(1)), I80F48!(50));
+    }
+}
+
+#[cfg(test)]
+mod bank_solvency_tests {
+    use super::*;
+
+    fn bank(assets: i32, liabilities: i32) -> Bank {
+        let mut bank: Bank = bytemuck::Zeroable::zeroed();
+        bank.asset_share_value = I80F48::ONE.into();
+        bank.liability_share_value = I80F48::ONE.into();
+        bank.total_asset_shares = I80F48::from_num(assets).into();
+        bank.total_liability_shares = I80F48::from_num(liabilities).into();
+        bank
+    }
+
+    #[test]
+    fn a_bank_whose_deposits_cover_its_borrows_is_solvent() {
+        assert!(bank_covers_its_borrows(&bank(100, 90)).unwrap());
+        assert!(bank_covers_its_borrows(&bank(100, 100)).unwrap());
+    }
+
+    #[test]
+    fn a_bank_borrowed_beyond_its_deposits_is_not() {
+        assert!(!bank_covers_its_borrows(&bank(100, 101)).unwrap());
+    }
+
+    #[test]
+    fn share_values_are_applied() {
+        let mut in_bad_debt = bank(100, 90);
+        in_bad_debt.liability_share_value = I80F48::from_num(1.2).into();
+        assert!(!bank_covers_its_borrows(&in_bad_debt).unwrap());
     }
 }
