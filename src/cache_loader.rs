@@ -290,11 +290,10 @@ impl CacheLoader {
                 .try_insert(*oracle_address, oracle_account.clone())?;
         }
 
-        // Staked banks need a 4th "on-ramp" account. In PreTransition mode it may not exist
-        // on-chain yet (the program doesn't read it then), so insert an empty placeholder for any
-        // that didn't load — otherwise pricing and the liquidatability eval fail to find it. Once
-        // the pool transitions to OnRampEnabled the account is created and Geyser streams the real
-        // data over this placeholder.
+        // Staked banks need a 4th "on-ramp" account, which a pool may not have created yet. An
+        // account that doesn't exist reads on-chain as zero lamports and no data, which is exactly
+        // the empty placeholder inserted here: on-ramp pricing then counts nothing for it, as the
+        // program does. Geyser streams the real account over it once the pool creates it.
         for onramp in cache.banks.get_staked_onramps() {
             if !oracle_map.contains_key(&onramp) {
                 debug!(

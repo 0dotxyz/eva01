@@ -231,12 +231,13 @@ mod tests {
         let held = balances(100);
         let start = Instant::now();
         let mut observe =
-            |at: u64| policy.observe(&[account], [candidate(account, &held)], start + minutes(at));
+            |at: Duration| policy.observe(&[account], [candidate(account, &held)], start + at);
+        let first_tag = TAG_MIN_UNHEALTHY_FOR;
 
-        observe(0);
-        assert_eq!(observe(30).len(), 1);
-        assert!(observe(35).is_empty());
-        assert_eq!(observe(40).len(), 1);
+        observe(Duration::ZERO);
+        assert_eq!(observe(first_tag).len(), 1);
+        assert!(observe(first_tag + TAG_RETRY_INTERVAL - Duration::from_secs(1)).is_empty());
+        assert_eq!(observe(first_tag + TAG_RETRY_INTERVAL).len(), 1);
     }
 
     #[test]
