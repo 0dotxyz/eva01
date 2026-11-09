@@ -142,7 +142,9 @@ impl Rebalancer {
     }
 
     /// Sell every non-swap-mint token the wallet holds (above the dust floor) back to the swap mint.
-    pub fn run(&mut self) -> anyhow::Result<()> {
+    /// Returns how many sells were attempted: each may have changed the wallet, even a failed one.
+    pub fn run(&mut self) -> anyhow::Result<usize> {
+        let mut sells = 0;
         info!("Running the Rebalancing process...");
 
         for mint in self.cache.mints.get_mints() {
@@ -230,6 +232,7 @@ impl Rebalancer {
                 mint,
                 value.to_num::<f64>()
             );
+            sells += 1;
             if let Err(e) = self.swap(wrapper.balance, mint, self.swap_mint, value) {
                 error!("Rebalance swap failed for {}: {}", mint, e);
             }
@@ -237,7 +240,7 @@ impl Rebalancer {
 
         info!("The Rebalancing process is complete.");
 
-        Ok(())
+        Ok(sells)
     }
 
     /// Whether `mint` is the LST of a staked collateral bank.
@@ -290,11 +293,14 @@ impl Rebalancer {
         );
 
         let (prepared, signature) = self.tokio_rt.block_on(async {
-            let _permit = self.dex_gate.acquire().await?;
-            let prepared = self
-                .dex_client
-                .build_swap_transaction(input_mint, output_mint, amount, min_out)
-                .await?;
+            // The gate admits aggregator calls only; waiting for the confirmation must not hold a
+            // slot the liquidation workers need for their quotes.
+            let prepared = {
+                let _permit = self.dex_gate.acquire().await?;
+                self.dex_client
+                    .build_swap_transaction(input_mint, output_mint, amount, min_out)
+                    .await?
+            };
             let signature = self
                 .dex_client
                 .send_and_confirm(&prepared.transaction, CommitmentLevel::Confirmed)

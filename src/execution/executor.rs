@@ -275,10 +275,10 @@ impl Executor {
         result
     }
 
-    /// A landed liquidation changed the wallet's balances, and the Geyser updates reporting that
-    /// are only applied when the liquidator loop drains them. Anything sizing a swap from the cache
-    /// before then (the next inventory plan, the rebalancer's sweep) needs the real balances.
-    fn refresh_wallet_balances(&self) {
+    /// A landed liquidation or sell changed the wallet's balances, and the Geyser updates reporting
+    /// that are only applied when the liquidator loop drains them. Anything sizing a swap from the
+    /// cache before then (the next inventory plan, the rebalancer's sweep) needs the real balances.
+    pub fn refresh_wallet_balances(&self) {
         if let Err(e) = self.cache.refresh_wallet_tokens(&self.rpc_client) {
             warn!("Failed to refresh the wallet balances: {e}");
         }

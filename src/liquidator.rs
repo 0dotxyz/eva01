@@ -646,9 +646,14 @@ fn run_rebalancer(mut rebalancer: Rebalancer, executor: &Executor, requests: &Re
     {
         let _inventory = executor.lock_inventory();
         match panic::catch_unwind(AssertUnwindSafe(|| rebalancer.run())) {
-            Ok(Ok(())) => {}
+            // The next inventory plan sizes from the cached balances as soon as the lock is free.
+            Ok(Ok(sells)) if sells > 0 => executor.refresh_wallet_balances(),
+            Ok(Ok(_)) => {}
             Ok(Err(error)) => error!("Rebalancing failed: {:?}", error),
-            Err(_) => error!("Rebalancing panicked."),
+            Err(_) => {
+                error!("Rebalancing panicked.");
+                executor.refresh_wallet_balances();
+            }
         }
     }
 }
