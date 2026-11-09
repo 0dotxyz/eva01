@@ -6,6 +6,7 @@ use crate::{
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{error, info, warn};
+use marginfi_type_crate::constants::ASSET_TAG_STAKED;
 use solana_commitment_config::CommitmentLevel;
 use solana_dex_superagg::{
     ClientConfig, DexSuperAggClient, DflowConfig, JupiterConfig, TitanConfig,
@@ -82,6 +83,8 @@ pub struct Rebalancer {
     dex_gate: Arc<DexGate>,
     empty_stake_banks: HashSet<Pubkey>,
     unsweepable_mints: HashMap<Pubkey, u64>,
+    /// Staked collateral held, by mint, as last reported.
+    held_stake: HashMap<Pubkey, u64>,
     /// Reports each unpriceable token at most once per [`SKIP_WARN_INTERVAL`].
     skip_warnings: RateLimiter<Pubkey>,
 }
@@ -125,6 +128,7 @@ impl Rebalancer {
             dex_gate: Arc::new(DexGate::new()),
             empty_stake_banks: HashSet::new(),
             unsweepable_mints: HashMap::new(),
+            held_stake: HashMap::new(),
             skip_warnings: RateLimiter::new(SKIP_WARN_INTERVAL),
         })
     }
@@ -155,13 +159,7 @@ impl Rebalancer {
             // prices the raw SPL token, so they can never be swept.
             // Expected to only ever happen on staging.
             if self.cache.banks.try_get_account_for_mint(&mint).is_err() {
-                let balance = self
-                    .cache
-                    .tokens
-                    .try_get_account(&token)
-                    .ok()
-                    .and_then(|account| accessor::amount(&account.data).ok())
-                    .unwrap_or(0);
+                let balance = self.token_balance(&token);
                 // The condition is permanent, so report a mint only when its held amount changes.
                 if self.unsweepable_mints.insert(mint, balance) != Some(balance) {
                     if balance > 0 {
@@ -175,6 +173,19 @@ impl Rebalancer {
                             mint
                         );
                     }
+                }
+                continue;
+            }
+
+            // Seized stake is kept, not sold: a single-validator LST rarely has a DEX market, and
+            // liquidations seizing it are rare enough to just hold what they leave.
+            if self.is_staked_collateral(&mint) {
+                let balance = self.token_balance(&token);
+                if balance > 0 && self.held_stake.insert(mint, balance) != Some(balance) {
+                    info!(
+                        "Keeping {} of the staked collateral {}: seized stake is held, not sold.",
+                        balance, mint
+                    );
                 }
                 continue;
             }
@@ -227,6 +238,24 @@ impl Rebalancer {
         info!("The Rebalancing process is complete.");
 
         Ok(())
+    }
+
+    /// Whether `mint` is the LST of a staked collateral bank.
+    fn is_staked_collateral(&self, mint: &Pubkey) -> bool {
+        self.cache
+            .banks
+            .try_get_account_for_mint(mint)
+            .and_then(|bank| self.cache.banks.try_get_bank(&bank))
+            .is_ok_and(|bank| bank.bank.config.asset_tag == ASSET_TAG_STAKED)
+    }
+
+    fn token_balance(&self, token: &Pubkey) -> u64 {
+        self.cache
+            .tokens
+            .try_get_account(token)
+            .ok()
+            .and_then(|account| accessor::amount(&account.data).ok())
+            .unwrap_or(0)
     }
 
     /// Swap `amount` of `input_mint` (worth `value` USD at the oracle) for `output_mint`, refusing

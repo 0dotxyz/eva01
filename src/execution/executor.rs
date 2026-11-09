@@ -226,16 +226,14 @@ impl Executor {
 
         // A sandwich funds itself from the seized collateral: no wallet inventory, no bundle, no
         // serialization. Simulated during assembly; the RPC preflight is the second check.
-        let collateral_sellable = match strategy.assemble_sandwich(intent) {
+        match strategy.assemble_sandwich(intent) {
             Ok(Sandwich::Plan(ExecutionPlan { txs })) => {
                 let result = self.send_over_rpc(&txs, "Sandwich");
                 self.note_outcome(&liquidatee, result.is_err());
                 self.refresh_wallet_balances();
                 return result;
             }
-            Ok(Sandwich::Unavailable {
-                collateral_sellable,
-            }) => collateral_sellable,
+            Ok(Sandwich::Unavailable) => {}
             Err(e) => {
                 self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
                 return Err(e);
@@ -272,7 +270,7 @@ impl Executor {
                 return Ok(());
             }
         };
-        let result = self.execute_with_inventory(strategy, &intent, liab_mint, collateral_sellable);
+        let result = self.execute_with_inventory(strategy, &intent, liab_mint);
         self.refresh_wallet_balances();
         result
     }
@@ -292,10 +290,9 @@ impl Executor {
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
         liab_mint: Pubkey,
-        collateral_sellable: bool,
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
-        let plan = match strategy.assemble_with_inventory(intent, collateral_sellable) {
+        let plan = match strategy.assemble_with_inventory(intent) {
             Ok(plan) => plan,
             Err(e) => {
                 // Record a quarantine/backoff so we stop hammering this target, then propagate so
