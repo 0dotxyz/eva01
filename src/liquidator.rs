@@ -2,10 +2,15 @@ use crate::{
     cache::Cache,
     clock_manager,
     config::Eva01Config,
-    execution::{executor::Executor, inventory::InventoryStrategy},
+    execution::{
+        executor::Executor,
+        inventory::InventoryStrategy,
+        queue::{ExecutionQueue, QueuedIntent},
+    },
     geyser::{AccountType, GeyserUpdate},
     rebalancer::Rebalancer,
-    utils::{self, jito::JitoClient, log_genuine_error},
+    tag_policy::{Balances, Candidate, TagPolicy},
+    utils::{self, jito::JitoClient, log_genuine_error, rate_limiter::RateLimiter},
     wrappers::{
         bank::BankWrapper,
         liquidator_account::{
@@ -17,7 +22,7 @@ use crate::{
 };
 use anchor_lang::AccountDeserialize;
 use anyhow::{anyhow, Result};
-use crossbeam::channel::{Receiver, RecvTimeoutError};
+use crossbeam::channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{debug, error, info};
@@ -51,7 +56,7 @@ use std::sync::atomic::Ordering;
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},
-    sync::{atomic::AtomicBool, Arc, Condvar, Mutex, MutexGuard},
+    sync::{atomic::AtomicBool, Arc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -72,42 +77,26 @@ const PREMIUM_SAFETY_MARGIN: I80F48 = I80F48!(0.005);
 /// moves between evaluation and landing; profit is judged on the same share.
 const LIQUIDATION_SIZE_HAIRCUT: I80F48 = I80F48!(0.90);
 
-/// Minimum time between tag attempts on the same account, so a failing tag is not resent on every
-/// update.
-const TAG_RETRY_INTERVAL: Duration = Duration::from_secs(600);
-
-/// An account is tagged only after it has been unhealthy, with its position untouched, for this
-/// long. A tag costs a fee and pays off only if we liquidate the account ourselves once the premium
-/// has grown; an account other liquidators are willing to work gets chunked away long before that.
-const TAG_MIN_UNHEALTHY_FOR: Duration = Duration::from_secs(30 * 60);
-
-/// An account under tag observation that has not been evaluated for this long is forgotten.
-const TAG_WATCH_TTL: Duration = Duration::from_secs(3600);
-
 /// How often each unhealthy account we are not liquidating is reported.
 const SKIP_REPORT_INTERVAL: Duration = Duration::from_secs(600);
 
-/// After a liquidation attempt the same account is left alone this long, so the next attempt sees
-/// the state the attempt produced (which arrives over Geyser) rather than the state it started from.
+/// After an attempt the same account is left alone this long. An attempt only ends once its
+/// transaction is confirmed or can no longer land, and Geyser streams the account at processed
+/// commitment, so the update is already on its way; this covers its delivery and the loop applying
+/// it, so the next attempt is sized on the state the last one produced.
 const ATTEMPT_COOLDOWN: Duration = Duration::from_secs(3);
 
-/// How long a worker waits for new intents before re-checking cooldowns and the stop flag.
-const WORKER_WAIT: Duration = Duration::from_millis(250);
-
 pub struct Liquidator {
-    rebalancer: Rebalancer,
+    /// Moved onto its own thread by [`Liquidator::start`].
+    rebalancer: Option<Rebalancer>,
     executor: Arc<Executor>,
     strategy: Arc<InventoryStrategy>,
     evaluator: Arc<Evaluator>,
     queue: Arc<ExecutionQueue>,
-    workers: Vec<JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
     liquidator_account: Arc<LiquidatorAccount>,
-    /// When each account was last tagged (or a tag last failed).
-    tag_attempts: HashMap<Pubkey, Instant>,
-    /// Unhealthy accounts waiting out [`TAG_MIN_UNHEALTHY_FOR`].
-    tag_watch: HashMap<Pubkey, TagWatch>,
-    /// When each unhealthy account we are not liquidating was last reported.
-    skip_reports: HashMap<Pubkey, Instant>,
+    tag_policy: TagPolicy,
+    skip_reports: RateLimiter<Pubkey>,
     geyser_rx: Receiver<GeyserUpdate>,
     stop_liquidator: Arc<AtomicBool>,
     cache: Arc<Cache>,
@@ -119,115 +108,6 @@ pub struct Liquidator {
 struct Evaluator {
     cache: Arc<Cache>,
     min_profit: f64,
-}
-
-/// Liquidation intents waiting for a worker: the newest evaluation of each account. The liquidator
-/// loop replaces intents as it re-evaluates, and the workers take the most profitable one that is
-/// not already being worked, so a slow send never holds up evaluation or the other intents.
-struct ExecutionQueue {
-    state: Mutex<QueueState>,
-    ready: Condvar,
-    /// Set by a worker after an attempt, since the wallet may now hold tokens to sweep.
-    rebalance_requested: AtomicBool,
-}
-
-#[derive(Default)]
-struct QueueState {
-    pending: HashMap<Pubkey, QueuedIntent>,
-    in_flight: HashSet<Pubkey>,
-    cooldowns: HashMap<Pubkey, Instant>,
-    stopped: bool,
-}
-
-struct QueuedIntent {
-    intent: PreparedLiquidatableAccount,
-    queued_at: Instant,
-}
-
-impl ExecutionQueue {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(QueueState::default()),
-            ready: Condvar::new(),
-            rebalance_requested: AtomicBool::new(false),
-        }
-    }
-
-    fn lock(&self) -> MutexGuard<'_, QueueState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Replaces the intents of the `checked` accounts with `intents`: an account that was checked
-    /// and is no longer liquidatable leaves the queue.
-    fn offer(&self, checked: &[Pubkey], intents: Vec<PreparedLiquidatableAccount>) {
-        let mut state = self.lock();
-        for address in checked {
-            state.pending.remove(address);
-        }
-        let queued_at = Instant::now();
-        for intent in intents {
-            state.pending.insert(
-                intent.liquidatee_account.address,
-                QueuedIntent { intent, queued_at },
-            );
-        }
-        drop(state);
-        self.ready.notify_all();
-    }
-
-    /// The most profitable intent not being worked or cooling down; `None` once stopped.
-    fn take(&self) -> Option<QueuedIntent> {
-        let mut state = self.lock();
-        loop {
-            if state.stopped {
-                return None;
-            }
-            let now = Instant::now();
-            state.cooldowns.retain(|_, until| *until > now);
-            let best = state
-                .pending
-                .iter()
-                .filter(|(address, _)| {
-                    !state.in_flight.contains(*address) && !state.cooldowns.contains_key(*address)
-                })
-                .max_by_key(|(_, queued)| queued.intent.profit)
-                .map(|(address, _)| *address);
-            if let Some(queued) = best.and_then(|address| state.pending.remove(&address)) {
-                state
-                    .in_flight
-                    .insert(queued.intent.liquidatee_account.address);
-                return Some(queued);
-            }
-            state = self
-                .ready
-                .wait_timeout(state, WORKER_WAIT)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
-    }
-
-    fn release(&self, address: Pubkey) {
-        let mut state = self.lock();
-        state.in_flight.remove(&address);
-        state
-            .cooldowns
-            .insert(address, Instant::now() + ATTEMPT_COOLDOWN);
-        drop(state);
-        self.ready.notify_all();
-    }
-
-    fn request_rebalance(&self) {
-        self.rebalance_requested.store(true, Ordering::Relaxed);
-    }
-
-    fn take_rebalance_request(&self) -> bool {
-        self.rebalance_requested.swap(false, Ordering::Relaxed)
-    }
-
-    fn stop(&self) {
-        self.lock().stopped = true;
-        self.ready.notify_all();
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -339,9 +219,6 @@ enum Evaluation {
     Unhealthy(UnhealthyAccount),
 }
 
-/// Active balances as `(shares, bank)` per side; unchanged while nobody touches the position.
-type Balances = (Vec<(I80F48, Pubkey)>, Vec<(I80F48, Pubkey)>);
-
 struct UnhealthyAccount {
     address: Pubkey,
     observation_accounts: ObservationAccounts,
@@ -354,13 +231,6 @@ struct UnhealthyAccount {
     max_repay: I80F48,
     profit: I80F48,
     premium: I80F48,
-    balances: Balances,
-}
-
-struct TagWatch {
-    /// Since when the account has been unhealthy with these balances.
-    since: Instant,
-    last_seen: Instant,
     balances: Balances,
 }
 
@@ -403,19 +273,18 @@ impl Liquidator {
         )?;
 
         Ok(Liquidator {
-            rebalancer,
+            rebalancer: Some(rebalancer),
             executor: Arc::new(executor),
             strategy: Arc::new(strategy),
             evaluator: Arc::new(Evaluator {
                 cache: cache.clone(),
                 min_profit: config.min_profit,
             }),
-            queue: Arc::new(ExecutionQueue::new()),
-            workers: Vec::new(),
+            queue: Arc::new(ExecutionQueue::new(ATTEMPT_COOLDOWN)),
+            threads: Vec::new(),
             liquidator_account,
-            tag_attempts: HashMap::new(),
-            tag_watch: HashMap::new(),
-            skip_reports: HashMap::new(),
+            tag_policy: TagPolicy::new(),
+            skip_reports: RateLimiter::new(SKIP_REPORT_INTERVAL),
             geyser_rx,
             stop_liquidator,
             cache,
@@ -423,8 +292,12 @@ impl Liquidator {
     }
 
     pub fn start(&mut self) -> Result<()> {
-        self.rebalancer.run()?;
-        self.spawn_workers()?;
+        let mut rebalancer = self
+            .rebalancer
+            .take()
+            .ok_or_else(|| anyhow!("the Liquidator was already started"))?;
+        rebalancer.run()?;
+        self.spawn_threads(rebalancer)?;
 
         // Geyser only delivers changes, so an account that is already underwater at startup would
         // wait for an unrelated update to touch one of its banks. Sweep them all once up front.
@@ -444,32 +317,20 @@ impl Liquidator {
         }
 
         info!("Staring the Liquidator loop.");
-        let mut last_rebalance = Instant::now();
         while !self.stop_liquidator.load(Ordering::Relaxed) {
             debug!("Waiting for any data change...");
             let accounts_to_check = self.receive_geyser_updates()?;
             if !accounts_to_check.is_empty() {
                 self.run_liquidation_cycle(accounts_to_check);
             }
-
-            // Sell-only sweep: convert any seized collateral / JIT-buy overshoot back to USDC. Only
-            // a liquidation attempt can leave such tokens behind, so the sweep runs after one, and
-            // otherwise on a heartbeat.
-            if self.queue.take_rebalance_request()
-                || last_rebalance.elapsed() >= IDLE_REBALANCE_INTERVAL
-            {
-                last_rebalance = Instant::now();
-                if let Err(error) = self.rebalancer.run() {
-                    error!("Rebalancing failed: {:?}", error);
-                }
-            }
         }
 
-        info!("Stopping the liquidation workers...");
+        // The workers exit once the queue stops; the rebalancer once the last worker is gone.
+        info!("Stopping the liquidation workers and the rebalancer...");
         self.queue.stop();
-        for worker in self.workers.drain(..) {
-            if worker.join().is_err() {
-                error!("A liquidation worker panicked.");
+        for thread in self.threads.drain(..) {
+            if thread.join().is_err() {
+                error!("A liquidation worker or the rebalancer panicked.");
             }
         }
         info!("The Liquidator loop is stopped.");
@@ -477,65 +338,33 @@ impl Liquidator {
         Ok(())
     }
 
-    /// Starts the workers that take intents off the queue and land them. They outlive the
-    /// evaluation cycles: a send waiting for confirmation occupies one worker, not the loop.
-    fn spawn_workers(&mut self) -> Result<()> {
+    /// Starts the execution workers and the rebalancer. Both outlive the evaluation cycles, so a
+    /// send waiting for confirmation or a sweep selling seized collateral never holds up the loop
+    /// that applies Geyser updates.
+    fn spawn_threads(&mut self, rebalancer: Rebalancer) -> Result<()> {
+        let (rebalance_tx, rebalance_rx) = bounded::<()>(1);
         for index in 0..MAX_CONCURRENT_LIQUIDATIONS {
             let queue = Arc::clone(&self.queue);
             let evaluator = Arc::clone(&self.evaluator);
             let executor = Arc::clone(&self.executor);
             let strategy = Arc::clone(&self.strategy);
-            let worker = thread::Builder::new()
-                .name(format!("liquidation-worker-{index}"))
-                .spawn(move || Self::run_worker(&queue, &evaluator, &executor, &strategy))?;
-            self.workers.push(worker);
+            let rebalance_tx = rebalance_tx.clone();
+            self.threads.push(
+                thread::Builder::new()
+                    .name(format!("liquidation-worker-{index}"))
+                    .spawn(move || {
+                        run_worker(&queue, &evaluator, &executor, &strategy, &rebalance_tx)
+                    })?,
+            );
         }
-        Ok(())
-    }
 
-    fn run_worker(
-        queue: &ExecutionQueue,
-        evaluator: &Evaluator,
-        executor: &Executor,
-        strategy: &InventoryStrategy,
-    ) {
-        while let Some(QueuedIntent { intent, queued_at }) = queue.take() {
-            let liquidatee = intent.liquidatee_account.address;
-            // The intent was sized on the state at evaluation time. By now another liquidator may
-            // have taken a chunk of the account or prices may have moved, so it is re-sized on the
-            // current state and dropped if it is no longer worth it, instead of sending a
-            // transaction preflight or the program would reject.
-            match evaluator.re_evaluate(&liquidatee) {
-                Ok(Some(fresh)) => {
-                    info!(
-                        "Liquidating {}: seizing {} for {} (est. profit ${:.4}, ${:.4} when queued {} ms ago)",
-                        liquidatee,
-                        fresh.asset_bank,
-                        fresh.liab_bank,
-                        fresh.profit.to_num::<f64>(),
-                        intent.profit.to_num::<f64>(),
-                        queued_at.elapsed().as_millis()
-                    );
-                    if let Err(e) = executor.try_execute(strategy, &fresh) {
-                        error!(
-                            "Failed to execute liquidation for {:?}: {:?}",
-                            liquidatee, e
-                        );
-                    }
-                    queue.request_rebalance();
-                }
-                Ok(None) => info!(
-                    "Dropping the liquidation of {}: no longer worth it on the current state ({} ms after it was queued)",
-                    liquidatee,
-                    queued_at.elapsed().as_millis()
-                ),
-                Err(e) => error!(
-                    "Failed to re-evaluate {} before liquidating it: {:?}",
-                    liquidatee, e
-                ),
-            }
-            queue.release(liquidatee);
-        }
+        let executor = Arc::clone(&self.executor);
+        self.threads.push(
+            thread::Builder::new()
+                .name("rebalancer".to_string())
+                .spawn(move || run_rebalancer(rebalancer, &executor, &rebalance_rx))?,
+        );
+        Ok(())
     }
 
     fn run_liquidation_cycle(&mut self, accounts_to_check: Vec<Pubkey>) {
@@ -543,15 +372,14 @@ impl Liquidator {
         match self.evaluator.check_accounts(&accounts_to_check) {
             Ok((liquidations, unhealthy)) => {
                 let liquidatable = liquidations.len();
-                let skipped = unhealthy.len();
                 self.queue.offer(&accounts_to_check, liquidations);
-                self.handle_unhealthy(&accounts_to_check, unhealthy);
+                self.handle_unhealthy(&accounts_to_check, &unhealthy);
                 info!(
                     "Evaluated {} account(s) in {} ms: {} queued for liquidation, {} unhealthy but not worth liquidating.",
                     accounts_to_check.len(),
                     started.elapsed().as_millis(),
                     liquidatable,
-                    skipped
+                    unhealthy.len()
                 );
             }
             Err(err) => {
@@ -677,38 +505,46 @@ impl Liquidator {
         Ok(())
     }
 
-    /// Reports the unhealthy accounts we are not liquidating and tags the ones that have stayed
-    /// unhealthy and untouched for [`TAG_MIN_UNHEALTHY_FOR`].
-    fn handle_unhealthy(&mut self, checked: &[Pubkey], unhealthy: Vec<UnhealthyAccount>) {
+    /// Reports the unhealthy accounts we are not liquidating and tags the ones the tag policy says
+    /// are due.
+    fn handle_unhealthy(&mut self, checked: &[Pubkey], unhealthy: &[UnhealthyAccount]) {
         let now = Instant::now();
-
-        // An account that was checked and is no longer merely unhealthy (it healed, someone
-        // liquidated it, or it became worth liquidating) leaves the watch; the wait starts over if
-        // it turns up again.
-        let still_unhealthy: HashSet<Pubkey> = unhealthy.iter().map(|u| u.address).collect();
-        for address in checked {
-            if !still_unhealthy.contains(address) {
-                self.tag_watch.remove(address);
+        self.skip_reports.prune(now);
+        for account in unhealthy {
+            if self.skip_reports.allow(account.address, now) {
+                self.report_skipped(account);
             }
         }
-        self.tag_watch
-            .retain(|_, watch| now.duration_since(watch.last_seen) < TAG_WATCH_TTL);
-        self.tag_attempts
-            .retain(|_, at| now.duration_since(*at) < TAG_RETRY_INTERVAL);
-        self.skip_reports
-            .retain(|_, at| now.duration_since(*at) < SKIP_REPORT_INTERVAL);
 
-        for account in unhealthy {
-            self.report_skipped(&account, now);
-            self.consider_tagging(account, now);
+        let candidates = unhealthy.iter().map(|account| Candidate {
+            address: account.address,
+            taggable: account.taggable,
+            balances: &account.balances,
+        });
+        let due = self.tag_policy.observe(checked, candidates, now);
+        if due.is_empty() {
+            return;
+        }
+        let by_address: HashMap<Pubkey, &UnhealthyAccount> =
+            unhealthy.iter().map(|a| (a.address, a)).collect();
+        for (address, waited) in due {
+            let observation_accounts = &by_address[&address].observation_accounts;
+            match self
+                .liquidator_account
+                .send_tag_tx(address, observation_accounts)
+            {
+                Ok(signature) => info!(
+                    "Sent a tag for {} after {} min unhealthy with nobody liquidating it, so its premium grows: {}",
+                    address,
+                    waited.as_secs() / 60,
+                    signature
+                ),
+                Err(err) => error!("Failed to tag {}: {:?}", address, err),
+            }
         }
     }
 
-    fn report_skipped(&mut self, account: &UnhealthyAccount, now: Instant) {
-        if self.skip_reports.contains_key(&account.address) {
-            return;
-        }
-        self.skip_reports.insert(account.address, now);
+    fn report_skipped(&self, account: &UnhealthyAccount) {
         info!(
             "Not liquidating the unhealthy account {} (maintenance health ${:.4}): seizing {} for {} \
              may repay at most ${:.4} for ${:.4} profit at a {:.2}% premium, below the ${} minimum \
@@ -725,64 +561,74 @@ impl Liquidator {
             account.taggable
         );
     }
+}
 
-    /// Tags `account` once it has been unhealthy with nobody touching it for
-    /// [`TAG_MIN_UNHEALTHY_FOR`]. The tag fee is spent either way, so an account other liquidators
-    /// are working (its balances keep changing) is left to them.
-    fn consider_tagging(&mut self, account: UnhealthyAccount, now: Instant) {
-        let UnhealthyAccount {
-            address,
-            observation_accounts,
-            taggable,
-            balances,
-            ..
-        } = account;
-        if !taggable {
-            self.tag_watch.remove(&address);
-            return;
-        }
-
-        let watch = self.tag_watch.entry(address).or_insert_with(|| TagWatch {
-            since: now,
-            last_seen: now,
-            balances: balances.clone(),
-        });
-        watch.last_seen = now;
-        if watch.balances != balances {
-            watch.since = now;
-            watch.balances = balances;
-        }
-        let unhealthy_for = now.duration_since(watch.since);
-        if unhealthy_for < TAG_MIN_UNHEALTHY_FOR || self.tag_attempts.contains_key(&address) {
-            return;
-        }
-
-        // Tagged by someone else since the evaluation? The program would reject ours, fee paid.
-        match self.cache.marginfi_accounts.try_get_account(&address) {
-            Ok(current) if current.account.liquidation_tagged_at != 0 => {
-                debug!("Not tagging {}: already tagged.", address);
-                self.tag_watch.remove(&address);
-                return;
+/// Takes intents off the queue and lands them until the queue stops.
+fn run_worker(
+    queue: &ExecutionQueue,
+    evaluator: &Evaluator,
+    executor: &Executor,
+    strategy: &InventoryStrategy,
+    rebalance: &Sender<()>,
+) {
+    while let Some(QueuedIntent { intent, queued_at }) = queue.take() {
+        let liquidatee = intent.liquidatee_account.address;
+        // The intent was sized on the state at evaluation time. By now another liquidator may have
+        // taken a chunk of the account or prices may have moved, so it is re-sized on the current
+        // state and dropped if it is no longer worth it, instead of sending a transaction the
+        // program would reject.
+        let refresh = || evaluator.re_evaluate(&liquidatee);
+        match refresh() {
+            Ok(Some(fresh)) => {
+                info!(
+                    "Liquidating {}: seizing {} for {} (est. profit ${:.4}, ${:.4} when queued {} ms ago)",
+                    liquidatee,
+                    fresh.asset_bank,
+                    fresh.liab_bank,
+                    fresh.profit.to_num::<f64>(),
+                    intent.profit.to_num::<f64>(),
+                    queued_at.elapsed().as_millis()
+                );
+                if let Err(e) = executor.try_execute(strategy, &fresh, &refresh) {
+                    error!(
+                        "Failed to execute liquidation for {:?}: {:?}",
+                        liquidatee, e
+                    );
+                }
+                // The wallet may now hold seized collateral to sell. A request already pending
+                // covers this one.
+                let _ = rebalance.try_send(());
             }
-            Ok(_) => {}
-            Err(e) => {
-                debug!("Not tagging {}: {}", address, e);
-                return;
-            }
-        }
-
-        self.tag_attempts.insert(address, now);
-        match self
-            .liquidator_account
-            .send_tag_tx(address, &observation_accounts)
-        {
-            Ok(signature) => info!(
-                "Sent a tag for {} after {} min unhealthy with nobody liquidating it, so its premium grows: {}",
-                address,
-                unhealthy_for.as_secs() / 60,
-                signature
+            Ok(None) => info!(
+                "Dropping the liquidation of {}: no longer worth it on the current state ({} ms after it was queued)",
+                liquidatee,
+                queued_at.elapsed().as_millis()
             ),
-            Err(err) => error!("Failed to tag {}: {:?}", address, err),
+            Err(e) => error!(
+                "Failed to re-evaluate {} before liquidating it: {:?}",
+                liquidatee, e
+            ),
+        }
+        queue.release(liquidatee);
+    }
+}
+
+/// Sells leftover tokens back to the swap mint after each liquidation attempt and on a heartbeat,
+/// until every worker is gone.
+fn run_rebalancer(mut rebalancer: Rebalancer, executor: &Executor, requests: &Receiver<()>) {
+    // A request or the heartbeat timeout; disconnected once every worker has exited.
+    while let Ok(()) | Err(RecvTimeoutError::Timeout) =
+        requests.recv_timeout(IDLE_REBALANCE_INTERVAL)
+    {
+        let _inventory = match executor.lock_inventory() {
+            Ok(guard) => guard,
+            Err(error) => {
+                error!("Rebalancing skipped: {:?}", error);
+                continue;
+            }
+        };
+        if let Err(error) = rebalancer.run() {
+            error!("Rebalancing failed: {:?}", error);
         }
     }
 }

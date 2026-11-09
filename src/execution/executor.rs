@@ -6,7 +6,8 @@
 //! 2. otherwise take the inventory lock and ask for the inventory plan (`[buy] [liquidate]`, or
 //!    `[liquidate]` paid from holdings): simulate-first, then an atomic Jito bundle (with a tip),
 //!    falling back to sequential RPC sends. The lock is held until the plan has landed or failed
-//!    and the wallet balances are re-read, so the next plan is sized against real holdings.
+//!    and the wallet balances are re-read, so the next plan is sized against real holdings. The
+//!    wait for the lock can be long, so the intent is re-sized on the current state once it is held.
 //!
 //! The tip is added only on the bundle path; the sequential fallback sends the core txs as-is.
 
@@ -14,7 +15,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
     },
     thread,
     time::{Duration, Instant},
@@ -176,11 +177,21 @@ impl Executor {
         }
     }
 
-    /// Assemble, gate, simulate-first, and land a single liquidation.
+    /// Held while anything spends or sells wallet tokens: an inventory plan, or the rebalancer's
+    /// sweep, which must not sell the tokens a plan was sized against.
+    pub fn lock_inventory(&self) -> Result<MutexGuard<'_, ()>> {
+        self.inventory_lock
+            .lock()
+            .map_err(|_| anyhow!("inventory lock poisoned"))
+    }
+
+    /// Assemble, gate, simulate-first, and land a single liquidation. `refresh` re-sizes the
+    /// intent on the current state, `None` when the account is no longer worth liquidating.
     pub fn try_execute(
         &self,
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
+        refresh: &dyn Fn() -> Result<Option<PreparedLiquidatableAccount>>,
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
 
@@ -227,11 +238,31 @@ impl Executor {
             strategy.name(),
             liquidatee
         );
-        let _inventory = self
-            .inventory_lock
-            .lock()
-            .map_err(|_| anyhow!("inventory lock poisoned"))?;
-        let result = self.execute_with_inventory(strategy, intent, liab_mint, collateral_sellable);
+        let _inventory = self.lock_inventory()?;
+        // Other plans or a rebalance may have held the lock for a while; competitors may have
+        // taken the account meanwhile.
+        let intent = match refresh()? {
+            Some(fresh)
+                if fresh.asset_bank == intent.asset_bank && fresh.liab_bank == intent.liab_bank =>
+            {
+                fresh
+            }
+            Some(_) => {
+                info!(
+                    "Leaving {} to the next attempt: its best bank pair changed while waiting for the inventory lock",
+                    liquidatee
+                );
+                return Ok(());
+            }
+            None => {
+                info!(
+                    "Dropping the liquidation of {}: no longer worth it after waiting for the inventory lock",
+                    liquidatee
+                );
+                return Ok(());
+            }
+        };
+        let result = self.execute_with_inventory(strategy, &intent, liab_mint, collateral_sellable);
         self.refresh_wallet_balances();
         result
     }

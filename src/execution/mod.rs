@@ -9,6 +9,7 @@
 
 pub mod executor;
 pub mod inventory;
+pub mod queue;
 
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 use anyhow::Result;

@@ -3,6 +3,7 @@ pub mod integration_account_fetcher;
 pub mod jito;
 pub mod lut_registry;
 pub mod pyth_cranker;
+pub mod rate_limiter;
 
 use anyhow::{anyhow, Error, Result};
 use backoff::ExponentialBackoff;

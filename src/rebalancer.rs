@@ -1,4 +1,8 @@
-use crate::{cache::Cache, config::Eva01Config, utils::accessor};
+use crate::{
+    cache::Cache,
+    config::Eva01Config,
+    utils::{accessor, rate_limiter::RateLimiter},
+};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{error, info, warn};
@@ -64,7 +68,7 @@ const MIN_SELL_PRICE_VS_ORACLE: I80F48 = I80F48!(0.95);
 
 /// A token the sweep cannot price (e.g. a bank whose oracle is disabled) is reported this often,
 /// not on every pass.
-const SKIP_WARN_INTERVAL: Duration = Duration::from_secs(600);
+const SKIP_WARN_INTERVAL: Duration = Duration::from_secs(1200);
 
 /// The rebalancer keeps the liquidator holding only the swap mint (USDC). Every other token it
 /// ends up with (a liquidation's leftover liability or seized collateral, or a JIT-buy overshoot)
@@ -78,8 +82,8 @@ pub struct Rebalancer {
     dex_gate: Arc<DexGate>,
     empty_stake_banks: HashSet<Pubkey>,
     unsweepable_mints: HashMap<Pubkey, u64>,
-    /// When each unpriceable token was last reported.
-    skip_warnings: HashMap<Pubkey, Instant>,
+    /// Reports each unpriceable token at most once per [`SKIP_WARN_INTERVAL`].
+    skip_warnings: RateLimiter<Pubkey>,
 }
 
 impl Rebalancer {
@@ -121,7 +125,7 @@ impl Rebalancer {
             dex_gate: Arc::new(DexGate::new()),
             empty_stake_banks: HashSet::new(),
             unsweepable_mints: HashMap::new(),
-            skip_warnings: HashMap::new(),
+            skip_warnings: RateLimiter::new(SKIP_WARN_INTERVAL),
         })
     }
 
@@ -181,7 +185,7 @@ impl Rebalancer {
                     // Ignore empty stake banks.
                     if e.to_string().contains("Stake pool supply is zero") {
                         self.empty_stake_banks.insert(mint);
-                    } else if self.should_warn_about(mint) {
+                    } else if self.skip_warnings.allow(mint, Instant::now()) {
                         warn!("Skipping the token {} in rebalancing: {}", mint, e);
                     }
                     continue;
@@ -195,7 +199,7 @@ impl Rebalancer {
             let value = match wrapper.get_value() {
                 Ok(value) => value,
                 Err(e) => {
-                    if self.should_warn_about(mint) {
+                    if self.skip_warnings.allow(mint, Instant::now()) {
                         warn!(
                             "Skipping the token {} in rebalancing (price unavailable): {}",
                             mint, e
@@ -223,18 +227,6 @@ impl Rebalancer {
         info!("The Rebalancing process is complete.");
 
         Ok(())
-    }
-
-    /// Whether a skipped token is due another warning; the condition usually lasts for hours.
-    fn should_warn_about(&mut self, mint: Pubkey) -> bool {
-        let now = Instant::now();
-        match self.skip_warnings.get(&mint) {
-            Some(at) if now.duration_since(*at) < SKIP_WARN_INTERVAL => false,
-            _ => {
-                self.skip_warnings.insert(mint, now);
-                true
-            }
-        }
     }
 
     /// Swap `amount` of `input_mint` (worth `value` USD at the oracle) for `output_mint`, refusing
