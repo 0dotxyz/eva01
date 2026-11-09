@@ -68,7 +68,7 @@ use std::{
 const MAX_CONCURRENT_LIQUIDATIONS: usize = 8;
 
 /// How often the rebalancing sweep runs when no liquidation has been attempted.
-const IDLE_REBALANCE_INTERVAL: Duration = Duration::from_secs(60);
+const IDLE_REBALANCE_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Taken off the premium `end_liquidation` allows, so price moves between evaluation and landing
 /// cannot push the seizure over the cap.
@@ -79,7 +79,7 @@ const PREMIUM_SAFETY_MARGIN: I80F48 = I80F48!(0.005);
 const LIQUIDATION_SIZE_HAIRCUT: I80F48 = I80F48!(0.90);
 
 /// How often each unhealthy account we are not liquidating is reported.
-const SKIP_REPORT_INTERVAL: Duration = Duration::from_secs(600);
+const SKIP_REPORT_INTERVAL: Duration = Duration::from_secs(1200);
 
 /// After an attempt the same account is left alone this long. An attempt only ends once its
 /// transaction is confirmed or can no longer land, and Geyser streams the account at processed

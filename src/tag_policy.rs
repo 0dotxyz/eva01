@@ -24,7 +24,7 @@ use crate::utils::rate_limiter::RateLimiter;
 const TAG_MIN_UNHEALTHY_FOR: Duration = Duration::from_secs(30 * 60);
 
 /// Minimum time between tag attempts on the same account, in case a tag does not land.
-const TAG_RETRY_INTERVAL: Duration = Duration::from_secs(600);
+const TAG_RETRY_INTERVAL: Duration = Duration::from_secs(1200);
 
 /// A watched account no evaluation has reported for this long (it was closed, or lost its
 /// liabilities and is no longer evaluated) is forgotten. Watched accounts are re-evaluated on
