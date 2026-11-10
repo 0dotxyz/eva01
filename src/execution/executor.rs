@@ -9,8 +9,8 @@
 //!
 //! It goes alone over RPC, unless it was sized on Pyth prices the chain does not hold yet (from
 //! Hermes): then the prices are pushed ahead of it in one Jito bundle, `[push..] [liquidate]
-//! [tip]`, simulated first. A bundle that doesn't land falls back to sending the push and then the
-//! liquidation over RPC; a push alone is harmless.
+//! [tip]`, simulated first. The push is never sent outside that bundle: on its own it would hand
+//! the prices to whoever liquidates next. A bundle that doesn't land is retried on a later cycle.
 //!
 //! Nothing waits for another plan: any number of liquidations run at once, bounded by the workers.
 
@@ -269,14 +269,22 @@ impl Executor {
             return Ok(());
         }
 
-        // eva may price on Hermes prices the chain doesn't hold yet. Most liquidations don't need
-        // them pushed: the plain path runs first, simulated against the chain's prices, and only a
-        // liquidation that fails there goes behind a price push.
+        // eva may price on Hermes prices the chain doesn't hold yet. The evaluation priced the
+        // account on the chain's prices too: one that is liquidatable there goes the plain way,
+        // simulated against the chain's prices, and falls back to a price push only if that fails
+        // (eva's health model and the program can disagree right at the line).
         let pending = if self.price_push.is_some() {
             self.pending_pushes(intent)
         } else {
             Vec::new()
         };
+
+        // Healthy on the chain's prices: no push-free plan can pass, so none is built or
+        // simulated. Straight to the bundle, sandwich first. Without a feed behind (the chain
+        // caught up since evaluation) the plain path below applies.
+        if intent.needs_price_push && !pending.is_empty() {
+            return self.execute_with_price_push(strategy, intent, liab_mint, &pending, true);
+        }
 
         // A sandwich funds itself from the seized collateral and touches no wallet inventory.
         let sandwich = match strategy.assemble_sandwich(intent, Landing::Rpc) {
@@ -449,8 +457,8 @@ impl Executor {
         result
     }
 
-    /// Simulates `[push..] [liquidation]`, then sends it as a Jito bundle with a tip. A bundle that
-    /// doesn't land is followed by the push and then the liquidation over RPC.
+    /// Simulates `[push..] [liquidation]`, then sends it as a Jito bundle with a tip. Nothing goes
+    /// out if the bundle doesn't land.
     fn land_behind_price_push(
         &self,
         landing: &PricePushLanding,
@@ -490,36 +498,12 @@ impl Executor {
             return Ok(());
         }
 
-        // The bundle didn't land: push over RPC, then liquidate on the pushed prices.
-        for (i, tx) in push.txs.iter().enumerate() {
-            if let Err(e) = self.send_with_resend(tx, Preflight::Run) {
-                warn!(
-                    "The price push for {} failed at tx {}: {}",
-                    liquidatee,
-                    i + 1,
-                    e
-                );
-                if i > 0 {
-                    // The first transaction created the VAA account; reclaim its rent.
-                    match landing.pusher.reclaim_transaction(&push.encoded_vaa) {
-                        Ok(reclaim) => {
-                            if let Err(e) = self.send_with_resend(&reclaim, Preflight::Run) {
-                                warn!(
-                                    "Failed to reclaim the VAA account {}: {}",
-                                    push.encoded_vaa, e
-                                );
-                            }
-                        }
-                        Err(e) => warn!("Failed to build the VAA reclaim: {e}"),
-                    }
-                }
-                // Somebody else may have pushed the same prices; the liquidation's preflight
-                // decides.
-                break;
-            }
-        }
-        // Built for the bundle and never simulated alone on the pushed prices.
-        self.send_over_rpc(liquidation, "Pushed", Preflight::Run)
+        // The bundle is atomic, so nothing of it is on chain. The push is never sent on its own:
+        // landing it ahead of a liquidation that may not follow hands the prices to whoever
+        // liquidates next. The next cycle tries again.
+        Err(anyhow!(
+            "the price push and liquidation bundle for {liquidatee} didn't land"
+        ))
     }
 
     /// Sends `bundle` with a tip appended. Returns whether its liquidation, the last transaction,
@@ -535,10 +519,12 @@ impl Executor {
             .copied()
             .ok_or_else(|| anyhow!("empty bundle"))?;
         let mut txs = bundle.to_vec();
+        // The tip goes out with the bundle's own blockhash, so it expires with the rest.
+        let blockhash = *bundle[0].message.recent_blockhash();
         txs.push(
             landing
                 .tip_estimator
-                .build_tip_transaction(&landing.signer, &self.rpc_client)?,
+                .build_tip_transaction(&landing.signer, blockhash)?,
         );
         match landing
             .jito
@@ -801,7 +787,9 @@ mod tests {
                 .try_insert(address, test_price_update_account(feed, cached, 1))
                 .unwrap();
             if let Some(onchain) = onchain {
-                cache.pyth_prices.record_onchain(address, onchain);
+                cache
+                    .pyth_prices
+                    .record_onchain(address, &test_price_update_account(feed, onchain, 1));
             }
             address
         };

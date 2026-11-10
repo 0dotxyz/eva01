@@ -1,7 +1,10 @@
 use crate::{
     cache::Cache,
     config::Eva01Config,
-    execution::reservations::{Claim, TokenReservations},
+    execution::{
+        activity::LiquidationActivity,
+        reservations::{Claim, TokenReservations},
+    },
     utils::{accessor, rate_limiter::RateLimiter},
     wrappers::{oracle::OracleWrapper, token_account::TokenAccountWrapper},
 };
@@ -33,6 +36,9 @@ const MAX_CONCURRENT_DEX_CALLS: usize = 2;
 /// two or three Jupiter requests still burst past its per-second gateway limit at startup; this
 /// keeps the request rate steady instead.
 const DEX_CALL_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long a swap venue gets to quote, or to build its route, before it is left out.
+const SWAP_VENUE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Admission to the DEX aggregators: at most [`MAX_CONCURRENT_DEX_CALLS`] operations in flight,
 /// starting no closer together than [`DEX_CALL_MIN_INTERVAL`].
@@ -142,7 +148,10 @@ pub struct Rebalancer {
     swap_mint: Pubkey,
     tokio_rt: Runtime,
     cache: Arc<Cache>,
+    /// The rebalancer's own swaps, under the venues' default deadlines: nothing races them.
     dex_client: Arc<DexSuperAggClient>,
+    /// The liquidations' swaps, under [`SWAP_VENUE_TIMEOUT`].
+    liquidation_dex_client: Arc<DexSuperAggClient>,
     dex_gate: Arc<DexGate>,
     empty_stake_banks: HashSet<Pubkey>,
     unsweepable_mints: HashMap<Pubkey, u64>,
@@ -151,6 +160,8 @@ pub struct Rebalancer {
     /// Reports each unpriceable token at most once per [`SKIP_WARN_INTERVAL`].
     skip_warnings: RateLimiter<Pubkey>,
     reservations: Arc<TokenReservations>,
+    /// A pass stops as soon as a liquidation is attempted.
+    activity: Arc<LiquidationActivity>,
     inventory_mints: HashSet<Pubkey>,
     /// The working balance per inventory token (USD).
     inventory_target: I80F48,
@@ -162,6 +173,7 @@ impl Rebalancer {
         config: Eva01Config,
         cache: Arc<Cache>,
         reservations: Arc<TokenReservations>,
+        activity: Arc<LiquidationActivity>,
     ) -> anyhow::Result<Self> {
         let swap_mint = config.swap_mint;
         let inventory_mints: HashSet<Pubkey> = config
@@ -204,28 +216,40 @@ impl Rebalancer {
             }),
             ..Default::default()
         };
-        let signer = Keypair::try_from(config.wallet_keypair.as_slice())?;
-        let dex_client = Arc::new(DexSuperAggClient::new(client_config, signer)?);
+        // A liquidation's venue slower than this loses the race to the others, or the
+        // liquidation to a competitor, anyway.
+        let liquidation_config = ClientConfig {
+            quote_timeout: SWAP_VENUE_TIMEOUT,
+            build_timeout: SWAP_VENUE_TIMEOUT,
+            ..client_config.clone()
+        };
+        let signer = || Keypair::try_from(config.wallet_keypair.as_slice());
+        let dex_client = Arc::new(DexSuperAggClient::new(client_config, signer()?)?);
+        let liquidation_dex_client =
+            Arc::new(DexSuperAggClient::new(liquidation_config, signer()?)?);
 
         Ok(Self {
             swap_mint,
             tokio_rt,
             cache,
             dex_client,
+            liquidation_dex_client,
             dex_gate: Arc::new(DexGate::new()),
             empty_stake_banks: HashSet::new(),
             unsweepable_mints: HashMap::new(),
             held_stake: HashMap::new(),
             skip_warnings: RateLimiter::new(SKIP_WARN_INTERVAL),
             reservations,
+            activity,
             inventory_mints,
             inventory_target,
             cooldown: TradeCooldown::default(),
         })
     }
 
-    pub fn dex_client(&self) -> Arc<DexSuperAggClient> {
-        Arc::clone(&self.dex_client)
+    /// The swap client liquidations quote and build on.
+    pub fn liquidation_dex_client(&self) -> Arc<DexSuperAggClient> {
+        Arc::clone(&self.liquidation_dex_client)
     }
 
     pub fn dex_gate(&self) -> Arc<DexGate> {
@@ -233,13 +257,19 @@ impl Rebalancer {
     }
 
     /// Bring every inventory token back into its band, and sell every other unclaimed token the
-    /// wallet holds (above the dust floor) back to the swap mint.
+    /// wallet holds (above the dust floor) back to the swap mint. Stops early, between tokens, once
+    /// a liquidation is attempted.
     pub fn run(&mut self) -> anyhow::Result<RebalancePass> {
         let mut trades = 0;
         let mut claim = self.reservations.new_claim();
+        let started = Instant::now();
         info!("Running the Rebalancing process...");
 
         for mint in self.cache.mints.get_mints() {
+            if self.activity.attempted_since(started) {
+                info!("Stopping the Rebalancing process: a liquidation was attempted.");
+                return Ok(RebalancePass { trades, claim });
+            }
             if mint == self.swap_mint
                 || self.empty_stake_banks.contains(&mint)
                 || !self.cooldown.ready(&mint, Instant::now())

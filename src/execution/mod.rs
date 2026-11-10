@@ -6,6 +6,7 @@
 //! (scanning/ranking) from execution (tx assembly + submission), and lets different funding
 //! methods plug in behind the same trait.
 
+pub mod activity;
 pub mod executor;
 pub mod inventory;
 pub mod queue;

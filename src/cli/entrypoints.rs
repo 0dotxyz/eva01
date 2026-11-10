@@ -69,6 +69,17 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     let (geyser_tx, geyser_rx) = crossbeam::channel::unbounded::<GeyserUpdate>();
     let cache = Arc::new(cache);
 
+    // Every transaction eva builds takes its blockhash from here instead of asking the RPC.
+    let blockhash_cache = cache.clone();
+    let blockhash_rpc =
+        RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
+    let blockhash_stop = stop_liquidator.clone();
+    thread::spawn(move || {
+        blockhash_cache
+            .blockhash
+            .refresh(&blockhash_rpc, &blockhash_stop)
+    });
+
     let liquidator_account = Arc::new(LiquidatorAccount::new(
         &config.clone(),
         config.marginfi_group_key,

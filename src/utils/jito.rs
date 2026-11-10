@@ -18,9 +18,8 @@ use log::{debug, warn};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use solana_client::rpc_client::RpcClient;
 use solana_keypair::Keypair;
-use solana_message::{v0, VersionedMessage};
+use solana_message::{v0, Hash, VersionedMessage};
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_system_interface::instruction::transfer;
@@ -381,12 +380,11 @@ impl TipEstimator {
     pub fn build_tip_transaction(
         &self,
         signer: &Keypair,
-        rpc_client: &RpcClient,
+        blockhash: Hash,
     ) -> Result<VersionedTransaction> {
         let tip_account = select_tip_account()?;
         let tip_lamports = self.current_tip();
         let ix = transfer(&signer.pubkey(), &tip_account, tip_lamports);
-        let blockhash = rpc_client.get_latest_blockhash()?;
         let msg = v0::Message::try_compile(&signer.pubkey(), &[ix], &[], blockhash)?;
         VersionedTransaction::try_new(VersionedMessage::V0(msg), &[signer]).map_err(Into::into)
     }

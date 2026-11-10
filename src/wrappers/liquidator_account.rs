@@ -33,7 +33,11 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use crate::execution::Landing;
 use crate::juplend_ixs::juplend_underlying_amount;
@@ -81,6 +85,9 @@ pub struct PreparedLiquidatableAccount {
     pub asset_amount: I80F48,
     pub liab_amount: I80F48,
     pub profit: I80F48,
+    /// The account is liquidatable only on Pyth prices the chain doesn't hold yet (from
+    /// Hermes), so the liquidation must go behind a push of them.
+    pub needs_price_push: bool,
 }
 
 pub struct LiquidatorAccount {
@@ -96,7 +103,13 @@ pub struct LiquidatorAccount {
     /// liquidation tx carries a CU limit but no price, so it confirms slowly under load.
     cu_price_ix: Instruction,
     pub cache: Arc<Cache>,
+    /// The swap venues' lookup tables, as last fetched. Routes keep reusing the same few.
+    venue_luts: Mutex<HashMap<Pubkey, (AddressLookupTableAccount, Instant)>>,
 }
+
+/// How long a venue's lookup table is used as fetched. Venues extend their tables now and then;
+/// a stale copy only leaves the new addresses outside it, in the transaction itself.
+const VENUE_LUT_TTL: Duration = Duration::from_secs(60);
 
 impl LiquidatorAccount {
     pub fn new(config: &Eva01Config, marginfi_group_id: Pubkey, cache: Arc<Cache>) -> Result<Self> {
@@ -123,6 +136,7 @@ impl LiquidatorAccount {
                 config.compute_unit_price_micro_lamports,
             ),
             cache,
+            venue_luts: Mutex::new(HashMap::new()),
         })
     }
 
@@ -354,6 +368,7 @@ impl LiquidatorAccount {
             asset_amount: I80F48::ONE,
             liab_amount: I80F48::ONE,
             profit: I80F48::ZERO,
+            needs_price_push: false,
         };
         let (ixs, _, record) = self.liquidation_ixs(&intent, I80F48::ONE, I80F48::ONE, None)?;
         Ok(lookupable_accounts(&self.signer.pubkey(), &ixs)
@@ -471,22 +486,49 @@ impl LiquidatorAccount {
         }
     }
 
+    /// The venue lookup tables `keys`, fetched in one call for those not fetched recently.
     fn fetch_luts(&self, keys: &[Pubkey]) -> Result<Vec<AddressLookupTableAccount>> {
-        if keys.is_empty() {
-            return Ok(vec![]);
-        }
-        self.rpc_client
-            .get_multiple_accounts(keys)?
-            .into_iter()
-            .zip(keys)
-            .map(|(account, key)| {
-                let account = account.ok_or_else(|| anyhow!("Lookup table {} not found", key))?;
-                Ok(AddressLookupTableAccount {
-                    key: *key,
-                    addresses: AddressLookupTable::deserialize(&account.data)?
-                        .addresses
-                        .to_vec(),
+        let now = Instant::now();
+        let missing: Vec<Pubkey> = {
+            let cached = self.venue_luts.lock().unwrap_or_else(|e| e.into_inner());
+            keys.iter()
+                .filter(|key| {
+                    cached
+                        .get(key)
+                        .is_none_or(|(_, at)| now.duration_since(*at) > VENUE_LUT_TTL)
                 })
+                .copied()
+                .collect()
+        };
+        if !missing.is_empty() {
+            let fetched = self
+                .rpc_client
+                .get_multiple_accounts(&missing)?
+                .into_iter()
+                .zip(&missing)
+                .map(|(account, key)| {
+                    let account =
+                        account.ok_or_else(|| anyhow!("Lookup table {} not found", key))?;
+                    Ok(AddressLookupTableAccount {
+                        key: *key,
+                        addresses: AddressLookupTable::deserialize(&account.data)?
+                            .addresses
+                            .to_vec(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut cached = self.venue_luts.lock().unwrap_or_else(|e| e.into_inner());
+            for table in fetched {
+                cached.insert(table.key, (table, now));
+            }
+        }
+        let cached = self.venue_luts.lock().unwrap_or_else(|e| e.into_inner());
+        keys.iter()
+            .map(|key| {
+                cached
+                    .get(key)
+                    .map(|(table, _)| table.clone())
+                    .ok_or_else(|| anyhow!("Lookup table {} not found", key))
             })
             .collect()
     }
@@ -568,7 +610,7 @@ impl LiquidatorAccount {
             loaded_accounts_data_size_limit: Some(MAX_LOADED_ACCOUNTS_DATA),
             ..v1::TransactionConfig::empty()
         };
-        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
+        let recent_blockhash = self.cache.blockhash.get(&self.rpc_client)?;
         let message =
             v1::Message::try_compile_with_config(&signer_pk, ixs, recent_blockhash, config)
                 .map_err(|e| anyhow!("{e:?}"))?;
@@ -590,7 +632,7 @@ impl LiquidatorAccount {
         ixs: &[Instruction],
         luts: &[AddressLookupTableAccount],
     ) -> Result<VersionedTransaction> {
-        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
+        let recent_blockhash = self.cache.blockhash.get(&self.rpc_client)?;
         let msg = Message::try_compile(signer_pk, ixs, luts, recent_blockhash)?;
         VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
             .map_err(Into::into)

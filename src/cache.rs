@@ -1,5 +1,6 @@
 mod accounts;
 mod banks;
+pub mod blockhash;
 pub mod mints;
 mod oracles;
 pub mod pyth_prices;
@@ -43,6 +44,8 @@ pub struct Cache {
     pub mints: MintsCache,
     pub oracles: OraclesCache,
     pub pyth_prices: pyth_prices::PythPrices,
+    /// The newest blockhash, kept fresh in the background.
+    pub blockhash: blockhash::RecentBlockhash,
     pub tokens: TokensCache,
     pub clock: Arc<Mutex<Clock>>,
     pub luts: Arc<LutRegistry>,
@@ -76,6 +79,7 @@ impl Cache {
             mints: MintsCache::new(excluded_mints),
             oracles: OraclesCache::default(),
             pyth_prices: pyth_prices::PythPrices::default(),
+            blockhash: blockhash::RecentBlockhash::default(),
             tokens: TokensCache::default(),
             clock,
             luts: Arc::new(LutRegistry::default()),

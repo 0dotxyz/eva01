@@ -4,14 +4,13 @@
 //! the sponsored push feed marginfi reads. A liquidation sized on such a price only passes once
 //! the feed holds it, so the price is posted in the same bundle, ahead of the liquidation: post
 //! the update's VAA to Wormhole, verify it, write each feed with `update_price_feed`, and close the
-//! VAA account to reclaim its rent. One Hermes update covers every feed asked for, so all of them
-//! share one VAA.
+//! VAA account to reclaim its rent. A push carries one VAA for every feed: the newest one the Hermes
+//! stream delivered under which every feed has an update the chain doesn't hold yet. Nothing is
+//! fetched from Hermes on the way.
 
 use anyhow::{anyhow, Result};
 use log::debug;
 use pyth_solana_receiver_sdk::config::Config;
-use pythnet_sdk::wire::v1::Proof;
-use reqwest::blocking::Client;
 use solana_client::rpc_client::RpcClient;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::Instruction;
@@ -25,10 +24,13 @@ use solana_transaction::versioned::VersionedTransaction;
 use anchor_lang::AccountDeserialize;
 use pyth_solana_receiver_sdk::pda::get_config_address;
 
+use std::sync::Arc;
+
+use crate::cache::Cache;
 use crate::config::Eva01Config;
 use crate::transaction_limits::{MAX_BUNDLE_TXS, MAX_COMPUTE_UNIT_LIMIT, MAX_V0_TX_SIZE};
 use crate::utils::pyth_cranker::{
-    close_encoded_vaa_ix, fetch_hermes_update, guardian_set_index, init_encoded_vaa_ix,
+    close_encoded_vaa_ix, guardian_set_index, init_encoded_vaa_ix, price_feed_address,
     update_price_feed_ix, verify_encoded_vaa_ix, write_encoded_vaa_ix, VAA_HEADER_SIZE,
     VAA_SPLIT_INDEX,
 };
@@ -37,35 +39,30 @@ use crate::utils::pyth_cranker::{
 pub const MAX_PUSH_TXS: usize = MAX_BUNDLE_TXS - 2;
 
 pub struct PythPusher {
+    cache: Arc<Cache>,
     wormhole_program_id: Pubkey,
-    hermes_url: String,
-    hermes_api_key: Option<String>,
-    http_client: Client,
     rpc_client: RpcClient,
     payer: Keypair,
     cu_price_micro_lamports: u64,
 }
 
-/// The transactions that post one Hermes update, in the order they must land.
+/// The transactions that post one Hermes update, in the order they must land. They only ever
+/// land in a bundle with the liquidation behind them, so the VAA account the first one creates is
+/// always closed by the last.
 pub struct PricePush {
     pub txs: Vec<VersionedTransaction>,
-    /// Holds the VAA until the last transaction closes it; reclaimed separately if a later
-    /// transaction never lands.
-    pub encoded_vaa: Pubkey,
 }
 
 impl PythPusher {
-    pub fn new(config: &Eva01Config) -> Result<Self> {
+    pub fn new(config: &Eva01Config, cache: Arc<Cache>) -> Result<Self> {
         let rpc_client = RpcClient::new(config.rpc_url.clone());
         let receiver_config = rpc_client.get_account(&get_config_address())?;
         let wormhole_program_id = Config::try_deserialize(&mut receiver_config.data.as_slice())
             .map_err(|e| anyhow!("Failed to read the Pyth receiver config: {e:?}"))?
             .wormhole;
         Ok(Self {
+            cache,
             wormhole_program_id,
-            hermes_url: config.pyth_hermes_url.clone(),
-            hermes_api_key: config.pyth_api_key.clone(),
-            http_client: Client::new(),
             rpc_client,
             payer: Keypair::try_from(config.wallet_keypair.as_slice())?,
             cu_price_micro_lamports: config.compute_unit_price_micro_lamports,
@@ -74,21 +71,21 @@ impl PythPusher {
 
     /// Builds the transactions that post the latest Hermes prices of `feed_ids`.
     pub fn push_transactions(&self, feed_ids: &[[u8; 32]]) -> Result<PricePush> {
-        let update = fetch_hermes_update(
-            &self.http_client,
-            &self.hermes_url,
-            self.hermes_api_key.as_deref(),
-            feed_ids,
-        )?;
-        let Proof::WormholeMerkle { vaa, updates } = update.proof;
-        let vaa: Vec<u8> = vaa.into();
-        if updates.len() != feed_ids.len() {
-            return Err(anyhow!(
-                "Hermes returned {} price updates for {} feeds",
-                updates.len(),
-                feed_ids.len()
-            ));
-        }
+        // A streamed update is pushed only while it is still ahead of the chain.
+        let prices = &self.cache.pyth_prices;
+        let (vaa, updates) = prices
+            .signed_together(feed_ids, |feed_id, publish_time| {
+                prices
+                    .onchain(&price_feed_address(feed_id))
+                    .is_none_or(|chain| publish_time > chain)
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "the stream holds no signed update covering all {} feed(s) ahead of the chain",
+                    feed_ids.len()
+                )
+            })?;
+        let vaa = vaa.as_slice();
 
         let payer = self.payer.pubkey();
         let wormhole = &self.wormhole_program_id;
@@ -132,7 +129,7 @@ impl PythPusher {
             wormhole,
             &payer,
             &vaa_account,
-            guardian_set_index(&vaa)?,
+            guardian_set_index(vaa)?,
         ));
         for (feed_id, merkle_price_update) in feed_ids.iter().zip(updates) {
             rest.push(update_price_feed_ix(
@@ -144,7 +141,7 @@ impl PythPusher {
         }
         rest.push(close_encoded_vaa_ix(wormhole, &payer, &vaa_account));
 
-        let blockhash = self.rpc_client.get_latest_blockhash()?;
+        let blockhash = self.cache.blockhash.get(&self.rpc_client)?;
         let mut txs = vec![self.compile(&post, &[&self.payer, &encoded_vaa], blockhash)?];
         for chunk in self.pack(&rest, blockhash)? {
             txs.push(self.compile(&chunk, &[&self.payer], blockhash)?);
@@ -162,18 +159,7 @@ impl PythPusher {
             txs.len(),
             feed_ids.len()
         );
-        Ok(PricePush {
-            txs,
-            encoded_vaa: vaa_account,
-        })
-    }
-
-    /// The transaction that reclaims the VAA account's rent when a push stopped halfway.
-    pub fn reclaim_transaction(&self, encoded_vaa: &Pubkey) -> Result<VersionedTransaction> {
-        let close =
-            close_encoded_vaa_ix(&self.wormhole_program_id, &self.payer.pubkey(), encoded_vaa);
-        let blockhash = self.rpc_client.get_latest_blockhash()?;
-        self.compile(&[close], &[&self.payer], blockhash)
+        Ok(PricePush { txs })
     }
 
     /// Splits `ixs`, in order, into as few transactions as fit.
@@ -235,10 +221,13 @@ mod tests {
     #[test]
     fn a_push_is_packed_in_order_into_transactions_that_fit() {
         let pusher = PythPusher {
+            cache: Arc::new(Cache::new(
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                Arc::new(std::sync::Mutex::new(solana_clock::Clock::default())),
+                std::collections::HashSet::new(),
+            )),
             wormhole_program_id: Pubkey::new_unique(),
-            hermes_url: String::new(),
-            hermes_api_key: None,
-            http_client: Client::new(),
             rpc_client: RpcClient::new("http://127.0.0.1:1".to_string()),
             payer: Keypair::new(),
             cu_price_micro_lamports: 1_000,
