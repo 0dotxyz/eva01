@@ -71,9 +71,9 @@ const IX_CLOSE_ENCODED_VAA: [u8; 8] = [48, 221, 174, 198, 231, 7, 152, 38];
 const IX_UPDATE_PRICE_FEED: [u8; 8] = [28, 9, 93, 150, 86, 153, 188, 115];
 
 /// Header the Wormhole account keeps in front of the VAA bytes.
-const VAA_HEADER_SIZE: usize = 46;
+pub(crate) const VAA_HEADER_SIZE: usize = 46;
 /// The VAA is written in two chunks; the first is as large as fits alongside create + init.
-const VAA_SPLIT_INDEX: usize = 721;
+pub(crate) const VAA_SPLIT_INDEX: usize = 721;
 const DEFAULT_TREASURY_ID: u8 = 0;
 
 /// Seconds since `publish_time`, as of the cached clock. The cached clock can trail a fresh
@@ -185,7 +185,12 @@ impl PythCranker {
                 Err(_) => continue,
             };
 
-            let published = price_update.price_message.publish_time;
+            // The cached price may come from Hermes, ahead of the feed; staleness is the chain's.
+            let published = self
+                .cache
+                .pyth_prices
+                .onchain(&oracle)
+                .unwrap_or(price_update.price_message.publish_time);
             let threshold = match adopted.get(&oracle) {
                 Some(&ours) if published > ours => {
                     info!(
@@ -233,24 +238,12 @@ impl PythCranker {
 
     /// Latest signed update for a feed, as the accumulator payload Hermes serves.
     fn fetch_update(&self, feed_id: &[u8; 32]) -> Result<AccumulatorUpdateData> {
-        let url = format!(
-            "{}/v2/updates/price/latest?ids[]=0x{}&encoding=base64",
-            self.hermes_url.trim_end_matches('/'),
-            hex_encode(feed_id)
-        );
-        let mut request = self.http_client.get(&url);
-        if let Some(api_key) = &self.hermes_api_key {
-            request = request.bearer_auth(api_key);
-        }
-        let response: HermesResponse = request.send()?.error_for_status()?.json()?;
-        let encoded = response
-            .binary
-            .data
-            .first()
-            .ok_or_else(|| anyhow!("Hermes returned no update for the feed"))?;
-
-        AccumulatorUpdateData::try_from_slice(&BASE64.decode(encoded)?)
-            .map_err(|e| anyhow!("Failed to parse the Hermes accumulator update: {e:?}"))
+        fetch_hermes_update(
+            &self.http_client,
+            &self.hermes_url,
+            self.hermes_api_key.as_deref(),
+            &[*feed_id],
+        )
     }
 
     /// Post the VAA, update the feed account, then reclaim the VAA account's rent. Two transactions
@@ -283,14 +276,21 @@ impl PythCranker {
                 vaa_account_size as u64,
                 &self.wormhole_program_id,
             ),
-            self.init_encoded_vaa_ix(&payer, &encoded_vaa.pubkey()),
-            self.write_encoded_vaa_ix(&payer, &encoded_vaa.pubkey(), 0, &vaa[..split]),
+            init_encoded_vaa_ix(&self.wormhole_program_id, &payer, &encoded_vaa.pubkey()),
+            write_encoded_vaa_ix(
+                &self.wormhole_program_id,
+                &payer,
+                &encoded_vaa.pubkey(),
+                0,
+                &vaa[..split],
+            ),
         ];
         self.send(&post, &[&self.payer, &encoded_vaa])?;
 
         let mut update = Vec::new();
         if split < vaa.len() {
-            update.push(self.write_encoded_vaa_ix(
+            update.push(write_encoded_vaa_ix(
+                &self.wormhole_program_id,
                 &payer,
                 &encoded_vaa.pubkey(),
                 split as u32,
@@ -298,21 +298,27 @@ impl PythCranker {
             ));
         }
         update.extend([
-            self.verify_encoded_vaa_ix(&payer, &encoded_vaa.pubkey(), guardian_set_index(&vaa)?),
+            verify_encoded_vaa_ix(
+                &self.wormhole_program_id,
+                &payer,
+                &encoded_vaa.pubkey(),
+                guardian_set_index(&vaa)?,
+            ),
             update_price_feed_ix(
                 &payer,
                 &encoded_vaa.pubkey(),
                 feed.feed_id,
                 merkle_price_update,
             )?,
-            self.close_encoded_vaa_ix(&payer, &encoded_vaa.pubkey()),
+            close_encoded_vaa_ix(&self.wormhole_program_id, &payer, &encoded_vaa.pubkey()),
         ]);
         let signature = match self.send(&update, &[&self.payer]) {
             Ok(signature) => signature,
             Err(e) => {
                 // The VAA account from the first transaction holds rent that only this payer can
                 // reclaim; close it on the way out instead of stranding it.
-                let close = self.close_encoded_vaa_ix(&payer, &encoded_vaa.pubkey());
+                let close =
+                    close_encoded_vaa_ix(&self.wormhole_program_id, &payer, &encoded_vaa.pubkey());
                 if let Err(close_err) = self.send(&[close], &[&self.payer]) {
                     warn!(
                         "PythCranker: failed to reclaim the VAA account {} after a failed update: \
@@ -360,80 +366,119 @@ impl PythCranker {
             }
         }
     }
+}
 
-    fn guardian_set_address(&self, index: u32) -> Pubkey {
-        Pubkey::find_program_address(
-            &[b"GuardianSet", &index.to_be_bytes()],
-            &self.wormhole_program_id,
-        )
-        .0
+/// Latest signed update for `feed_ids`, as the accumulator payload Hermes serves: one VAA and a
+/// merkle price update per feed, in the order asked.
+pub(crate) fn fetch_hermes_update(
+    http_client: &Client,
+    hermes_url: &str,
+    api_key: Option<&str>,
+    feed_ids: &[[u8; 32]],
+) -> Result<AccumulatorUpdateData> {
+    let ids: String = feed_ids
+        .iter()
+        .map(|id| format!("ids[]=0x{}&", hex_encode(id)))
+        .collect();
+    let url = format!(
+        "{}/v2/updates/price/latest?{}encoding=base64",
+        hermes_url.trim_end_matches('/'),
+        ids
+    );
+    let mut request = http_client.get(&url);
+    if let Some(api_key) = api_key {
+        request = request.bearer_auth(api_key);
     }
+    let response: HermesResponse = request.send()?.error_for_status()?.json()?;
+    let encoded = response
+        .binary
+        .data
+        .first()
+        .ok_or_else(|| anyhow!("Hermes returned no update for the feeds"))?;
 
-    fn init_encoded_vaa_ix(&self, write_authority: &Pubkey, encoded_vaa: &Pubkey) -> Instruction {
-        Instruction {
-            program_id: self.wormhole_program_id,
-            accounts: vec![
-                AccountMeta::new_readonly(*write_authority, true),
-                AccountMeta::new(*encoded_vaa, false),
-            ],
-            data: IX_INIT_ENCODED_VAA.to_vec(),
-        }
+    AccumulatorUpdateData::try_from_slice(&BASE64.decode(encoded)?)
+        .map_err(|e| anyhow!("Failed to parse the Hermes accumulator update: {e:?}"))
+}
+
+pub(crate) fn guardian_set_address(wormhole_program_id: &Pubkey, index: u32) -> Pubkey {
+    Pubkey::find_program_address(&[b"GuardianSet", &index.to_be_bytes()], wormhole_program_id).0
+}
+
+pub(crate) fn init_encoded_vaa_ix(
+    wormhole_program_id: &Pubkey,
+    write_authority: &Pubkey,
+    encoded_vaa: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: *wormhole_program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*write_authority, true),
+            AccountMeta::new(*encoded_vaa, false),
+        ],
+        data: IX_INIT_ENCODED_VAA.to_vec(),
     }
+}
 
-    fn write_encoded_vaa_ix(
-        &self,
-        write_authority: &Pubkey,
-        draft_vaa: &Pubkey,
-        index: u32,
-        data: &[u8],
-    ) -> Instruction {
-        let mut ix_data = IX_WRITE_ENCODED_VAA.to_vec();
-        ix_data.extend_from_slice(&index.to_le_bytes());
-        ix_data.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        ix_data.extend_from_slice(data);
+pub(crate) fn write_encoded_vaa_ix(
+    wormhole_program_id: &Pubkey,
+    write_authority: &Pubkey,
+    draft_vaa: &Pubkey,
+    index: u32,
+    data: &[u8],
+) -> Instruction {
+    let mut ix_data = IX_WRITE_ENCODED_VAA.to_vec();
+    ix_data.extend_from_slice(&index.to_le_bytes());
+    ix_data.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    ix_data.extend_from_slice(data);
 
-        Instruction {
-            program_id: self.wormhole_program_id,
-            accounts: vec![
-                AccountMeta::new_readonly(*write_authority, true),
-                AccountMeta::new(*draft_vaa, false),
-            ],
-            data: ix_data,
-        }
+    Instruction {
+        program_id: *wormhole_program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*write_authority, true),
+            AccountMeta::new(*draft_vaa, false),
+        ],
+        data: ix_data,
     }
+}
 
-    fn verify_encoded_vaa_ix(
-        &self,
-        write_authority: &Pubkey,
-        draft_vaa: &Pubkey,
-        guardian_set_index: u32,
-    ) -> Instruction {
-        Instruction {
-            program_id: self.wormhole_program_id,
-            accounts: vec![
-                AccountMeta::new_readonly(*write_authority, true),
-                AccountMeta::new(*draft_vaa, false),
-                AccountMeta::new_readonly(self.guardian_set_address(guardian_set_index), false),
-            ],
-            data: IX_VERIFY_ENCODED_VAA_V1.to_vec(),
-        }
+pub(crate) fn verify_encoded_vaa_ix(
+    wormhole_program_id: &Pubkey,
+    write_authority: &Pubkey,
+    draft_vaa: &Pubkey,
+    guardian_set_index: u32,
+) -> Instruction {
+    Instruction {
+        program_id: *wormhole_program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*write_authority, true),
+            AccountMeta::new(*draft_vaa, false),
+            AccountMeta::new_readonly(
+                guardian_set_address(wormhole_program_id, guardian_set_index),
+                false,
+            ),
+        ],
+        data: IX_VERIFY_ENCODED_VAA_V1.to_vec(),
     }
+}
 
-    fn close_encoded_vaa_ix(&self, write_authority: &Pubkey, encoded_vaa: &Pubkey) -> Instruction {
-        Instruction {
-            program_id: self.wormhole_program_id,
-            accounts: vec![
-                AccountMeta::new(*write_authority, true),
-                AccountMeta::new(*encoded_vaa, false),
-            ],
-            data: IX_CLOSE_ENCODED_VAA.to_vec(),
-        }
+pub(crate) fn close_encoded_vaa_ix(
+    wormhole_program_id: &Pubkey,
+    write_authority: &Pubkey,
+    encoded_vaa: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: *wormhole_program_id,
+        accounts: vec![
+            AccountMeta::new(*write_authority, true),
+            AccountMeta::new(*encoded_vaa, false),
+        ],
+        data: IX_CLOSE_ENCODED_VAA.to_vec(),
     }
 }
 
 /// The Pyth-sponsored push feed account for `feed_id`. marginfi no longer sponsors a shard of its
 /// own, so shard 0 is the only one banks point at.
-fn price_feed_address(feed_id: &[u8; 32]) -> Pubkey {
+pub(crate) fn price_feed_address(feed_id: &[u8; 32]) -> Pubkey {
     Pubkey::find_program_address(
         &[&PYTH_SPONSORED_SHARD_ID.to_le_bytes(), feed_id],
         &PYTH_PUSH_ORACLE_ID,
@@ -442,14 +487,14 @@ fn price_feed_address(feed_id: &[u8; 32]) -> Pubkey {
 }
 
 /// Guardian set that signed the VAA: bytes 1..5 of the header, big-endian.
-fn guardian_set_index(vaa: &[u8]) -> Result<u32> {
+pub(crate) fn guardian_set_index(vaa: &[u8]) -> Result<u32> {
     let bytes = vaa
         .get(1..5)
         .ok_or_else(|| anyhow!("VAA is too short to carry a guardian set index"))?;
     Ok(u32::from_be_bytes(bytes.try_into()?))
 }
 
-fn update_price_feed_ix(
+pub(crate) fn update_price_feed_ix(
     payer: &Pubkey,
     encoded_vaa: &Pubkey,
     feed_id: [u8; 32],
@@ -481,7 +526,7 @@ fn update_price_feed_ix(
 }
 
 /// Publish time carried by the update we post, used to recognise our own write later.
-fn publish_time(update: &MerklePriceUpdate) -> Result<i64> {
+pub(crate) fn publish_time(update: &MerklePriceUpdate) -> Result<i64> {
     match from_slice::<byteorder::BE, Message>(update.message.as_ref())
         .map_err(|e| anyhow!("Failed to parse the price message: {e:?}"))?
     {
@@ -490,7 +535,7 @@ fn publish_time(update: &MerklePriceUpdate) -> Result<i64> {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

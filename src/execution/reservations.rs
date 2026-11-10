@@ -55,13 +55,6 @@ impl TokenReservations {
         granted
     }
 
-    /// Claims `amount` of `mint` the wallet does not hold yet but a plan is about to receive (a
-    /// buy's output), so nothing else counts it as free once it arrives.
-    pub fn claim_incoming(&self, claim: &mut Claim, mint: Pubkey, amount: u64) {
-        *self.lock().entry(mint).or_insert(0) += amount;
-        claim.record(mint, amount);
-    }
-
     fn release(&self, amounts: &HashMap<Pubkey, u64>) {
         let mut reserved = self.lock();
         for (mint, amount) in amounts {
@@ -119,20 +112,5 @@ mod tests {
         assert_eq!(ledger.unclaimed(&mint, 100), 70);
         drop(b);
         assert_eq!(ledger.unclaimed(&mint, 100), 100);
-    }
-
-    #[test]
-    fn incoming_tokens_are_not_free_when_they_arrive() {
-        let ledger = TokenReservations::new();
-        let mint = Pubkey::new_unique();
-        let mut buyer = ledger.new_claim();
-        ledger.claim_incoming(&mut buyer, mint, 50);
-        // Before the buy lands the wallet holds nothing, and after it lands the 50 are the buyer's.
-        assert_eq!(ledger.unclaimed(&mint, 0), 0);
-        assert_eq!(ledger.unclaimed(&mint, 50), 0);
-        let mut other = ledger.new_claim();
-        assert_eq!(ledger.claim_available(&mut other, mint, 10, 50), 0);
-        drop(buyer);
-        assert_eq!(ledger.claim_available(&mut other, mint, 10, 50), 10);
     }
 }

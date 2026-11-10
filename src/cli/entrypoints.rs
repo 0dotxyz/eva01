@@ -5,7 +5,10 @@ use crate::{
     config::Eva01Config,
     geyser::{GeyserService, GeyserUpdate},
     liquidator::Liquidator,
-    utils::{integration_account_fetcher::IntegrationAccountFetcher, pyth_cranker::PythCranker},
+    utils::{
+        hermes_stream::HermesStream, integration_account_fetcher::IntegrationAccountFetcher,
+        pyth_cranker::PythCranker,
+    },
     wrappers::liquidator_account::LiquidatorAccount,
 };
 use log::{error, info, warn};
@@ -104,6 +107,17 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     };
 
     let integration_fetcher_tx = geyser_tx.clone();
+    let hermes_stream = if config.price_push_enabled {
+        Some(HermesStream::new(
+            &config,
+            cache.clone(),
+            geyser_tx.clone(),
+            stop_liquidator.clone(),
+        )?)
+    } else {
+        info!("Price pushing is disabled: pricing on the chain's Pyth feeds only.");
+        None
+    };
 
     let geyser_service = GeyserService::new(
         config,
@@ -132,6 +146,9 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
 
     if let Some(pyth_cranker) = pyth_cranker {
         thread::spawn(move || pyth_cranker.start());
+    }
+    if let Some(hermes_stream) = hermes_stream {
+        thread::spawn(move || hermes_stream.start());
     }
     thread::spawn(move || integration_fetcher.start());
 

@@ -43,6 +43,9 @@ pub struct GeyserUpdate {
 #[derive(Clone, Copy, Debug)]
 pub enum AccountType {
     Oracle,
+    /// A Pyth price update built from Hermes, newer than the chain's: priced with like an oracle
+    /// update, but not what the chain holds.
+    HermesPrice,
     Marginfi,
     Bank,
     Token,

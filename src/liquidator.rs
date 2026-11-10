@@ -3,7 +3,7 @@ use crate::{
     clock_manager,
     config::Eva01Config,
     execution::{
-        executor::Executor,
+        executor::{Executor, PricePushLanding},
         inventory::InventoryStrategy,
         queue::{ExecutionQueue, QueuedIntent},
         reservations::TokenReservations,
@@ -11,7 +11,13 @@ use crate::{
     geyser::{AccountType, GeyserUpdate},
     rebalancer::Rebalancer,
     tag_policy::{Balances, Candidate, TagPolicy},
-    utils::{self, jito::JitoClient, log_genuine_error, rate_limiter::RateLimiter},
+    utils::{
+        self,
+        jito::{JitoClient, TipEstimator},
+        log_genuine_error,
+        pyth_push::PythPusher,
+        rate_limiter::RateLimiter,
+    },
     wrappers::{
         bank::BankWrapper,
         liquidator_account::{
@@ -63,7 +69,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Max liquidations executed concurrently. Bounds in-flight RPC/sim/bundle load while still
+/// Max liquidations executed concurrently. Bounds in-flight RPC/simulation load while still
 /// letting a burst of liquidatable accounts (e.g. a price crash) be worked in parallel rather
 /// than one-at-a-time.
 const MAX_CONCURRENT_LIQUIDATIONS: usize = 8;
@@ -132,6 +138,8 @@ pub struct Liquidator {
 struct Evaluator {
     cache: Arc<Cache>,
     min_profit: f64,
+    /// Liquidations earning more than this are left to another instance (a dust instance's cap).
+    max_profit: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -273,26 +281,27 @@ impl Liquidator {
         let dex_client = rebalancer.dex_client();
         let dex_gate = rebalancer.dex_gate();
 
-        let jito = JitoClient::new(
-            config.jito_block_engine_url.clone(),
-            config.bundle_api_key.clone(),
-        );
         let rpc_client =
             RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
-        let signer = Keypair::try_from(config.wallet_keypair.as_slice())?;
-        let executor = Executor::new(
-            jito,
-            rpc_client,
-            cache.clone(),
-            signer,
-            config.rpc_url.clone(),
-            config.bundle_api_key.clone(),
-            config.jito_tip_max_lamports,
-        );
+        let price_push = if config.price_push_enabled {
+            Some(PricePushLanding {
+                pusher: PythPusher::new(&config)?,
+                jito: JitoClient::new(
+                    config.jito_block_engine_url.clone(),
+                    config.bundle_api_key.clone(),
+                ),
+                tip_estimator: TipEstimator::new(config.jito_tip_max_lamports),
+                signer: Keypair::try_from(config.wallet_keypair.as_slice())?,
+                rpc_url: config.rpc_url.clone(),
+                bundle_api_key: config.bundle_api_key.clone(),
+            })
+        } else {
+            None
+        };
+        let executor = Executor::new(rpc_client, cache.clone(), price_push);
 
         let strategy = InventoryStrategy::new(
             liquidator_account.clone(),
-            config.swap_mint,
             dex_client,
             dex_gate,
             config.slippage_bps,
@@ -307,6 +316,7 @@ impl Liquidator {
             evaluator: Arc::new(Evaluator {
                 cache: cache.clone(),
                 min_profit: config.min_profit,
+                max_profit: config.max_profit,
             }),
             queue: Arc::new(ExecutionQueue::new(ATTEMPT_COOLDOWN)),
             threads: Vec::new(),
@@ -324,7 +334,7 @@ impl Liquidator {
             .rebalancer
             .take()
             .ok_or_else(|| anyhow!("the Liquidator was already started"))?;
-        if rebalancer.run()?.sells > 0 {
+        if rebalancer.run()?.trades > 0 {
             self.executor.refresh_wallet_balances();
         }
         self.spawn_threads(rebalancer)?;
@@ -482,10 +492,20 @@ impl Liquidator {
         debug!("Processing the {:?} {:?} update.", account_type, address);
 
         match account_type {
-            AccountType::Oracle => {
+            AccountType::Oracle | AccountType::HermesPrice => {
+                if matches!(account_type, AccountType::Oracle) {
+                    if let Some(update) = crate::cache::pyth_prices::price_update(&account) {
+                        self.cache
+                            .pyth_prices
+                            .record_onchain(address, update.price_message.publish_time);
+                    }
+                }
                 let banks = self.cache.banks.get_banks_for_oracle(&address)?;
                 self.advance_clock_to_oracle(&address, &account, &banks);
-                self.cache.oracles.try_update(&address, account)?;
+                // An older price than the one cached changes nothing to evaluate.
+                if !self.cache.oracles.try_update(&address, account)? {
+                    return Ok(());
+                }
 
                 for bank in banks {
                     self.add_accounts_for_bank(&bank, account_addresses)?;
@@ -679,7 +699,7 @@ fn run_rebalancer(mut rebalancer: Rebalancer, executor: &Executor, requests: &Re
             // Liquidations size from the cached balances; the sold tokens stay claimed until the
             // balances show them gone.
             Ok(Ok(pass)) => {
-                if pass.sells > 0 {
+                if pass.trades > 0 {
                     executor.refresh_wallet_balances();
                 }
                 drop(pass.claim);
@@ -818,6 +838,20 @@ impl Evaluator {
             })));
         }
 
+        let profit = liquidation_amounts.liquidator_profit * LIQUIDATION_SIZE_HAIRCUT;
+        if self
+            .max_profit
+            .is_some_and(|max| profit > I80F48::from_num(max))
+        {
+            debug!(
+                "Account {}: ${:.4} profit is above this instance's ${:?} cap; left to another instance",
+                account.address,
+                profit.to_num::<f64>(),
+                self.max_profit
+            );
+            return Ok(None);
+        }
+
         let slippage_adjusted_asset_amount =
             liquidation_amounts.max_liquidatable_asset_amount * LIQUIDATION_SIZE_HAIRCUT;
         let slippage_adjusted_liab_amount =
@@ -835,7 +869,7 @@ impl Evaluator {
             liab_bank: liab_bank_pk,
             asset_amount: slippage_adjusted_asset_amount,
             liab_amount: slippage_adjusted_liab_amount,
-            profit: liquidation_amounts.liquidator_profit * LIQUIDATION_SIZE_HAIRCUT,
+            profit,
         })))
     }
 

@@ -2,6 +2,7 @@ mod accounts;
 mod banks;
 pub mod mints;
 mod oracles;
+pub mod pyth_prices;
 mod tokens;
 
 use std::{
@@ -41,6 +42,7 @@ pub struct Cache {
     pub banks: BanksCache,
     pub mints: MintsCache,
     pub oracles: OraclesCache,
+    pub pyth_prices: pyth_prices::PythPrices,
     pub tokens: TokensCache,
     pub clock: Arc<Mutex<Clock>>,
     pub luts: Arc<LutRegistry>,
@@ -73,6 +75,7 @@ impl Cache {
             banks: BanksCache::default(),
             mints: MintsCache::new(excluded_mints),
             oracles: OraclesCache::default(),
+            pyth_prices: pyth_prices::PythPrices::default(),
             tokens: TokensCache::default(),
             clock,
             luts: Arc::new(LutRegistry::default()),
