@@ -150,17 +150,13 @@ impl LiquidatorAccount {
         let (ixs, mut luts, record) =
             self.liquidation_ixs(account, asset_amount, liab_amount, swap)?;
 
-        // v1 first: up to 4096 bytes with every address in full, so it needs no lookup table and
-        // a route's pool accounts always fit; its header carries the compute budget, which saves
-        // the compute-budget program's account. Both formats lock at most 64 accounts. The Jito
-        // block engine cannot decode v1, so a bundled liquidation is always v0.
+        // Over RPC, always v1: up to 4096 bytes with every address in full, so it needs no lookup
+        // table and a route's pool accounts always fit, and its header carries the compute budget,
+        // which saves the compute-budget program's account. Both formats lock at most 64 accounts,
+        // so whatever fits a v0 transaction fits a v1 one. The Jito block engine cannot decode v1,
+        // so only a bundled liquidation is v0, with lookup tables.
         if landing == Landing::Rpc {
-            match self.compile_v1(&ixs) {
-                Ok(tx) => return Ok(tx),
-                Err(e) => {
-                    debug!("The liquidation doesn't fit a v1 transaction ({e}); compiling v0")
-                }
-            }
+            return self.compile_v1(&ixs);
         }
 
         if let Some(swap) = swap {
@@ -455,16 +451,14 @@ impl LiquidatorAccount {
             ..
         } = observation_accounts;
 
-        let mut ixs = vec![self.cu_limit_ix.clone(), self.cu_price_ix.clone()];
-        ixs.extend(self.venue_refresh_ixs(kamino_reserves, juplend_states)?);
+        let mut ixs = self.venue_refresh_ixs(kamino_reserves, juplend_states)?;
         ixs.push(make_tag_liq_record_ix(
             self.group,
             liquidatee,
             liquidatee_observation_accounts,
         ));
 
-        let luts = self.cache.luts.tables();
-        let tx = self.compile_tx(&self.signer.pubkey(), &ixs, &luts)?;
+        let tx = self.compile_v1(&ixs)?;
         // Sent, not confirmed: the liquidator loop runs tags inline, and waiting out a tag that
         // never lands would hold up every liquidation behind it. Preflight still rejects a tag the
         // program would refuse.

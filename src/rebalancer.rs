@@ -81,6 +81,33 @@ pub struct RebalancePass {
     pub claim: Claim,
 }
 
+/// A token whose swap failed is left alone this long: a pass runs after every liquidation
+/// attempt, and retrying a failing route on each one spends the DEX quota liquidations need.
+const TRADE_RETRY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// When each token's last swap failed, so it is retried only after [`TRADE_RETRY_INTERVAL`].
+#[derive(Default)]
+struct TradeCooldown {
+    failed_at: HashMap<Pubkey, Instant>,
+}
+
+impl TradeCooldown {
+    fn failed(&mut self, mint: Pubkey, now: Instant) {
+        self.failed_at.insert(mint, now);
+    }
+
+    fn ready(&mut self, mint: &Pubkey, now: Instant) -> bool {
+        match self.failed_at.get(mint) {
+            Some(at) if now.duration_since(*at) < TRADE_RETRY_INTERVAL => false,
+            Some(_) => {
+                self.failed_at.remove(mint);
+                true
+            }
+            None => true,
+        }
+    }
+}
+
 /// What a pass does with one token, by the value of its unclaimed balance.
 #[derive(Debug, PartialEq)]
 enum Trade {
@@ -127,6 +154,7 @@ pub struct Rebalancer {
     inventory_mints: HashSet<Pubkey>,
     /// The working balance per inventory token (USD).
     inventory_target: I80F48,
+    cooldown: TradeCooldown,
 }
 
 impl Rebalancer {
@@ -136,13 +164,21 @@ impl Rebalancer {
         reservations: Arc<TokenReservations>,
     ) -> anyhow::Result<Self> {
         let swap_mint = config.swap_mint;
-        let inventory_mints = config
+        let inventory_mints: HashSet<Pubkey> = config
             .inventory_mints
             .iter()
             .copied()
             .filter(|mint| *mint != swap_mint)
             .collect();
         let inventory_target = I80F48::from_num(config.inventory_target_usd);
+        for mint in &inventory_mints {
+            if cache.tokens.try_get_token_for_mint(mint).is_err() {
+                warn!(
+                    "The inventory token {} has no wallet token account (no bank uses it?); it will never be bought",
+                    mint
+                );
+            }
+        }
 
         let tokio_rt = Builder::new_multi_thread()
             .thread_name("rebalancer")
@@ -184,6 +220,7 @@ impl Rebalancer {
             reservations,
             inventory_mints,
             inventory_target,
+            cooldown: TradeCooldown::default(),
         })
     }
 
@@ -203,7 +240,10 @@ impl Rebalancer {
         info!("Running the Rebalancing process...");
 
         for mint in self.cache.mints.get_mints() {
-            if mint == self.swap_mint || self.empty_stake_banks.contains(&mint) {
+            if mint == self.swap_mint
+                || self.empty_stake_banks.contains(&mint)
+                || !self.cooldown.ready(&mint, Instant::now())
+            {
                 continue;
             }
 
@@ -315,7 +355,7 @@ impl Rebalancer {
     /// Sells `units` of `mint` for the swap mint, or whatever of them is still unclaimed. Returns
     /// whether a swap was attempted.
     fn sell(
-        &self,
+        &mut self,
         claim: &mut Claim,
         mint: Pubkey,
         wrapper: &TokenAccountWrapper<OracleWrapper>,
@@ -338,6 +378,7 @@ impl Rebalancer {
         );
         if let Err(e) = self.swap(units, mint, self.swap_mint, value) {
             error!("Rebalance swap failed for {}: {}", mint, e);
+            self.cooldown.failed(mint, Instant::now());
         }
         Ok(true)
     }
@@ -373,6 +414,7 @@ impl Rebalancer {
         );
         if let Err(e) = self.swap(units, self.swap_mint, mint, spent) {
             error!("Inventory buy failed for {}: {}", mint, e);
+            self.cooldown.failed(mint, Instant::now());
         }
         Ok(true)
     }
@@ -483,6 +525,18 @@ mod tests {
             inventory_trade(I80F48!(500), TARGET),
             Trade::Sell(I80F48!(425))
         );
+    }
+
+    #[test]
+    fn a_failed_token_waits_before_trading_again() {
+        let mut cooldown = TradeCooldown::default();
+        let mint = Pubkey::new_unique();
+        let start = Instant::now();
+        assert!(cooldown.ready(&mint, start));
+        cooldown.failed(mint, start);
+        assert!(!cooldown.ready(&mint, start + TRADE_RETRY_INTERVAL / 2));
+        assert!(cooldown.ready(&mint, start + TRADE_RETRY_INTERVAL));
+        assert!(cooldown.ready(&Pubkey::new_unique(), start));
     }
 
     #[test]

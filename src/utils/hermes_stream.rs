@@ -106,7 +106,13 @@ impl HermesStream {
         Ok(Self {
             hermes_url: config.pyth_hermes_url.clone(),
             api_key: config.pyth_api_key.clone(),
-            http_client: Client::builder().timeout(None).build()?,
+            // No overall timeout on a stream that lives for hours; keepalive notices a dead
+            // connection that would otherwise block the read forever.
+            http_client: Client::builder()
+                .timeout(None)
+                .connect_timeout(Duration::from_secs(10))
+                .tcp_keepalive(Duration::from_secs(15))
+                .build()?,
             cache,
             updates,
             stop,
@@ -228,6 +234,63 @@ fn parse_feed_id(id: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::pyth_prices::test_price_update_account;
+    use solana_clock::Clock;
+    use std::{collections::HashSet, sync::Mutex};
+
+    fn update(publish_time: i64, price: &str) -> ParsedUpdate {
+        let quote = |value: &str| HermesPrice {
+            price: value.to_string(),
+            conf: "2".to_string(),
+            expo: -8,
+            publish_time,
+        };
+        ParsedUpdate {
+            id: hex_encode(&[7u8; 32]),
+            price: quote(price),
+            ema_price: quote("1"),
+            metadata: Metadata {
+                prev_publish_time: Some(publish_time - 1),
+            },
+        }
+    }
+
+    #[test]
+    fn only_a_newer_hermes_price_is_written_over_the_cached_one() {
+        let feed = [7u8; 32];
+        let oracle = price_feed_address(&feed);
+        let mut cache = Cache::new(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Arc::new(Mutex::new(Clock::default())),
+            HashSet::new(),
+        );
+        cache
+            .oracles
+            .try_insert(oracle, test_price_update_account(feed, 100, 5))
+            .unwrap();
+        let (tx, rx) = crossbeam::channel::unbounded();
+        let stream = HermesStream {
+            hermes_url: String::new(),
+            api_key: None,
+            http_client: Client::new(),
+            cache: Arc::new(cache),
+            updates: tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            feeds: HashMap::from([(feed, oracle)]),
+        };
+
+        stream.apply(update(100, "9")).unwrap();
+        assert!(rx.try_recv().is_err(), "a price as old as the cached one");
+
+        stream.apply(update(101, "9")).unwrap();
+        let written = rx.try_recv().unwrap();
+        assert!(matches!(written.account_type, AccountType::HermesPrice));
+        assert_eq!(written.address, oracle);
+        let price = price_update(&written.account).unwrap().price_message;
+        assert_eq!((price.price, price.publish_time, price.conf), (9, 101, 2));
+        assert_eq!(written.account.owner, pyth_solana_receiver_sdk::ID);
+    }
 
     #[test]
     fn parses_feed_ids_with_or_without_the_prefix() {

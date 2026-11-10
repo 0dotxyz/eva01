@@ -33,7 +33,7 @@ use crate::cache::{pyth_prices::price_update, Cache};
 use crate::utils::{
     jito::{BundleOutcome, JitoClient, TipEstimator},
     pyth_cranker::price_feed_address,
-    pyth_push::{PythPusher, MAX_PUSH_TXS},
+    pyth_push::{PricePush, PythPusher},
 };
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 use solana_keypair::Keypair;
@@ -45,6 +45,14 @@ const BUNDLE_CONFIRM_ATTEMPTS: usize = 3;
 /// Polls of the liquidation's signature after an unconfirmed bundle, this far apart.
 const SIGNATURE_CONFIRM_ATTEMPTS: usize = 6;
 const SIGNATURE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Whether the RPC simulates a transaction before forwarding it. Every transaction is checked
+/// exactly once: one eva already simulated skips it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Preflight {
+    Run,
+    Skip,
+}
 
 /// What landing a liquidation behind a price push needs.
 pub struct PricePushLanding {
@@ -168,6 +176,34 @@ fn bump_target_backoff(
     );
 }
 
+/// The Pyth feeds among `oracles` whose cached price is newer than the chain's, which a liquidation
+/// sized on them must push first. Every feed an account's health reads counts, since the program
+/// re-checks health on all of them. Only sponsored feeds count: nobody else can push to the
+/// others, and eva never prices them from Hermes.
+fn pending_feeds(cache: &Cache, oracles: &[Pubkey]) -> Vec<[u8; 32]> {
+    let mut feeds = Vec::new();
+    for oracle in oracles {
+        let Some(update) = cache
+            .oracles
+            .try_get_account(oracle)
+            .ok()
+            .as_ref()
+            .and_then(price_update)
+        else {
+            continue;
+        };
+        let feed_id = update.price_message.feed_id;
+        let behind = cache
+            .pyth_prices
+            .onchain(oracle)
+            .is_some_and(|onchain| update.price_message.publish_time > onchain);
+        if behind && price_feed_address(&feed_id) == *oracle && !feeds.contains(&feed_id) {
+            feeds.push(feed_id);
+        }
+    }
+    feeds
+}
+
 pub struct Executor {
     rpc_client: RpcClient,
     cache: Arc<Cache>,
@@ -192,33 +228,11 @@ impl Executor {
         }
     }
 
-    /// The Pyth feeds `intent` was priced on that are newer in the cache than on chain, which a
-    /// liquidation sized on them must push first. Every feed the account's health reads counts,
-    /// since the program re-checks health on all of them.
     fn pending_pushes(&self, intent: &PreparedLiquidatableAccount) -> Vec<[u8; 32]> {
-        let mut feeds = Vec::new();
-        for oracle in &intent.observation_accounts.observation_accounts {
-            let Some(update) = self
-                .cache
-                .oracles
-                .try_get_account(oracle)
-                .ok()
-                .as_ref()
-                .and_then(price_update)
-            else {
-                continue;
-            };
-            let feed_id = update.price_message.feed_id;
-            let behind = self
-                .cache
-                .pyth_prices
-                .onchain(oracle)
-                .is_some_and(|onchain| update.price_message.publish_time > onchain);
-            if behind && price_feed_address(&feed_id) == *oracle && !feeds.contains(&feed_id) {
-                feeds.push(feed_id);
-            }
-        }
-        feeds
+        pending_feeds(
+            &self.cache,
+            &intent.observation_accounts.observation_accounts,
+        )
     }
 
     /// Whether `try_execute` would skip `intent` for now: its liability mint has no swap route, or
@@ -255,35 +269,75 @@ impl Executor {
             return Ok(());
         }
 
-        if self.price_push.is_some() {
-            let feeds = self.pending_pushes(intent);
-            if !feeds.is_empty() {
-                return self.execute_with_price_push(strategy, intent, liab_mint, &feeds);
-            }
-        }
+        // eva may price on Hermes prices the chain doesn't hold yet. Most liquidations don't need
+        // them pushed: the plain path runs first, simulated against the chain's prices, and only a
+        // liquidation that fails there goes behind a price push.
+        let pending = if self.price_push.is_some() {
+            self.pending_pushes(intent)
+        } else {
+            Vec::new()
+        };
 
         // A sandwich funds itself from the seized collateral and touches no wallet inventory.
-        // Simulated during assembly; the RPC preflight is the second check.
-        match strategy.assemble_sandwich(intent, Landing::Rpc) {
+        let sandwich = match strategy.assemble_sandwich(intent, Landing::Rpc) {
             Ok(Sandwich::Plan(ExecutionPlan { tx, .. })) => {
-                let result = self.send_over_rpc(&tx, "Sandwich");
+                // Simulated while it was built: no second check on the way out.
+                let result = self.send_over_rpc(&tx, "Sandwich", Preflight::Skip);
                 self.note_result(&liquidatee, &result);
                 self.refresh_wallet_balances();
                 return result;
             }
-            Ok(Sandwich::Unavailable) => {}
+            Ok(sandwich) => sandwich,
             Err(e) => {
                 self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
                 return Err(e);
             }
         };
+        let sandwich_rejected = matches!(sandwich, Sandwich::Rejected);
 
         debug!(
             "{}: no sandwich for {}; funding it from the wallet",
             strategy.name(),
             liquidatee
         );
-        self.execute_with_inventory(strategy, intent, liab_mint)
+        let plan = match strategy.assemble_with_inventory(intent, Landing::Rpc) {
+            Ok(plan) => plan,
+            // The wallet can't fund it, but the sandwich failed only on the chain's prices.
+            Err(_) if !pending.is_empty() && sandwich_rejected => {
+                return self.execute_with_price_push(strategy, intent, liab_mint, &pending, true);
+            }
+            Err(e) => {
+                // Record a quarantine/backoff so we stop hammering this target, then propagate so
+                // the caller logs + counts the failure once (subsequent cycles skip silently).
+                self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
+                return Err(e);
+            }
+        };
+        // With a feed behind, the plan is simulated here to choose between it and a price push,
+        // and that simulation is its only check; otherwise the send's preflight is.
+        let preflight = if pending.is_empty() {
+            Preflight::Run
+        } else {
+            Preflight::Skip
+        };
+        if !pending.is_empty() {
+            if let Err(e) = self.simulate(&plan.tx) {
+                debug!(
+                    "The wallet-funded liquidation of {} fails on the chain's prices ({e}); pushing them",
+                    liquidatee
+                );
+                // Releases its claim; the pushed plan claims afresh.
+                drop(plan);
+                return self.execute_with_price_push(
+                    strategy,
+                    intent,
+                    liab_mint,
+                    &pending,
+                    sandwich_rejected,
+                );
+            }
+        }
+        self.land_wallet_plan(&liquidatee, plan, preflight)
     }
 
     /// Brings the cached wallet balances up to the moment of the call, after a liquidation or sell
@@ -320,56 +374,75 @@ impl Executor {
         );
     }
 
-    /// Assemble and land a plan that spends wallet inventory, then re-read the wallet balances
-    /// before releasing the tokens it claimed, so the spent tokens never look free.
-    fn execute_with_inventory(
+    /// Lands a plan that spends wallet inventory, then re-reads the wallet balances before
+    /// releasing the tokens it claimed, so the spent tokens never look free.
+    fn land_wallet_plan(
         &self,
-        strategy: &dyn LiquidationStrategy,
-        intent: &PreparedLiquidatableAccount,
-        liab_mint: Pubkey,
+        liquidatee: &Pubkey,
+        plan: ExecutionPlan,
+        preflight: Preflight,
     ) -> Result<()> {
-        let liquidatee = intent.liquidatee_account.address;
-        let plan = match strategy.assemble_with_inventory(intent, Landing::Rpc) {
-            Ok(plan) => plan,
-            Err(e) => {
-                // Record a quarantine/backoff so we stop hammering this target, then propagate so
-                // the caller logs + counts the failure once (subsequent cycles skip silently).
-                self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
-                return Err(e);
-            }
-        };
-
         let ExecutionPlan { tx, claim } = plan;
-        let result = self.send_over_rpc(&tx, "Wallet-funded");
-        self.note_result(&liquidatee, &result);
+        let result = self.send_over_rpc(&tx, "Wallet-funded", preflight);
+        self.note_result(liquidatee, &result);
         self.refresh_wallet_balances();
         drop(claim);
         result
     }
 
-    /// Builds the liquidation for a bundle, the sandwich first and the wallet-funded plan
-    /// otherwise, and lands it behind a push of `feeds`.
+    /// Simulates `tx` against the chain's current state.
+    fn simulate(&self, tx: &VersionedTransaction) -> Result<()> {
+        match self.rpc_client.simulate_transaction(tx)?.value.err {
+            None => Ok(()),
+            Some(err) => Err(anyhow!("simulation failed: {err:?}")),
+        }
+    }
+
+    /// Lands the liquidation behind a push of `feeds`: the sandwich when `try_sandwich` (it was
+    /// rejected only on the chain's prices) and it still fits a bundle, the wallet-funded plan
+    /// otherwise.
     fn execute_with_price_push(
         &self,
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
         liab_mint: Pubkey,
         feeds: &[[u8; 32]],
+        try_sandwich: bool,
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
-        let plan = match strategy.assemble_sandwich(intent, Landing::Bundle) {
-            Ok(Sandwich::Plan(plan)) => Ok(plan),
-            Ok(Sandwich::Unavailable) => strategy.assemble_with_inventory(intent, Landing::Bundle),
-            Err(e) => Err(e),
-        };
-        let ExecutionPlan { tx, claim } = match plan {
-            Ok(plan) => plan,
+        let landing = self
+            .price_push
+            .as_ref()
+            .ok_or_else(|| anyhow!("price pushing is off"))?;
+        // The push first: without it there is nothing to bundle, and no quote is spent.
+        let push = match landing.pusher.push_transactions(feeds) {
+            Ok(push) => push,
             Err(e) => {
-                self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
+                let e = anyhow!("can't push the {} Pyth feed(s) it needs: {e}", feeds.len());
+                self.note_execution_failure(&liquidatee, &e.to_string());
                 return Err(e);
             }
         };
-        let result = self.land_behind_price_push(&liquidatee, feeds, &tx);
+        let sandwich = if try_sandwich {
+            match strategy.assemble_sandwich(intent, Landing::Bundle) {
+                Ok(Sandwich::Plan(plan)) => Some(plan),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let plan = match sandwich {
+            Some(plan) => plan,
+            None => match strategy.assemble_with_inventory(intent, Landing::Bundle) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
+                    return Err(e);
+                }
+            },
+        };
+        let ExecutionPlan { tx, claim } = plan;
+        let result = self.land_behind_price_push(landing, &liquidatee, feeds.len(), &push, &tx);
         self.note_result(&liquidatee, &result);
         self.refresh_wallet_balances();
         drop(claim);
@@ -380,18 +453,14 @@ impl Executor {
     /// doesn't land is followed by the push and then the liquidation over RPC.
     fn land_behind_price_push(
         &self,
+        landing: &PricePushLanding,
         liquidatee: &Pubkey,
-        feeds: &[[u8; 32]],
+        feeds: usize,
+        push: &PricePush,
         liquidation: &VersionedTransaction,
     ) -> Result<()> {
-        let landing = self
-            .price_push
-            .as_ref()
-            .ok_or_else(|| anyhow!("price pushing is off"))?;
-        let push = landing.pusher.push_transactions(feeds)?;
         let mut bundle = push.txs.clone();
         bundle.push(liquidation.clone());
-        debug_assert!(push.txs.len() <= MAX_PUSH_TXS);
 
         match landing.jito.simulate_bundle(
             &landing.rpc_url,
@@ -415,8 +484,7 @@ impl Executor {
 
         info!(
             "Liquidating {} behind a push of {} Pyth feed(s)",
-            liquidatee,
-            feeds.len()
+            liquidatee, feeds
         );
         if self.send_bundle(landing, &bundle)? {
             return Ok(());
@@ -424,7 +492,7 @@ impl Executor {
 
         // The bundle didn't land: push over RPC, then liquidate on the pushed prices.
         for (i, tx) in push.txs.iter().enumerate() {
-            if let Err(e) = self.send_with_resend(tx) {
+            if let Err(e) = self.send_with_resend(tx, Preflight::Run) {
                 warn!(
                     "The price push for {} failed at tx {}: {}",
                     liquidatee,
@@ -435,7 +503,7 @@ impl Executor {
                     // The first transaction created the VAA account; reclaim its rent.
                     match landing.pusher.reclaim_transaction(&push.encoded_vaa) {
                         Ok(reclaim) => {
-                            if let Err(e) = self.send_with_resend(&reclaim) {
+                            if let Err(e) = self.send_with_resend(&reclaim, Preflight::Run) {
                                 warn!(
                                     "Failed to reclaim the VAA account {}: {}",
                                     push.encoded_vaa, e
@@ -450,7 +518,8 @@ impl Executor {
                 break;
             }
         }
-        self.send_over_rpc(liquidation, "Pushed")
+        // Built for the bundle and never simulated alone on the pushed prices.
+        self.send_over_rpc(liquidation, "Pushed", Preflight::Run)
     }
 
     /// Sends `bundle` with a tip appended. Returns whether its liquidation, the last transaction,
@@ -590,27 +659,72 @@ impl Executor {
         }
     }
 
-    /// Sends the liquidation over RPC, with preflight, and waits for it to confirm or fail.
-    fn send_over_rpc(&self, tx: &VersionedTransaction, label: &str) -> Result<()> {
+    /// Sends the liquidation over RPC and waits for it to confirm or fail.
+    fn send_over_rpc(
+        &self,
+        tx: &VersionedTransaction,
+        label: &str,
+        preflight: Preflight,
+    ) -> Result<()> {
         let sig = self
-            .send_with_resend(tx)
+            .send_with_resend(tx, preflight)
             .map_err(|e| anyhow!("{label} send failed: {e}"))?;
         info!("{label} tx confirmed: {sig}");
         Ok(())
     }
 
-    /// Sends `tx` with preflight, then re-sends it every [`RESEND_INTERVAL`] (without preflight)
-    /// while polling its status, until it is confirmed, reverts, or its blockhash expires.
-    fn send_with_resend(&self, tx: &VersionedTransaction) -> Result<Signature> {
+    /// Whether `sig` is on chain: `Some(Ok)` once confirmed, `Some(Err)` if it reverted, `None`
+    /// if it isn't known or the status can't be read.
+    fn landed_status(&self, sig: &Signature) -> Option<Result<()>> {
+        let status = self
+            .rpc_client
+            .get_signature_statuses(&[*sig])
+            .ok()?
+            .value
+            .into_iter()
+            .next()??;
+        if let Some(err) = status.err {
+            return Some(Err(anyhow!("{sig} reverted on-chain: {err:?}")));
+        }
+        status
+            .satisfies_commitment(CommitmentConfig::confirmed())
+            .then_some(Ok(()))
+    }
+
+    /// Sends `tx`, with the RPC's preflight simulation unless eva already simulated it, then
+    /// re-sends it every [`RESEND_INTERVAL`] (without preflight) while polling its status, until it
+    /// is confirmed, reverts, or its blockhash expires. Only this one transaction is waited on:
+    /// every liquidation runs on its own worker.
+    fn send_with_resend(
+        &self,
+        tx: &VersionedTransaction,
+        preflight: Preflight,
+    ) -> Result<Signature> {
         let blockhash = *tx.message.recent_blockhash();
-        let sig = self.rpc_client.send_transaction_with_config(
+        let sig = match self.rpc_client.send_transaction_with_config(
             tx,
             RpcSendTransactionConfig {
-                skip_preflight: false,
+                skip_preflight: preflight == Preflight::Skip,
                 preflight_commitment: Some(CommitmentLevel::Processed),
                 ..Default::default()
             },
-        )?;
+        ) {
+            Ok(sig) => sig,
+            Err(e) => {
+                // A transaction that already landed, from a bundle that landed late for instance,
+                // is rejected by preflight; the chain says whether that is a success.
+                let sig = tx
+                    .signatures
+                    .first()
+                    .copied()
+                    .ok_or_else(|| anyhow!("unsigned transaction"))?;
+                return match self.landed_status(&sig) {
+                    Some(Ok(())) => Ok(sig),
+                    Some(Err(reverted)) => Err(reverted),
+                    None => Err(e.into()),
+                };
+            }
+        };
 
         let started = Instant::now();
         let mut last_sent = Instant::now();
@@ -668,6 +782,39 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::pyth_prices::test_price_update_account;
+    use solana_clock::Clock;
+    use std::collections::HashSet;
+
+    #[test]
+    fn only_sponsored_feeds_ahead_of_the_chain_are_pushed() {
+        let mut cache = Cache::new(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Arc::new(Mutex::new(Clock::default())),
+            HashSet::new(),
+        );
+        let (ahead, synced, unknown) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let mut add = |feed: [u8; 32], address: Pubkey, cached: i64, onchain: Option<i64>| {
+            cache
+                .oracles
+                .try_insert(address, test_price_update_account(feed, cached, 1))
+                .unwrap();
+            if let Some(onchain) = onchain {
+                cache.pyth_prices.record_onchain(address, onchain);
+            }
+            address
+        };
+        let ahead_feed = add(ahead, price_feed_address(&ahead), 110, Some(100));
+        let synced_feed = add(synced, price_feed_address(&synced), 100, Some(100));
+        // Not the sponsored PDA: nobody can push it, and Hermes never overwrites it.
+        let unsponsored = add(ahead, Pubkey::new_unique(), 110, Some(100));
+        // The chain's publish time was never seen: nothing to compare against.
+        let never_seen = add(unknown, price_feed_address(&unknown), 110, None);
+
+        let oracles = [ahead_feed, synced_feed, unsponsored, never_seen, ahead_feed];
+        assert_eq!(pending_feeds(&cache, &oracles), vec![ahead]);
+    }
 
     fn retry_in(backoffs: &HashMap<Pubkey, BackoffState>, target: &Pubkey) -> Duration {
         backoffs[target]

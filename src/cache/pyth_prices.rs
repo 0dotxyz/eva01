@@ -43,6 +43,38 @@ impl PythPrices {
     }
 }
 
+/// A receiver-owned `PriceUpdateV2` account holding `price` for `feed_id`, published at
+/// `publish_time`.
+#[cfg(test)]
+pub fn test_price_update_account(feed_id: [u8; 32], publish_time: i64, price: i64) -> Account {
+    use anchor_lang::AccountSerialize;
+    use pyth_solana_receiver_sdk::price_update::{PriceFeedMessage, VerificationLevel};
+    let update = PriceUpdateV2 {
+        write_authority: Default::default(),
+        verification_level: VerificationLevel::Full,
+        price_message: PriceFeedMessage {
+            feed_id,
+            price,
+            conf: 1,
+            exponent: -8,
+            publish_time,
+            prev_publish_time: publish_time - 1,
+            ema_price: price,
+            ema_conf: 1,
+        },
+        posted_slot: 0,
+    };
+    let mut data = Vec::new();
+    update.try_serialize(&mut data).unwrap();
+    Account {
+        lamports: 1,
+        data,
+        owner: pyth_solana_receiver_sdk::ID,
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

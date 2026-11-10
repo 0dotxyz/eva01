@@ -36,6 +36,19 @@ use super::{
     reservations::TokenReservations, ExecutionPlan, Landing, LiquidationStrategy, Sandwich,
 };
 
+/// A liquidation that was built but failed its simulation, as opposed to one that could not be
+/// built at all.
+#[derive(Debug)]
+struct SimulationRejected(anyhow::Error);
+
+impl std::fmt::Display for SimulationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for SimulationRejected {}
+
 /// The share of a `repay_units` repay that `held` free wallet tokens cover, at most 1, or `None`
 /// when they cover nothing.
 fn wallet_share(repay_units: u64, held: u64) -> Option<I80F48> {
@@ -184,11 +197,13 @@ impl InventoryStrategy {
             Some(&swap),
             landing,
         )?;
-        // A failure caught here falls back to the wallet-funded plan; the RPC preflight checks it
-        // again. A bundled liquidation relies on prices its push has not landed yet, so the
-        // executor simulates it inside the bundle instead.
+        // This is its only check: the executor sends it without preflight. A failure caught here
+        // falls back to the wallet-funded plan. A bundled liquidation relies on prices its push
+        // has not landed yet, so the executor simulates it inside the bundle instead.
         if landing == Landing::Rpc {
-            self.liquidator_account.simulate_tx(&tx)?;
+            self.liquidator_account
+                .simulate_tx(&tx)
+                .map_err(SimulationRejected)?;
         }
         Ok(tx)
     }
@@ -286,7 +301,11 @@ impl LiquidationStrategy for InventoryStrategy {
                     "InventoryStrategy: not selling the collateral in-tx for {} ({}); repaying from the wallet instead",
                     intent.liquidatee_account.address, e
                 );
-                Ok(Sandwich::Unavailable)
+                if e.downcast_ref::<SimulationRejected>().is_some() {
+                    Ok(Sandwich::Rejected)
+                } else {
+                    Ok(Sandwich::Unavailable)
+                }
             }
         }
     }
@@ -306,6 +325,14 @@ impl LiquidationStrategy for InventoryStrategy {
 mod tests {
     use super::*;
     use fixed_macro::types::I80F48;
+
+    #[test]
+    fn a_failed_simulation_is_told_apart_from_a_missing_route() {
+        let rejected: anyhow::Error = SimulationRejected(anyhow!("account is healthy")).into();
+        assert!(rejected.downcast_ref::<SimulationRejected>().is_some());
+        let no_route = anyhow!("No aggregator returned a quote");
+        assert!(no_route.downcast_ref::<SimulationRejected>().is_none());
+    }
 
     #[test]
     fn the_wallet_covers_a_share_of_the_repay() {

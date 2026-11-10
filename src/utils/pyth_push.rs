@@ -100,9 +100,13 @@ impl PythPusher {
         let encoded_vaa = Keypair::new();
         let vaa_account = encoded_vaa.pubkey();
         let vaa_account_size = VAA_HEADER_SIZE + vaa.len();
-        let lamports = self
-            .rpc_client
-            .get_minimum_balance_for_rent_exemption(vaa_account_size)?;
+        // The chain's rent, served at startup (see `rent_sysvar`); the RPC only if it isn't.
+        let lamports = match <solana_sysvar::rent::Rent as solana_sysvar::Sysvar>::get() {
+            Ok(rent) => rent.minimum_balance(vaa_account_size),
+            Err(_) => self
+                .rpc_client
+                .get_minimum_balance_for_rent_exemption(vaa_account_size)?,
+        };
 
         let split = VAA_SPLIT_INDEX.min(vaa.len());
         let post = vec![
@@ -222,5 +226,42 @@ impl PythPusher {
             return Err(anyhow!("transaction is {size} bytes (max {MAX_TX_SIZE})"));
         }
         Ok(tx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_instruction::AccountMeta;
+
+    #[test]
+    fn a_push_is_packed_in_order_into_transactions_that_fit() {
+        let pusher = PythPusher {
+            wormhole_program_id: Pubkey::new_unique(),
+            hermes_url: String::new(),
+            hermes_api_key: None,
+            http_client: Client::new(),
+            rpc_client: RpcClient::new("http://127.0.0.1:1".to_string()),
+            payer: Keypair::new(),
+            cu_price_micro_lamports: 1_000,
+        };
+        let program = Pubkey::new_unique();
+        // About the size of a VAA tail write and per-feed updates.
+        let ixs: Vec<Instruction> = (0..6u8)
+            .map(|i| Instruction {
+                program_id: program,
+                accounts: vec![AccountMeta::new(Pubkey::new_unique(), false)],
+                data: vec![i; 400],
+            })
+            .collect();
+        let blockhash = solana_message::Hash::default();
+        let chunks = pusher.pack(&ixs, blockhash).unwrap();
+
+        assert!(chunks.len() > 1);
+        let order: Vec<u8> = chunks.iter().flatten().map(|ix| ix.data[0]).collect();
+        assert_eq!(order, (0..6).collect::<Vec<u8>>());
+        for chunk in &chunks {
+            assert!(pusher.compile(chunk, &[&pusher.payer], blockhash).is_ok());
+        }
     }
 }
