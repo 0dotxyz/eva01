@@ -697,12 +697,13 @@ fn attempt_liquidation(
                     ""
                 }
             );
-            let _attempt = activity.attempt();
-            if let Err(e) = executor.try_execute(strategy, &fresh) {
-                error!(
+            let mut attempt = activity.attempt(liquidatee);
+            match executor.try_execute(strategy, &fresh) {
+                Ok(()) => attempt.succeeded(),
+                Err(e) => error!(
                     "Failed to execute liquidation for {:?}: {:?}",
                     liquidatee, e
-                );
+                ),
             }
         }
         Ok(None) => info!(
