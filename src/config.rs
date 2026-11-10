@@ -1,6 +1,19 @@
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
 
+/// The debt tokens the wallet keeps a working balance of by default, so a liquidation whose swap
+/// does not fit can repay from the wallet: the largest liabilities in the main group besides the
+/// swap mint (USDC), which is the reserve the balances are bought from.
+pub const DEFAULT_INVENTORY_MINTS: [&str; 7] = [
+    "So11111111111111111111111111111111111111112", // SOL (wrapped)
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
+    "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn", // JitoSOL
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So", // mSOL
+    "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1", // bSOL
+    "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA", // USDS
+    "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo", // PYUSD
+];
+
 #[derive(Clone, Debug)]
 pub struct Eva01Config {
     pub rpc_url: String,
@@ -14,6 +27,13 @@ pub struct Eva01Config {
     pub luts_group3: Vec<Pubkey>,
     pub excluded_liquidation_mints: Vec<Pubkey>,
     pub min_profit: f64,
+    /// Accounts whose liquidation would earn more than this are left to another instance: set on
+    /// a dust instance so it only takes what the main instance's `min_profit` passes over.
+    pub max_profit: Option<f64>,
+    /// Debt tokens the rebalancer keeps a working balance of (`INVENTORY_MINTS`).
+    pub inventory_mints: Vec<Pubkey>,
+    /// The working balance per inventory token, in USD (`INVENTORY_TARGET_USD`).
+    pub inventory_target_usd: f64,
     pub healthcheck_port: u16,
     pub pyth_hermes_url: String,
     pub pyth_api_key: Option<String>,
@@ -25,7 +45,10 @@ pub struct Eva01Config {
     pub titan_api_key: String,
     pub dflow_api_key: Option<String>,
     pub jupiter_api_key: String,
-    /// Jito block-engine `sendBundle` endpoint; `None` uses the executor's built-in default.
+    /// Price liquidations on Hermes prices and push them on chain in the same Jito bundle
+    /// (`PRICE_PUSH_ENABLED`, on unless "false").
+    pub price_push_enabled: bool,
+    /// Jito block-engine `sendBundle` endpoint; `None` uses the client's built-in default.
     pub jito_block_engine_url: Option<String>,
     /// Hard cap on the Jito tip per bundle (lamports).
     pub jito_tip_max_lamports: u64,
@@ -69,6 +92,21 @@ impl Eva01Config {
             .expect("MIN_PROFIT environment variable is not set")
             .parse()
             .expect("Invalid MIN_PROFIT number");
+        let max_profit: Option<f64> = std::env::var("MAX_PROFIT")
+            .ok()
+            .map(|value| value.parse().expect("Invalid MAX_PROFIT number"));
+
+        let inventory_mints = match std::env::var_os("INVENTORY_MINTS") {
+            Some(_) => parse_pubkey_list("INVENTORY_MINTS")?,
+            None => DEFAULT_INVENTORY_MINTS
+                .iter()
+                .map(|mint| Pubkey::from_str(mint).expect("valid default inventory mint"))
+                .collect(),
+        };
+        let inventory_target_usd: f64 = std::env::var("INVENTORY_TARGET_USD")
+            .unwrap_or_else(|_| "50".to_string())
+            .parse()
+            .expect("Invalid INVENTORY_TARGET_USD number");
 
         let healthcheck_port: u16 = std::env::var("PORT")
             .unwrap_or("3000".to_string())
@@ -106,6 +144,7 @@ impl Eva01Config {
         let pyth_cranker_enabled =
             std::env::var("PYTH_CRANKER_ENABLED").is_ok_and(|value| value == "true");
 
+        let price_push_enabled = std::env::var("PRICE_PUSH_ENABLED").map_or(true, |v| v != "false");
         let jito_block_engine_url = std::env::var("JITO_BLOCK_ENGINE_URL").ok();
         // Default cap 0.001 SOL (matches Jito's typical max tip floor).
         let jito_tip_max_lamports: u64 = std::env::var("JITO_TIP_MAX_LAMPORTS")
@@ -126,6 +165,9 @@ impl Eva01Config {
             luts_group3,
             excluded_liquidation_mints,
             min_profit,
+            max_profit,
+            inventory_mints,
+            inventory_target_usd,
             healthcheck_port,
             pyth_hermes_url,
             pyth_api_key,
@@ -137,6 +179,7 @@ impl Eva01Config {
             titan_api_key,
             dflow_api_key,
             jupiter_api_key,
+            price_push_enabled,
             jito_block_engine_url,
             jito_tip_max_lamports,
             bundle_api_key,

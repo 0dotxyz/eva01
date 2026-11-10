@@ -2,6 +2,7 @@ mod accounts;
 mod banks;
 pub mod mints;
 mod oracles;
+pub mod pyth_prices;
 mod tokens;
 
 use std::{
@@ -41,6 +42,7 @@ pub struct Cache {
     pub banks: BanksCache,
     pub mints: MintsCache,
     pub oracles: OraclesCache,
+    pub pyth_prices: pyth_prices::PythPrices,
     pub tokens: TokensCache,
     pub clock: Arc<Mutex<Clock>>,
     pub luts: Arc<LutRegistry>,
@@ -73,6 +75,7 @@ impl Cache {
             banks: BanksCache::default(),
             mints: MintsCache::new(excluded_mints),
             oracles: OraclesCache::default(),
+            pyth_prices: pyth_prices::PythPrices::default(),
             tokens: TokensCache::default(),
             clock,
             luts: Arc::new(LutRegistry::default()),
@@ -139,25 +142,23 @@ impl Cache {
     /// Re-reads the wallet's token accounts from the chain. Geyser updates are applied only when the
     /// liquidator loop drains them, so right after a liquidation lands the cached balances still show
     /// the pre-liquidation state; anything that sizes a swap from them must refresh first.
-    pub fn refresh_wallet_tokens(&self, rpc_client: &RpcClient) -> Result<usize> {
+    /// Re-reads every wallet token account and returns the oldest slot the reads were made at, so
+    /// the caller knows how recent the cached balances now are at least.
+    pub fn refresh_wallet_tokens(&self, rpc_client: &RpcClient) -> Result<u64> {
         let addresses = self.mints.get_tokens();
-        if addresses.is_empty() {
-            return Ok(0);
-        }
-        let mut refreshed = 0;
+        let mut read_at = u64::MAX;
         for chunk in addresses.chunks(100) {
-            // At processed commitment, like the Geyser stream: a confirmed read would be older than
-            // what Geyser may already have applied, and would roll a balance back.
-            let accounts = rpc_client
-                .get_multiple_accounts_with_commitment(chunk, CommitmentConfig::processed())?
-                .value;
-            for (address, account) in chunk.iter().zip(accounts) {
+            // At processed commitment, like the Geyser stream.
+            let response = rpc_client
+                .get_multiple_accounts_with_commitment(chunk, CommitmentConfig::processed())?;
+            let slot = response.context.slot;
+            read_at = read_at.min(slot);
+            for (address, account) in chunk.iter().zip(response.value) {
                 if let Some(account) = account {
-                    self.tokens.try_update_account(*address, account)?;
-                    refreshed += 1;
+                    self.tokens.try_update_account(*address, account, slot)?;
                 }
             }
         }
-        Ok(refreshed)
+        Ok(read_at)
     }
 }

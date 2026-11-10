@@ -1,7 +1,9 @@
 use crate::{
     cache::Cache,
     config::Eva01Config,
+    execution::reservations::{Claim, TokenReservations},
     utils::{accessor, rate_limiter::RateLimiter},
+    wrappers::{oracle::OracleWrapper, token_account::TokenAccountWrapper},
 };
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
@@ -71,10 +73,71 @@ const MIN_SELL_PRICE_VS_ORACLE: I80F48 = I80F48!(0.95);
 /// not on every pass.
 const SKIP_WARN_INTERVAL: Duration = Duration::from_secs(1200);
 
-/// The rebalancer keeps the liquidator holding only the swap mint (USDC). Every other token it
-/// ends up with (a liquidation's leftover liability or seized collateral, or a JIT-buy overshoot)
-/// is sold back to USDC on the next pass. Nothing is bought here and no inventory is maintained:
-/// liabilities are funded during the liquidation itself, so this is a pure sell-to-USDC sweep.
+/// One rebalancing pass: how many swaps it attempted, each of which may have changed the wallet
+/// even if it failed, and the tokens it claimed to spend. The claim is released once the wallet
+/// balances have been re-read, so swapped tokens never look free to a liquidation.
+pub struct RebalancePass {
+    pub trades: usize,
+    pub claim: Claim,
+}
+
+/// A token whose swap failed is left alone this long: a pass runs after every liquidation
+/// attempt, and retrying a failing route on each one spends the DEX quota liquidations need.
+const TRADE_RETRY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// When each token's last swap failed, so it is retried only after [`TRADE_RETRY_INTERVAL`].
+#[derive(Default)]
+struct TradeCooldown {
+    failed_at: HashMap<Pubkey, Instant>,
+}
+
+impl TradeCooldown {
+    fn failed(&mut self, mint: Pubkey, now: Instant) {
+        self.failed_at.insert(mint, now);
+    }
+
+    fn ready(&mut self, mint: &Pubkey, now: Instant) -> bool {
+        match self.failed_at.get(mint) {
+            Some(at) if now.duration_since(*at) < TRADE_RETRY_INTERVAL => false,
+            Some(_) => {
+                self.failed_at.remove(mint);
+                true
+            }
+            None => true,
+        }
+    }
+}
+
+/// What a pass does with one token, by the value of its unclaimed balance.
+#[derive(Debug, PartialEq)]
+enum Trade {
+    Hold,
+    /// Sell this much (USD) for the swap mint.
+    Sell(I80F48),
+    /// Buy this much (USD) with the swap mint.
+    Buy(I80F48),
+}
+
+/// An inventory token is kept between `target` and twice `target`. Outside that band it is
+/// brought back to the middle, one and a half times `target`, so every trade is at least half the
+/// target and the balance lands well inside the band: small price moves or a liquidation's
+/// leftovers never trigger another trade, and the pass never trades cents back and forth.
+fn inventory_trade(free_value: I80F48, target: I80F48) -> Trade {
+    let middle = target * I80F48!(1.5);
+    if free_value < target {
+        Trade::Buy(middle - free_value)
+    } else if free_value > target * I80F48!(2) {
+        Trade::Sell(free_value - middle)
+    } else {
+        Trade::Hold
+    }
+}
+
+/// The rebalancer keeps the liquidator holding the swap mint (USDC) as its reserve and a working
+/// balance of each inventory token, the common debt tokens a liquidation can repay from the
+/// wallet when its swap does not fit. Every other token it ends up with (a liquidation's leftover
+/// liability or seized collateral) is sold back to USDC. Tokens a liquidation in flight has
+/// claimed are left alone.
 pub struct Rebalancer {
     swap_mint: Pubkey,
     tokio_rt: Runtime,
@@ -87,11 +150,35 @@ pub struct Rebalancer {
     held_stake: HashMap<Pubkey, u64>,
     /// Reports each unpriceable token at most once per [`SKIP_WARN_INTERVAL`].
     skip_warnings: RateLimiter<Pubkey>,
+    reservations: Arc<TokenReservations>,
+    inventory_mints: HashSet<Pubkey>,
+    /// The working balance per inventory token (USD).
+    inventory_target: I80F48,
+    cooldown: TradeCooldown,
 }
 
 impl Rebalancer {
-    pub fn new(config: Eva01Config, cache: Arc<Cache>) -> anyhow::Result<Self> {
+    pub fn new(
+        config: Eva01Config,
+        cache: Arc<Cache>,
+        reservations: Arc<TokenReservations>,
+    ) -> anyhow::Result<Self> {
         let swap_mint = config.swap_mint;
+        let inventory_mints: HashSet<Pubkey> = config
+            .inventory_mints
+            .iter()
+            .copied()
+            .filter(|mint| *mint != swap_mint)
+            .collect();
+        let inventory_target = I80F48::from_num(config.inventory_target_usd);
+        for mint in &inventory_mints {
+            if cache.tokens.try_get_token_for_mint(mint).is_err() {
+                warn!(
+                    "The inventory token {} has no wallet token account (no bank uses it?); it will never be bought",
+                    mint
+                );
+            }
+        }
 
         let tokio_rt = Builder::new_multi_thread()
             .thread_name("rebalancer")
@@ -130,6 +217,10 @@ impl Rebalancer {
             unsweepable_mints: HashMap::new(),
             held_stake: HashMap::new(),
             skip_warnings: RateLimiter::new(SKIP_WARN_INTERVAL),
+            reservations,
+            inventory_mints,
+            inventory_target,
+            cooldown: TradeCooldown::default(),
         })
     }
 
@@ -141,14 +232,18 @@ impl Rebalancer {
         Arc::clone(&self.dex_gate)
     }
 
-    /// Sell every non-swap-mint token the wallet holds (above the dust floor) back to the swap mint.
-    /// Returns how many sells were attempted: each may have changed the wallet, even a failed one.
-    pub fn run(&mut self) -> anyhow::Result<usize> {
-        let mut sells = 0;
+    /// Bring every inventory token back into its band, and sell every other unclaimed token the
+    /// wallet holds (above the dust floor) back to the swap mint.
+    pub fn run(&mut self) -> anyhow::Result<RebalancePass> {
+        let mut trades = 0;
+        let mut claim = self.reservations.new_claim();
         info!("Running the Rebalancing process...");
 
         for mint in self.cache.mints.get_mints() {
-            if mint == self.swap_mint || self.empty_stake_banks.contains(&mint) {
+            if mint == self.swap_mint
+                || self.empty_stake_banks.contains(&mint)
+                || !self.cooldown.ready(&mint, Instant::now())
+            {
                 continue;
             }
 
@@ -205,11 +300,9 @@ impl Rebalancer {
                 }
             };
 
-            if wrapper.balance == 0 {
-                continue;
-            }
-
-            let value = match wrapper.get_value() {
+            // A liquidation in flight may be about to repay with some of it.
+            let free = self.reservations.unclaimed(&mint, wrapper.balance);
+            let free_value = match wrapper.get_value_for_amount(I80F48::from_num(free)) {
                 Ok(value) => value,
                 Err(e) => {
                     if self.skip_warnings.allow(mint, Instant::now()) {
@@ -222,25 +315,108 @@ impl Rebalancer {
                 }
             };
 
-            if value < MIN_REBALANCE_VALUE {
-                continue;
-            }
-
-            info!(
-                "Selling {} of {} (~${}) back to the swap mint.",
-                wrapper.balance,
-                mint,
-                value.to_num::<f64>()
-            );
-            sells += 1;
-            if let Err(e) = self.swap(wrapper.balance, mint, self.swap_mint, value) {
-                error!("Rebalance swap failed for {}: {}", mint, e);
+            let trade = if self.inventory_mints.contains(&mint) {
+                inventory_trade(free_value, self.inventory_target)
+            } else if free_value >= MIN_REBALANCE_VALUE {
+                Trade::Sell(free_value)
+            } else {
+                Trade::Hold
+            };
+            // One token failing to trade must not stop the pass for the others.
+            let traded = match trade {
+                Trade::Hold => Ok(false),
+                Trade::Sell(value) => {
+                    let units = if value >= free_value {
+                        Ok(free)
+                    } else {
+                        wrapper
+                            .get_amount_from_value(value)
+                            .map(|units| units.to_num::<u64>().min(free))
+                    };
+                    units.and_then(|units| self.sell(&mut claim, mint, &wrapper, units))
+                }
+                Trade::Buy(value) => self.buy(&mut claim, mint, value),
+            };
+            match traded {
+                Ok(traded) => trades += usize::from(traded),
+                Err(e) => {
+                    if self.skip_warnings.allow(mint, Instant::now()) {
+                        warn!("Rebalancing {} failed: {}", mint, e);
+                    }
+                }
             }
         }
 
         info!("The Rebalancing process is complete.");
 
-        Ok(sells)
+        Ok(RebalancePass { trades, claim })
+    }
+
+    /// Sells `units` of `mint` for the swap mint, or whatever of them is still unclaimed. Returns
+    /// whether a swap was attempted.
+    fn sell(
+        &mut self,
+        claim: &mut Claim,
+        mint: Pubkey,
+        wrapper: &TokenAccountWrapper<OracleWrapper>,
+        units: u64,
+    ) -> anyhow::Result<bool> {
+        // Claimed so no liquidation counts the tokens being sold. A liquidation may have claimed
+        // some since the free balance was read; then this sells only what is still free.
+        let units = self
+            .reservations
+            .claim_available(claim, mint, units, wrapper.balance);
+        if units == 0 {
+            return Ok(false);
+        }
+        let value = wrapper.get_value_for_amount(I80F48::from_num(units))?;
+        info!(
+            "Selling {} of {} (~${}) back to the swap mint.",
+            units,
+            mint,
+            value.to_num::<f64>()
+        );
+        if let Err(e) = self.swap(units, mint, self.swap_mint, value) {
+            error!("Rebalance swap failed for {}: {}", mint, e);
+            self.cooldown.failed(mint, Instant::now());
+        }
+        Ok(true)
+    }
+
+    /// Buys `value` (USD) of `mint` with the unclaimed swap mint. Returns whether a swap was
+    /// attempted.
+    fn buy(&mut self, claim: &mut Claim, mint: Pubkey, value: I80F48) -> anyhow::Result<bool> {
+        let reserve_token = self.cache.tokens.try_get_token_for_mint(&self.swap_mint)?;
+        let reserve = self
+            .cache
+            .try_get_token_wrapper_lenient(&self.swap_mint, &reserve_token)?;
+        let wanted = reserve.get_amount_from_value(value)?.to_num::<u64>();
+        let units =
+            self.reservations
+                .claim_available(claim, self.swap_mint, wanted, reserve.balance);
+        // Less than half the buy means the reserve is nearly empty; topping up a few cents at a
+        // time would only churn.
+        if units == 0 || units < wanted / 2 {
+            if self.skip_warnings.allow(self.swap_mint, Instant::now()) {
+                warn!(
+                    "Not buying {} of inventory: only {} of the {} {} it needs is free",
+                    mint, units, wanted, self.swap_mint
+                );
+            }
+            return Ok(false);
+        }
+        let spent = reserve.get_value_for_amount(I80F48::from_num(units))?;
+        info!(
+            "Buying ~${} of the inventory token {} with {} of the swap mint.",
+            spent.to_num::<f64>(),
+            mint,
+            units
+        );
+        if let Err(e) = self.swap(units, self.swap_mint, mint, spent) {
+            error!("Inventory buy failed for {}: {}", mint, e);
+            self.cooldown.failed(mint, Instant::now());
+        }
+        Ok(true)
     }
 
     /// Whether `mint` is the LST of a staked collateral bank.
@@ -314,5 +490,64 @@ impl Rebalancer {
         );
 
         Ok(prepared.min_out_amount)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TARGET: I80F48 = I80F48!(50);
+
+    #[test]
+    fn an_inventory_token_inside_its_band_is_held() {
+        assert_eq!(inventory_trade(I80F48!(50), TARGET), Trade::Hold);
+        assert_eq!(inventory_trade(I80F48!(75), TARGET), Trade::Hold);
+        assert_eq!(inventory_trade(I80F48!(100), TARGET), Trade::Hold);
+    }
+
+    #[test]
+    fn a_short_inventory_token_is_topped_up_to_the_middle() {
+        assert_eq!(
+            inventory_trade(I80F48!(49.99), TARGET),
+            Trade::Buy(I80F48!(25.01))
+        );
+        assert_eq!(inventory_trade(I80F48!(0), TARGET), Trade::Buy(I80F48!(75)));
+    }
+
+    #[test]
+    fn an_overfull_inventory_token_is_sold_down_to_the_middle() {
+        assert_eq!(
+            inventory_trade(I80F48!(100.01), TARGET),
+            Trade::Sell(I80F48!(25.01))
+        );
+        assert_eq!(
+            inventory_trade(I80F48!(500), TARGET),
+            Trade::Sell(I80F48!(425))
+        );
+    }
+
+    #[test]
+    fn a_failed_token_waits_before_trading_again() {
+        let mut cooldown = TradeCooldown::default();
+        let mint = Pubkey::new_unique();
+        let start = Instant::now();
+        assert!(cooldown.ready(&mint, start));
+        cooldown.failed(mint, start);
+        assert!(!cooldown.ready(&mint, start + TRADE_RETRY_INTERVAL / 2));
+        assert!(cooldown.ready(&mint, start + TRADE_RETRY_INTERVAL));
+        assert!(cooldown.ready(&Pubkey::new_unique(), start));
+    }
+
+    #[test]
+    fn every_trade_is_at_least_half_the_target() {
+        let mut value = I80F48!(0);
+        while value < I80F48!(300) {
+            match inventory_trade(value, TARGET) {
+                Trade::Buy(v) | Trade::Sell(v) => assert!(v >= TARGET / I80F48!(2)),
+                Trade::Hold => {}
+            }
+            value += I80F48!(0.25);
+        }
     }
 }

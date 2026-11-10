@@ -1,22 +1,22 @@
 //! Submission + orchestration engine for the execution layer.
 //!
-//! `try_execute()` turns a prepared liquidation into a landed liquidation:
-//! 1. ask the strategy for a sandwich (`[liquidate]`, self-funded): a single tx that touches no
-//!    wallet inventory, sent directly over RPC; any number of these run in parallel;
-//! 2. otherwise take the inventory lock and ask for the inventory plan (`[buy] [liquidate]`, or
-//!    `[liquidate]` paid from holdings): simulate-first, then an atomic Jito bundle (with a tip),
-//!    falling back to sequential RPC sends. The lock is held until the plan has landed or failed
-//!    and the wallet balances are re-read, so the next plan is sized against real holdings. The
-//!    wait for the lock can be long, so the intent is re-sized on the current state once it is held.
+//! `try_execute()` turns a prepared liquidation into a landed liquidation, always one liquidation
+//! transaction:
+//! 1. the sandwich (`[liquidate]` with the seized collateral sold in-tx), which touches no wallet
+//!    inventory;
+//! 2. otherwise the liquidation repaid from the wallet's holdings, which claims the tokens it
+//!    repays with until it has landed or failed and the wallet balances have been re-read.
 //!
-//! The tip is added only on the bundle path; the sequential fallback sends the core txs as-is.
+//! It goes alone over RPC, unless it was sized on Pyth prices the chain does not hold yet (from
+//! Hermes): then the prices are pushed ahead of it in one Jito bundle, `[push..] [liquidate]
+//! [tip]`, simulated first. A bundle that doesn't land falls back to sending the push and then the
+//! liquidation over RPC; a push alone is harmless.
+//!
+//! Nothing waits for another plan: any number of liquidations run at once, bounded by the workers.
 
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, MutexGuard,
-    },
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -25,28 +25,46 @@ use anyhow::{anyhow, Result};
 use log::{debug, info, warn};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
-use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 
-use crate::cache::Cache;
-use crate::utils::jito::{BundleOutcome, JitoClient, TipEstimator};
+use crate::cache::{pyth_prices::price_update, Cache};
+use crate::utils::{
+    jito::{BundleOutcome, JitoClient, TipEstimator},
+    pyth_cranker::price_feed_address,
+    pyth_push::{PricePush, PythPusher},
+};
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
+use solana_keypair::Keypair;
 
-use super::{ExecutionPlan, LiquidationStrategy, Sandwich};
+use super::{ExecutionPlan, Landing, LiquidationStrategy, Sandwich};
 
-/// Number of Jito status polls before checking the chain directly. Kept small: the public status
-/// endpoint is frequently rate-limited, so the RPC signature check below is the real confirmation
-/// and we want to reach the sequential fallback quickly (while the txs' blockhash is still fresh).
+/// Bundle status polls before checking the chain for the liquidation itself.
 const BUNDLE_CONFIRM_ATTEMPTS: usize = 3;
+/// Polls of the liquidation's signature after an unconfirmed bundle, this far apart.
+const SIGNATURE_CONFIRM_ATTEMPTS: usize = 6;
+const SIGNATURE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// After Jito reports a bundle accepted-but-unconfirmed (or its status endpoint is rate-limited),
-/// poll the RPC for the liquidation tx itself this many times, this interval apart, before giving
-/// up. The on-chain signature is the authoritative "did it land" — independent of Jito's throttled
-/// `getBundleStatuses`.
-const SIGNATURE_CONFIRM_ATTEMPTS: usize = 10;
-const SIGNATURE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Whether the RPC simulates a transaction before forwarding it. Every transaction is checked
+/// exactly once: one eva already simulated skips it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Preflight {
+    Run,
+    Skip,
+}
+
+/// What landing a liquidation behind a price push needs.
+pub struct PricePushLanding {
+    pub pusher: PythPusher,
+    pub jito: JitoClient,
+    pub tip_estimator: TipEstimator,
+    /// Pays the tip.
+    pub signer: Keypair,
+    /// An RPC endpoint that serves `simulateBundle`.
+    pub rpc_url: String,
+    pub bundle_api_key: Option<String>,
+}
 
 /// A transaction sent over RPC is re-sent this often until it confirms or its blockhash expires:
 /// a single send can be dropped on the way to the leader, which is indistinguishable from a slow
@@ -56,6 +74,11 @@ const RESEND_INTERVAL: Duration = Duration::from_secs(2);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Hard ceiling on waiting for an RPC send, in case the blockhash validity check misbehaves.
 const SEND_MAX_WAIT: Duration = Duration::from_secs(90);
+
+/// Reads of the wallet balances made while settling a plan, this far apart, before giving up on
+/// a lagging RPC node and releasing the plan's claim on the last read.
+const SETTLE_ATTEMPTS: usize = 10;
+const SETTLE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Re-check a liability mint that has no swap route only after this long (routes can appear).
 const NO_ROUTE_QUARANTINE_TTL: Duration = Duration::from_secs(3600);
@@ -69,10 +92,22 @@ const ASSEMBLE_BACKOFF_BASE: Duration = Duration::from_secs(30);
 const EXECUTION_BACKOFF_BASE: Duration = Duration::from_secs(5);
 const TARGET_BACKOFF_MAX: Duration = Duration::from_secs(900);
 
+/// A target rejected twice in a row by `end_liquidation`'s premium cap (6090) is left alone this
+/// long. Once is a price move; twice is usually a dust repay whose rounding the cap can never
+/// accept, and every retry spends a DEX quote.
+const PREMIUM_CAP_BACKOFF: Duration = Duration::from_secs(1200);
+
+/// Whether a failure is `end_liquidation` rejecting the seizure as above the premium cap.
+fn is_premium_cap_failure(message: &str) -> bool {
+    message.contains("0x17ca") || message.contains("LiquidationPremiumTooHigh")
+}
+
 /// Per-target backoff state after a transient (non-route) assemble failure.
 struct TargetBackoff {
     /// Consecutive assemble failures (drives the exponential cooldown).
     failures: u32,
+    /// The last failure was the premium cap.
+    premium_cap: bool,
     /// Don't re-attempt the target before this time.
     retry_after: Instant,
 }
@@ -103,23 +138,32 @@ fn target_backoff_delay(base: Duration, failures: u32) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Bump `target`'s consecutive-failure count and push out its retry time.
+/// Bump `target`'s consecutive-failure count and push out its retry time. A second premium-cap
+/// failure in a row backs the target off for [`PREMIUM_CAP_BACKOFF`].
 fn bump_target_backoff(
     backoffs: &mut HashMap<Pubkey, BackoffState>,
     target: &Pubkey,
     base: Duration,
     kind: &str,
+    premium_cap: bool,
 ) {
-    let failures = match backoffs.get(target) {
-        Some(BackoffState::Target(backoff)) => backoff.failures,
-        _ => 0,
-    }
-    .saturating_add(1);
-    let delay = target_backoff_delay(base, failures);
+    let (failures, repeated_premium_cap) = match backoffs.get(target) {
+        Some(BackoffState::Target(backoff)) => {
+            (backoff.failures, premium_cap && backoff.premium_cap)
+        }
+        _ => (0, false),
+    };
+    let failures = failures.saturating_add(1);
+    let delay = if repeated_premium_cap {
+        PREMIUM_CAP_BACKOFF
+    } else {
+        target_backoff_delay(base, failures)
+    };
     backoffs.insert(
         *target,
         BackoffState::Target(TargetBackoff {
             failures,
+            premium_cap,
             retry_after: Instant::now() + delay,
         }),
     );
@@ -132,60 +176,63 @@ fn bump_target_backoff(
     );
 }
 
+/// The Pyth feeds among `oracles` whose cached price is newer than the chain's, which a liquidation
+/// sized on them must push first. Every feed an account's health reads counts, since the program
+/// re-checks health on all of them. Only sponsored feeds count: nobody else can push to the
+/// others, and eva never prices them from Hermes.
+fn pending_feeds(cache: &Cache, oracles: &[Pubkey]) -> Vec<[u8; 32]> {
+    let mut feeds = Vec::new();
+    for oracle in oracles {
+        let Some(update) = cache
+            .oracles
+            .try_get_account(oracle)
+            .ok()
+            .as_ref()
+            .and_then(price_update)
+        else {
+            continue;
+        };
+        let feed_id = update.price_message.feed_id;
+        let behind = cache
+            .pyth_prices
+            .onchain(oracle)
+            .is_some_and(|onchain| update.price_message.publish_time > onchain);
+        if behind && price_feed_address(&feed_id) == *oracle && !feeds.contains(&feed_id) {
+            feeds.push(feed_id);
+        }
+    }
+    feeds
+}
+
 pub struct Executor {
-    jito: JitoClient,
     rpc_client: RpcClient,
     cache: Arc<Cache>,
-    signer: Keypair,
-    /// RPC URL that supports `simulateBundle` (used for the simulate-first check).
-    rpc_url: String,
-    /// Single key for both `sendBundle` (uuid) and `simulateBundle` (Bearer).
-    bundle_api_key: Option<String>,
-    tip_estimator: TipEstimator,
     /// Liability-mint no-route quarantines and per-liquidatee transient backoffs.
     backoffs: Mutex<HashMap<Pubkey, BackoffState>>,
-    /// Count sequential fallback uses so logs reveal how often the non-bundle path is exercised.
-    sequential_fallbacks: AtomicU64,
-    /// Held from assembling an inventory plan until it has landed or failed: plans spending the
-    /// wallet must not be sized against the same balance, and the block engine admits one bundle
-    /// at a time anyway.
-    inventory_lock: Mutex<()>,
+    /// Lands liquidations sized on prices the chain does not hold yet; `None` when price pushing
+    /// is off.
+    price_push: Option<PricePushLanding>,
 }
 
 impl Executor {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        jito: JitoClient,
         rpc_client: RpcClient,
         cache: Arc<Cache>,
-        signer: Keypair,
-        rpc_url: String,
-        bundle_api_key: Option<String>,
-        tip_max_lamports: u64,
+        price_push: Option<PricePushLanding>,
     ) -> Self {
         Self {
-            jito,
             rpc_client,
             cache,
-            signer,
-            rpc_url,
-            bundle_api_key,
-            tip_estimator: TipEstimator::new(tip_max_lamports),
             backoffs: Mutex::new(HashMap::new()),
-            sequential_fallbacks: AtomicU64::new(0),
-            inventory_lock: Mutex::new(()),
+            price_push,
         }
     }
 
-    /// Held while anything spends or sells wallet tokens: an inventory plan, or the rebalancer's
-    /// sweep, which must not sell the tokens a plan was sized against.
-    ///
-    /// A plan that panicked poisons the lock, but the lock guards no data: the wallet balances are
-    /// re-read before every plan, so the next holder can safely proceed.
-    pub fn lock_inventory(&self) -> MutexGuard<'_, ()> {
-        self.inventory_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn pending_pushes(&self, intent: &PreparedLiquidatableAccount) -> Vec<[u8; 32]> {
+        pending_feeds(
+            &self.cache,
+            &intent.observation_accounts.observation_accounts,
+        )
     }
 
     /// Whether `try_execute` would skip `intent` for now: its liability mint has no swap route, or
@@ -195,13 +242,11 @@ impl Executor {
             || self.is_backed_off(&intent.liquidatee_account.address)?)
     }
 
-    /// Assemble, gate, simulate-first, and land a single liquidation. `refresh` re-sizes the
-    /// intent on the current state, `None` when the account is no longer worth liquidating.
+    /// Assemble, gate, and land a single liquidation, sized on the current state by the caller.
     pub fn try_execute(
         &self,
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
-        refresh: &dyn Fn() -> Result<Option<PreparedLiquidatableAccount>>,
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
 
@@ -224,76 +269,43 @@ impl Executor {
             return Ok(());
         }
 
-        // A sandwich funds itself from the seized collateral: no wallet inventory, no bundle, no
-        // serialization. Simulated during assembly; the RPC preflight is the second check.
-        match strategy.assemble_sandwich(intent) {
-            Ok(Sandwich::Plan(ExecutionPlan { txs })) => {
-                let result = self.send_over_rpc(&txs, "Sandwich");
-                self.note_outcome(&liquidatee, result.is_err());
+        // eva may price on Hermes prices the chain doesn't hold yet. Most liquidations don't need
+        // them pushed: the plain path runs first, simulated against the chain's prices, and only a
+        // liquidation that fails there goes behind a price push.
+        let pending = if self.price_push.is_some() {
+            self.pending_pushes(intent)
+        } else {
+            Vec::new()
+        };
+
+        // A sandwich funds itself from the seized collateral and touches no wallet inventory.
+        let sandwich = match strategy.assemble_sandwich(intent, Landing::Rpc) {
+            Ok(Sandwich::Plan(ExecutionPlan { tx, .. })) => {
+                // Simulated while it was built: no second check on the way out.
+                let result = self.send_over_rpc(&tx, "Sandwich", Preflight::Skip);
+                self.note_result(&liquidatee, &result);
                 self.refresh_wallet_balances();
                 return result;
             }
-            Ok(Sandwich::Unavailable) => {}
+            Ok(sandwich) => sandwich,
             Err(e) => {
                 self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
                 return Err(e);
             }
         };
+        let sandwich_rejected = matches!(sandwich, Sandwich::Rejected);
 
-        // Inventory plans run one at a time, end to end.
         debug!(
-            "{}: no sandwich for {}; waiting for the inventory lock",
+            "{}: no sandwich for {}; funding it from the wallet",
             strategy.name(),
             liquidatee
         );
-        let _inventory = self.lock_inventory();
-        // Other plans or a rebalance may have held the lock for a while; competitors may have
-        // taken the account meanwhile.
-        let intent = match refresh()? {
-            Some(fresh)
-                if fresh.asset_bank == intent.asset_bank && fresh.liab_bank == intent.liab_bank =>
-            {
-                fresh
-            }
-            Some(_) => {
-                info!(
-                    "Leaving {} to the next attempt: its best bank pair changed while waiting for the inventory lock",
-                    liquidatee
-                );
-                return Ok(());
-            }
-            None => {
-                info!(
-                    "Dropping the liquidation of {}: no longer worth it after waiting for the inventory lock",
-                    liquidatee
-                );
-                return Ok(());
-            }
-        };
-        let result = self.execute_with_inventory(strategy, &intent, liab_mint);
-        self.refresh_wallet_balances();
-        result
-    }
-
-    /// A landed liquidation or sell changed the wallet's balances, and the Geyser updates reporting
-    /// that are only applied when the liquidator loop drains them. Anything sizing a swap from the
-    /// cache before then (the next inventory plan, the rebalancer's sweep) needs the real balances.
-    pub fn refresh_wallet_balances(&self) {
-        if let Err(e) = self.cache.refresh_wallet_tokens(&self.rpc_client) {
-            warn!("Failed to refresh the wallet balances: {e}");
-        }
-    }
-
-    /// Assemble and land a plan that spends wallet inventory. Caller holds the inventory lock.
-    fn execute_with_inventory(
-        &self,
-        strategy: &dyn LiquidationStrategy,
-        intent: &PreparedLiquidatableAccount,
-        liab_mint: Pubkey,
-    ) -> Result<()> {
-        let liquidatee = intent.liquidatee_account.address;
-        let plan = match strategy.assemble_with_inventory(intent) {
+        let plan = match strategy.assemble_with_inventory(intent, Landing::Rpc) {
             Ok(plan) => plan,
+            // The wallet can't fund it, but the sandwich failed only on the chain's prices.
+            Err(_) if !pending.is_empty() && sandwich_rejected => {
+                return self.execute_with_price_push(strategy, intent, liab_mint, &pending, true);
+            }
             Err(e) => {
                 // Record a quarantine/backoff so we stop hammering this target, then propagate so
                 // the caller logs + counts the failure once (subsequent cycles skip silently).
@@ -301,50 +313,272 @@ impl Executor {
                 return Err(e);
             }
         };
-
-        // Simulate-first. The outcome dispatches three ways:
-        //  - ran & ok                 -> bundle send
-        //  - ran & program error      -> skip (doomed on-chain; don't burn tip+fees)
-        //  - couldn't run (infra err) -> sequential RPC send (no bundle)
-        let ExecutionPlan { txs } = plan;
-        let mut attempt_failed = false;
-        let result = match self.jito.simulate_bundle(
-            &self.rpc_url,
-            self.bundle_api_key.as_deref(),
-            &txs,
-            &[],
-        ) {
-            Ok(sim) if sim.succeeded => self.submit(&txs),
-            Ok(sim) => {
-                warn!(
-                    "Skipping {}: simulation reports the liquidation would fail (tx index {:?}): {}",
-                    liquidatee,
-                    sim.failed_tx_index,
-                    sim.error_message.unwrap_or_default()
+        // With a feed behind, the plan is simulated here to choose between it and a price push,
+        // and that simulation is its only check; otherwise the send's preflight is.
+        let preflight = if pending.is_empty() {
+            Preflight::Run
+        } else {
+            Preflight::Skip
+        };
+        if !pending.is_empty() {
+            if let Err(e) = self.simulate(&plan.tx) {
+                debug!(
+                    "The wallet-funded liquidation of {} fails on the chain's prices ({e}); pushing them",
+                    liquidatee
                 );
-                attempt_failed = true;
-                Ok(())
+                // Releases its claim; the pushed plan claims afresh.
+                drop(plan);
+                return self.execute_with_price_push(
+                    strategy,
+                    intent,
+                    liab_mint,
+                    &pending,
+                    sandwich_rejected,
+                );
             }
+        }
+        self.land_wallet_plan(&liquidatee, plan, preflight)
+    }
+
+    /// Brings the cached wallet balances up to the moment of the call, after a liquidation or sell
+    /// that may have changed them; the Geyser updates reporting that are only applied when the
+    /// liquidator loop drains them.
+    ///
+    /// The balances are re-read until the read is at or past the slot the RPC was at when this was
+    /// called, which is at or past the slot of any transaction the caller saw confirm. The token
+    /// cache never lets an older read replace a newer one, so once this returns, the tokens the
+    /// caller spent can no longer look free, and its claim on them can be released.
+    pub fn refresh_wallet_balances(&self) {
+        let settled_at = match self
+            .rpc_client
+            .get_slot_with_commitment(CommitmentConfig::processed())
+        {
+            Ok(slot) => slot,
             Err(e) => {
-                warn!(
-                    "simulateBundle unavailable for {} ({}); sending sequentially",
-                    liquidatee, e
-                );
-                self.submit_sequential(&txs)
+                warn!("Failed to read the slot before refreshing the wallet balances: {e}");
+                0
             }
         };
+        for _ in 0..SETTLE_ATTEMPTS {
+            match self.cache.refresh_wallet_tokens(&self.rpc_client) {
+                Ok(read_at) if read_at >= settled_at => return,
+                Ok(read_at) => debug!(
+                    "Wallet balances read at slot {read_at}, short of {settled_at}; reading again"
+                ),
+                Err(e) => warn!("Failed to refresh the wallet balances: {e}"),
+            }
+            thread::sleep(SETTLE_RETRY_INTERVAL);
+        }
+        warn!(
+            "The wallet balances could not be read at or past slot {settled_at}; releasing the claim on the last read"
+        );
+    }
 
-        self.note_outcome(&liquidatee, attempt_failed || result.is_err());
+    /// Lands a plan that spends wallet inventory, then re-reads the wallet balances before
+    /// releasing the tokens it claimed, so the spent tokens never look free.
+    fn land_wallet_plan(
+        &self,
+        liquidatee: &Pubkey,
+        plan: ExecutionPlan,
+        preflight: Preflight,
+    ) -> Result<()> {
+        let ExecutionPlan { tx, claim } = plan;
+        let result = self.send_over_rpc(&tx, "Wallet-funded", preflight);
+        self.note_result(liquidatee, &result);
+        self.refresh_wallet_balances();
+        drop(claim);
         result
+    }
+
+    /// Simulates `tx` against the chain's current state.
+    fn simulate(&self, tx: &VersionedTransaction) -> Result<()> {
+        match self.rpc_client.simulate_transaction(tx)?.value.err {
+            None => Ok(()),
+            Some(err) => Err(anyhow!("simulation failed: {err:?}")),
+        }
+    }
+
+    /// Lands the liquidation behind a push of `feeds`: the sandwich when `try_sandwich` (it was
+    /// rejected only on the chain's prices) and it still fits a bundle, the wallet-funded plan
+    /// otherwise.
+    fn execute_with_price_push(
+        &self,
+        strategy: &dyn LiquidationStrategy,
+        intent: &PreparedLiquidatableAccount,
+        liab_mint: Pubkey,
+        feeds: &[[u8; 32]],
+        try_sandwich: bool,
+    ) -> Result<()> {
+        let liquidatee = intent.liquidatee_account.address;
+        let landing = self
+            .price_push
+            .as_ref()
+            .ok_or_else(|| anyhow!("price pushing is off"))?;
+        // The push first: without it there is nothing to bundle, and no quote is spent.
+        let push = match landing.pusher.push_transactions(feeds) {
+            Ok(push) => push,
+            Err(e) => {
+                let e = anyhow!("can't push the {} Pyth feed(s) it needs: {e}", feeds.len());
+                self.note_execution_failure(&liquidatee, &e.to_string());
+                return Err(e);
+            }
+        };
+        let sandwich = if try_sandwich {
+            match strategy.assemble_sandwich(intent, Landing::Bundle) {
+                Ok(Sandwich::Plan(plan)) => Some(plan),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let plan = match sandwich {
+            Some(plan) => plan,
+            None => match strategy.assemble_with_inventory(intent, Landing::Bundle) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
+                    return Err(e);
+                }
+            },
+        };
+        let ExecutionPlan { tx, claim } = plan;
+        let result = self.land_behind_price_push(landing, &liquidatee, feeds.len(), &push, &tx);
+        self.note_result(&liquidatee, &result);
+        self.refresh_wallet_balances();
+        drop(claim);
+        result
+    }
+
+    /// Simulates `[push..] [liquidation]`, then sends it as a Jito bundle with a tip. A bundle that
+    /// doesn't land is followed by the push and then the liquidation over RPC.
+    fn land_behind_price_push(
+        &self,
+        landing: &PricePushLanding,
+        liquidatee: &Pubkey,
+        feeds: usize,
+        push: &PricePush,
+        liquidation: &VersionedTransaction,
+    ) -> Result<()> {
+        let mut bundle = push.txs.clone();
+        bundle.push(liquidation.clone());
+
+        match landing.jito.simulate_bundle(
+            &landing.rpc_url,
+            landing.bundle_api_key.as_deref(),
+            &bundle,
+            &[],
+        ) {
+            Ok(sim) if sim.succeeded => {}
+            Ok(sim) => {
+                return Err(anyhow!(
+                    "the price push and liquidation would fail (tx index {:?}): {}",
+                    sim.failed_tx_index,
+                    sim.error_message.unwrap_or_default()
+                ));
+            }
+            Err(e) => warn!(
+                "simulateBundle unavailable for {} ({}); sending without it",
+                liquidatee, e
+            ),
+        }
+
+        info!(
+            "Liquidating {} behind a push of {} Pyth feed(s)",
+            liquidatee, feeds
+        );
+        if self.send_bundle(landing, &bundle)? {
+            return Ok(());
+        }
+
+        // The bundle didn't land: push over RPC, then liquidate on the pushed prices.
+        for (i, tx) in push.txs.iter().enumerate() {
+            if let Err(e) = self.send_with_resend(tx, Preflight::Run) {
+                warn!(
+                    "The price push for {} failed at tx {}: {}",
+                    liquidatee,
+                    i + 1,
+                    e
+                );
+                if i > 0 {
+                    // The first transaction created the VAA account; reclaim its rent.
+                    match landing.pusher.reclaim_transaction(&push.encoded_vaa) {
+                        Ok(reclaim) => {
+                            if let Err(e) = self.send_with_resend(&reclaim, Preflight::Run) {
+                                warn!(
+                                    "Failed to reclaim the VAA account {}: {}",
+                                    push.encoded_vaa, e
+                                );
+                            }
+                        }
+                        Err(e) => warn!("Failed to build the VAA reclaim: {e}"),
+                    }
+                }
+                // Somebody else may have pushed the same prices; the liquidation's preflight
+                // decides.
+                break;
+            }
+        }
+        // Built for the bundle and never simulated alone on the pushed prices.
+        self.send_over_rpc(liquidation, "Pushed", Preflight::Run)
+    }
+
+    /// Sends `bundle` with a tip appended. Returns whether its liquidation, the last transaction,
+    /// landed.
+    fn send_bundle(
+        &self,
+        landing: &PricePushLanding,
+        bundle: &[VersionedTransaction],
+    ) -> Result<bool> {
+        let liquidation_sig = bundle
+            .last()
+            .and_then(|tx| tx.signatures.first())
+            .copied()
+            .ok_or_else(|| anyhow!("empty bundle"))?;
+        let mut txs = bundle.to_vec();
+        txs.push(
+            landing
+                .tip_estimator
+                .build_tip_transaction(&landing.signer, &self.rpc_client)?,
+        );
+        match landing
+            .jito
+            .send_bundle_and_confirm(&txs, BUNDLE_CONFIRM_ATTEMPTS)
+        {
+            Ok(BundleOutcome::Confirmed(id)) => {
+                info!("Bundle landed: {} ({} txs)", id, txs.len());
+                Ok(true)
+            }
+            Ok(BundleOutcome::Unconfirmed(id)) => {
+                for _ in 0..SIGNATURE_CONFIRM_ATTEMPTS {
+                    if let Ok(resp) = self.rpc_client.get_signature_statuses(&[liquidation_sig]) {
+                        if let Some(Some(status)) = resp.value.into_iter().next() {
+                            if let Some(err) = status.err {
+                                return Err(anyhow!("bundle {id} reverted: {err:?}"));
+                            }
+                            if status.satisfies_commitment(CommitmentConfig::confirmed()) {
+                                info!("Bundle {} landed, confirmed via {}", id, liquidation_sig);
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    thread::sleep(SIGNATURE_POLL_INTERVAL);
+                }
+                warn!("Bundle {id} accepted but not on chain; pushing over RPC instead");
+                Ok(false)
+            }
+            Err(e) => {
+                warn!("The bundle was not accepted ({e}); pushing over RPC instead");
+                Ok(false)
+            }
+        }
     }
 
     /// Back off a target whose execution failed just like a failed assembly: every retry
     /// re-quotes the DEX without landing anything.
-    fn note_outcome(&self, liquidatee: &Pubkey, failed: bool) {
-        if failed {
-            self.note_execution_failure(liquidatee);
-        } else {
-            self.clear_target_backoff(liquidatee);
+    fn note_result(&self, liquidatee: &Pubkey, result: &Result<()>) {
+        match result {
+            Ok(()) => self.clear_target_backoff(liquidatee),
+            Err(e) => self.note_execution_failure(liquidatee, &e.to_string()),
         }
     }
 
@@ -406,168 +640,91 @@ impl Executor {
             return Ok(());
         }
 
-        bump_target_backoff(&mut guard, target, ASSEMBLE_BACKOFF_BASE, "assemble");
+        bump_target_backoff(&mut guard, target, ASSEMBLE_BACKOFF_BASE, "assemble", false);
         Ok(())
     }
 
     /// Record an execution failure: the plan assembled, but the liquidation could not be landed
     /// (simulation says it would revert, or the send failed). Same exponential backoff as an
-    /// assemble failure.
-    fn note_execution_failure(&self, target: &Pubkey) {
+    /// assemble failure, and a long one for a repeated premium-cap rejection.
+    fn note_execution_failure(&self, target: &Pubkey, message: &str) {
         if let Ok(mut guard) = self.backoffs.lock() {
-            bump_target_backoff(&mut guard, target, EXECUTION_BACKOFF_BASE, "execution");
+            bump_target_backoff(
+                &mut guard,
+                target,
+                EXECUTION_BACKOFF_BASE,
+                "execution",
+                is_premium_cap_failure(message),
+            );
         }
     }
 
-    /// Land the ordered transactions as an atomic Jito bundle (with a tip). Only fall back to
-    /// sequential RPC when the bundle was *never accepted* (infra error / rejection). If it was
-    /// accepted but didn't confirm in time, leave it in-flight (no resend) to avoid double
-    /// execution — the next cycle re-evaluates and retries if it didn't land.
-    pub fn submit(&self, txs: &[VersionedTransaction]) -> Result<()> {
-        if txs.is_empty() {
-            return Err(anyhow!("Executor::submit called with no transactions"));
-        }
-        // The liquidation tx is the last core tx (any buy precedes it); its signature is our
-        // authoritative "did it land" check when Jito's bundle status is unavailable/lagging.
-        let liquidation_sig = txs.last().and_then(|tx| tx.signatures.first()).copied();
-        match self.try_bundle(txs) {
-            Ok(BundleOutcome::Confirmed(bundle_id)) => {
-                info!("Bundle landed: {} ({} txs)", bundle_id, txs.len());
-                Ok(())
-            }
-            Ok(BundleOutcome::Unconfirmed(bundle_id)) => {
-                // Jito's `getBundleStatuses` can lag or be rate-limited (`-32097`); confirm against
-                // the chain directly before deciding it didn't land.
-                match liquidation_sig {
-                    Some(sig) => match self.confirm_on_chain(&sig) {
-                        Ok(true) => {
-                            info!(
-                                "Bundle {} landed ({} txs), confirmed on-chain via {}",
-                                bundle_id,
-                                txs.len(),
-                                sig
-                            );
-                            Ok(())
-                        }
-                        Ok(false) => {
-                            // The bundle was accepted but never landed (common on the rate-limited
-                            // public block engine). Don't spin re-submitting bundles that won't
-                            // land — fall back to a direct RPC send, which is what actually lands.
-                            // Idempotent: the txs keep their signatures, so a late-landing bundle
-                            // just makes the resend a no-op ("already processed").
-                            warn!(
-                                "Bundle {} accepted but liquidation tx {} not on-chain; falling back to sequential send",
-                                bundle_id, sig
-                            );
-                            self.submit_sequential(txs)
-                        }
-                        Err(e) => {
-                            // Bundles are atomic: a reverted liquidation tx means nothing applied,
-                            // so the next cycle can safely retry.
-                            warn!(
-                                "Bundle {} did not land (liquidation tx {}: {}); next cycle retries",
-                                bundle_id, sig, e
-                            );
-                            Ok(())
-                        }
-                    },
-                    None => {
-                        warn!(
-                            "Bundle {} accepted but unconfirmed and no signature to verify; leaving in-flight",
-                            bundle_id
-                        );
-                        Ok(())
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Bundle was not accepted ({}); falling back to sequential send",
-                    e
-                );
-                self.submit_sequential(txs)
-            }
-        }
-    }
-
-    /// Append a tip tx and submit the bundle to the block engine.
-    fn try_bundle(&self, txs: &[VersionedTransaction]) -> Result<BundleOutcome> {
-        let mut bundle_txs = txs.to_vec();
-        bundle_txs.push(
-            self.tip_estimator
-                .build_tip_transaction(&self.signer, &self.rpc_client)?,
-        );
-        self.jito
-            .send_bundle_and_confirm(&bundle_txs, BUNDLE_CONFIRM_ATTEMPTS)
-    }
-
-    /// Authoritative confirmation: poll the RPC for the liquidation tx landing on-chain,
-    /// independent of Jito's throttled bundle status. Returns `Ok(true)` once it reaches
-    /// `confirmed`, `Ok(false)` if it never appears within the window (still possibly in-flight),
-    /// and `Err` if it landed with an on-chain error (atomic bundle reverted).
-    fn confirm_on_chain(&self, sig: &Signature) -> Result<bool> {
-        for _ in 0..SIGNATURE_CONFIRM_ATTEMPTS {
-            match self.rpc_client.get_signature_statuses(&[*sig]) {
-                Ok(resp) => {
-                    if let Some(Some(status)) = resp.value.into_iter().next() {
-                        if let Some(err) = &status.err {
-                            return Err(anyhow!("reverted on-chain: {:?}", err));
-                        }
-                        if status.satisfies_commitment(CommitmentConfig::confirmed()) {
-                            return Ok(true);
-                        }
-                    }
-                }
-                Err(e) => debug!("signature status poll for {} failed: {}", sig, e),
-            }
-            thread::sleep(SIGNATURE_POLL_INTERVAL);
-        }
-        Ok(false)
-    }
-
-    /// Send each transaction in order, confirming before moving on. Used when the bundle path is
-    /// unavailable; loses atomicity, so a later failure can leave earlier txs applied.
-    fn submit_sequential(&self, txs: &[VersionedTransaction]) -> Result<()> {
-        let fallback_count = self.sequential_fallbacks.fetch_add(1, Ordering::Relaxed) + 1;
-        warn!(
-            "Sequential fallback #{}: sending {} transaction(s)",
-            fallback_count,
-            txs.len()
-        );
-        self.send_over_rpc(txs, "Sequential")
-    }
-
-    /// Send each transaction over RPC in order, with preflight, confirming before moving on.
-    fn send_over_rpc(&self, txs: &[VersionedTransaction], label: &str) -> Result<()> {
-        for (i, tx) in txs.iter().enumerate() {
-            match self.send_with_resend(tx) {
-                Ok(sig) => info!("{} tx {}/{} confirmed: {}", label, i + 1, txs.len(), sig),
-                Err(e) => {
-                    return Err(anyhow!(
-                        "{} send failed at tx {}/{}: {}",
-                        label,
-                        i + 1,
-                        txs.len(),
-                        e
-                    ));
-                }
-            }
-        }
+    /// Sends the liquidation over RPC and waits for it to confirm or fail.
+    fn send_over_rpc(
+        &self,
+        tx: &VersionedTransaction,
+        label: &str,
+        preflight: Preflight,
+    ) -> Result<()> {
+        let sig = self
+            .send_with_resend(tx, preflight)
+            .map_err(|e| anyhow!("{label} send failed: {e}"))?;
+        info!("{label} tx confirmed: {sig}");
         Ok(())
     }
 
-    /// Sends `tx` with preflight, then re-sends it every [`RESEND_INTERVAL`] (without preflight)
-    /// while polling its status, until it is confirmed, reverts, or its blockhash expires.
-    fn send_with_resend(&self, tx: &VersionedTransaction) -> Result<Signature> {
+    /// Whether `sig` is on chain: `Some(Ok)` once confirmed, `Some(Err)` if it reverted, `None`
+    /// if it isn't known or the status can't be read.
+    fn landed_status(&self, sig: &Signature) -> Option<Result<()>> {
+        let status = self
+            .rpc_client
+            .get_signature_statuses(&[*sig])
+            .ok()?
+            .value
+            .into_iter()
+            .next()??;
+        if let Some(err) = status.err {
+            return Some(Err(anyhow!("{sig} reverted on-chain: {err:?}")));
+        }
+        status
+            .satisfies_commitment(CommitmentConfig::confirmed())
+            .then_some(Ok(()))
+    }
+
+    /// Sends `tx`, with the RPC's preflight simulation unless eva already simulated it, then
+    /// re-sends it every [`RESEND_INTERVAL`] (without preflight) while polling its status, until it
+    /// is confirmed, reverts, or its blockhash expires. Only this one transaction is waited on:
+    /// every liquidation runs on its own worker.
+    fn send_with_resend(
+        &self,
+        tx: &VersionedTransaction,
+        preflight: Preflight,
+    ) -> Result<Signature> {
         let blockhash = *tx.message.recent_blockhash();
-        let sig = self.rpc_client.send_transaction_with_config(
+        let sig = match self.rpc_client.send_transaction_with_config(
             tx,
             RpcSendTransactionConfig {
-                skip_preflight: false,
+                skip_preflight: preflight == Preflight::Skip,
                 preflight_commitment: Some(CommitmentLevel::Processed),
                 ..Default::default()
             },
-        )?;
+        ) {
+            Ok(sig) => sig,
+            Err(e) => {
+                // A transaction that already landed, from a bundle that landed late for instance,
+                // is rejected by preflight; the chain says whether that is a success.
+                let sig = tx
+                    .signatures
+                    .first()
+                    .copied()
+                    .ok_or_else(|| anyhow!("unsigned transaction"))?;
+                return match self.landed_status(&sig) {
+                    Some(Ok(())) => Ok(sig),
+                    Some(Err(reverted)) => Err(reverted),
+                    None => Err(e.into()),
+                };
+            }
+        };
 
         let started = Instant::now();
         let mut last_sent = Instant::now();
@@ -619,5 +776,103 @@ impl Executor {
                 resends += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::pyth_prices::test_price_update_account;
+    use solana_clock::Clock;
+    use std::collections::HashSet;
+
+    #[test]
+    fn only_sponsored_feeds_ahead_of_the_chain_are_pushed() {
+        let mut cache = Cache::new(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Arc::new(Mutex::new(Clock::default())),
+            HashSet::new(),
+        );
+        let (ahead, synced, unknown) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let mut add = |feed: [u8; 32], address: Pubkey, cached: i64, onchain: Option<i64>| {
+            cache
+                .oracles
+                .try_insert(address, test_price_update_account(feed, cached, 1))
+                .unwrap();
+            if let Some(onchain) = onchain {
+                cache.pyth_prices.record_onchain(address, onchain);
+            }
+            address
+        };
+        let ahead_feed = add(ahead, price_feed_address(&ahead), 110, Some(100));
+        let synced_feed = add(synced, price_feed_address(&synced), 100, Some(100));
+        // Not the sponsored PDA: nobody can push it, and Hermes never overwrites it.
+        let unsponsored = add(ahead, Pubkey::new_unique(), 110, Some(100));
+        // The chain's publish time was never seen: nothing to compare against.
+        let never_seen = add(unknown, price_feed_address(&unknown), 110, None);
+
+        let oracles = [ahead_feed, synced_feed, unsponsored, never_seen, ahead_feed];
+        assert_eq!(pending_feeds(&cache, &oracles), vec![ahead]);
+    }
+
+    fn retry_in(backoffs: &HashMap<Pubkey, BackoffState>, target: &Pubkey) -> Duration {
+        backoffs[target]
+            .retry_after()
+            .saturating_duration_since(Instant::now())
+    }
+
+    #[test]
+    fn a_second_premium_cap_failure_in_a_row_backs_off_long() {
+        let mut backoffs = HashMap::new();
+        let target = Pubkey::new_unique();
+        bump_target_backoff(
+            &mut backoffs,
+            &target,
+            EXECUTION_BACKOFF_BASE,
+            "execution",
+            true,
+        );
+        assert!(retry_in(&backoffs, &target) <= EXECUTION_BACKOFF_BASE);
+        bump_target_backoff(
+            &mut backoffs,
+            &target,
+            EXECUTION_BACKOFF_BASE,
+            "execution",
+            true,
+        );
+        assert!(retry_in(&backoffs, &target) > TARGET_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn other_failures_keep_the_exponential_backoff() {
+        let mut backoffs = HashMap::new();
+        let target = Pubkey::new_unique();
+        bump_target_backoff(
+            &mut backoffs,
+            &target,
+            EXECUTION_BACKOFF_BASE,
+            "execution",
+            true,
+        );
+        bump_target_backoff(
+            &mut backoffs,
+            &target,
+            EXECUTION_BACKOFF_BASE,
+            "execution",
+            false,
+        );
+        assert!(retry_in(&backoffs, &target) <= EXECUTION_BACKOFF_BASE * 2);
+    }
+
+    #[test]
+    fn recognizes_the_premium_cap_error() {
+        assert!(is_premium_cap_failure(
+            "Error processing Instruction 4: custom program error: 0x17ca"
+        ));
+        assert!(is_premium_cap_failure(
+            "Error Code: LiquidationPremiumTooHigh. Error Number: 6090."
+        ));
+        assert!(!is_premium_cap_failure("custom program error: 0x17b4"));
     }
 }

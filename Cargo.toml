@@ -27,6 +27,12 @@ solana-sdk-ids = "3.1.0"
 solana-signature = "3"
 solana-signer = "3"
 solana-system-interface = "3.2.0"
+# Runtime limits (see transaction_limits.rs), at the versions the rest of the tree already uses.
+solana-compute-budget = "=4.2.2"
+solana-packet = "=4.2.0"
+solana-native-token = "=3.0.0"
+# The version the marginfi program calls `Rent::get()` through; see utils/rent_sysvar.rs.
+solana-sysvar = "=3.1.1"
 solana-transaction = { version = "4", features = ["serde"] }
 spl-associated-token-account = { version = "8.0.0", default-features = false, features = ["no-entrypoint"] }
 spl-token = "9.0.0"

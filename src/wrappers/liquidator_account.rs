@@ -28,14 +28,19 @@ use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_dex_superagg::SwapInstructions;
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
-use solana_message::{v0::Message, AddressLookupTableAccount, VersionedMessage};
+use solana_message::{v0::Message, v1, AddressLookupTableAccount, VersionedMessage};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 use std::{collections::HashSet, sync::Arc};
 
+use crate::execution::Landing;
 use crate::juplend_ixs::juplend_underlying_amount;
+use crate::transaction_limits::{
+    priority_fee_lamports, MAX_COMPUTE_UNIT_LIMIT, MAX_LOADED_ACCOUNTS_DATA, MAX_TX_ACCOUNT_LOCKS,
+    MAX_V0_TX_SIZE, MAX_V1_TX_SIZE,
+};
 
 /// Collateral tags `build_liquidate_tx` can withdraw. Staked banks hold a plain SPL LST, so they go
 /// through the standard withdraw like DEFAULT/SOL.
@@ -45,11 +50,6 @@ pub fn is_seizable_asset_tag(tag: u8) -> bool {
         ASSET_TAG_DEFAULT | ASSET_TAG_SOL | ASSET_TAG_STAKED | ASSET_TAG_KAMINO | ASSET_TAG_JUPLEND
     )
 }
-
-/// Max serialized Solana transaction size on the wire.
-const MAX_TX_SIZE: usize = 1232;
-/// Runtime cap on accounts one transaction may load, LUT-resolved or not.
-pub const MAX_TX_ACCOUNT_LOCKS: usize = 64;
 
 /// Unique accounts the compiled transaction will lock: the payer, every program and every account
 /// meta. (The blockhash is not an account.)
@@ -89,9 +89,11 @@ pub struct LiquidatorAccount {
     rpc_client: RpcClient,
     rpc_url: String,
     cu_limit_ix: Instruction,
+    /// The priority fee of a v1 liquidation transaction, in lamports: the configured price per
+    /// compute unit times [`MAX_COMPUTE_UNIT_LIMIT`], as a v1 header states a total.
+    v1_priority_fee: u64,
     /// Priority-fee instruction (from `COMPUTE_UNIT_PRICE_MICRO_LAMPORTS`). Without it the heavy
-    /// liquidation tx carries a CU limit but no price, so it confirms slowly under load — the
-    /// sequential-send path especially needs this to land promptly.
+    /// liquidation tx carries a CU limit but no price, so it confirms slowly under load.
     cu_price_ix: Instruction,
     pub cache: Arc<Cache>,
 }
@@ -115,7 +117,8 @@ impl LiquidatorAccount {
             group: marginfi_group_id,
             rpc_client,
             rpc_url: config.rpc_url.clone(),
-            cu_limit_ix: ComputeBudgetInstruction::set_compute_unit_limit(1400000),
+            cu_limit_ix: ComputeBudgetInstruction::set_compute_unit_limit(MAX_COMPUTE_UNIT_LIMIT),
+            v1_priority_fee: priority_fee_lamports(config.compute_unit_price_micro_lamports),
             cu_price_ix: ComputeBudgetInstruction::set_compute_unit_price(
                 config.compute_unit_price_micro_lamports,
             ),
@@ -131,16 +134,29 @@ impl LiquidatorAccount {
         asset_amount: I80F48,
         liab_amount: I80F48,
         swap: Option<&SwapInstructions>,
+        landing: Landing,
     ) -> Result<VersionedTransaction> {
         let (ixs, mut luts, record) =
             self.liquidation_ixs(account, asset_amount, liab_amount, swap)?;
+
+        // Over RPC, always v1: up to 4096 bytes with every address in full, so it needs no lookup
+        // table and a route's pool accounts always fit, and its header carries the compute budget,
+        // which saves the compute-budget program's account. Both formats lock at most 64 accounts,
+        // so whatever fits a v0 transaction fits a v1 one. The Jito block engine cannot decode v1,
+        // so only a bundled liquidation is v0, with lookup tables.
+        if landing == Landing::Rpc {
+            return self.compile_v1(&ixs);
+        }
+
         if let Some(swap) = swap {
             luts.extend(self.fetch_luts(&swap.address_lookup_tables)?);
         }
+        let mut v0_ixs = vec![self.cu_limit_ix.clone(), self.cu_price_ix.clone()];
+        v0_ixs.extend(ixs);
         // Whatever doesn't fit gets learned for next time, except the liquidatee's own account and
         // record, which no other liquidation references.
         let liquidatee = account.liquidatee_account.address;
-        self.compile_tx_fit(&ixs, &luts, &[liquidatee, record])
+        self.compile_tx_fit(&v0_ixs, &luts, &[liquidatee, record])
     }
 
     /// The liquidation's instructions, in order, the lookup tables that cover them (the venue's
@@ -194,9 +210,9 @@ impl LiquidatorAccount {
                 (None, liquidatee_account.account.liquidation_record)
             };
 
+        // The compute budget is added when compiling: a v1 header carries it, a v0 transaction
+        // needs its instructions.
         let mut ixs = Vec::new();
-        ixs.push(self.cu_limit_ix.clone());
-        ixs.push(self.cu_price_ix.clone());
 
         let start_ix = make_start_liquidate_ix(
             self.group,
@@ -424,16 +440,14 @@ impl LiquidatorAccount {
             ..
         } = observation_accounts;
 
-        let mut ixs = vec![self.cu_limit_ix.clone(), self.cu_price_ix.clone()];
-        ixs.extend(self.venue_refresh_ixs(kamino_reserves, juplend_states)?);
+        let mut ixs = self.venue_refresh_ixs(kamino_reserves, juplend_states)?;
         ixs.push(make_tag_liq_record_ix(
             self.group,
             liquidatee,
             liquidatee_observation_accounts,
         ));
 
-        let luts = self.cache.luts.tables();
-        let tx = self.compile_tx(&self.signer.pubkey(), &ixs, &luts)?;
+        let tx = self.compile_v1(&ixs)?;
         // Sent, not confirmed: the liquidator loop runs tags inline, and waiting out a tag that
         // never lands would hold up every liquidation behind it. Preflight still rejects a tag the
         // program would refuse.
@@ -499,7 +513,7 @@ impl LiquidatorAccount {
 
         let tx = self.compile_tx(&signer_pk, ixs, luts)?;
         let size = bincode::serialize(&tx)?.len();
-        if size <= MAX_TX_SIZE {
+        if size <= MAX_V0_TX_SIZE {
             return Ok(tx);
         }
 
@@ -526,7 +540,7 @@ impl LiquidatorAccount {
         Err(anyhow!(
             "transaction is {} bytes (max {}) with {} account(s) no lookup table holds{}",
             size,
-            MAX_TX_SIZE,
+            MAX_V0_TX_SIZE,
             uncovered.len(),
             if learnable.is_empty() {
                 String::new()
@@ -534,6 +548,40 @@ impl LiquidatorAccount {
                 format!("; adding {} of them", learnable.len())
             }
         ))
+    }
+
+    /// Compiles and signs `ixs` as a v1 transaction, with the liquidation's compute budget and
+    /// priority fee in its header.
+    fn compile_v1(&self, ixs: &[Instruction]) -> Result<VersionedTransaction> {
+        let signer_pk = self.signer.pubkey();
+        let locks = locked_accounts(&signer_pk, ixs).len();
+        if locks > MAX_TX_ACCOUNT_LOCKS {
+            return Err(anyhow!(
+                "transaction loads {} accounts (max {})",
+                locks,
+                MAX_TX_ACCOUNT_LOCKS
+            ));
+        }
+        let config = v1::TransactionConfig {
+            priority_fee: Some(self.v1_priority_fee),
+            compute_unit_limit: Some(MAX_COMPUTE_UNIT_LIMIT),
+            loaded_accounts_data_size_limit: Some(MAX_LOADED_ACCOUNTS_DATA),
+            ..v1::TransactionConfig::empty()
+        };
+        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
+        let message =
+            v1::Message::try_compile_with_config(&signer_pk, ixs, recent_blockhash, config)
+                .map_err(|e| anyhow!("{e:?}"))?;
+        let tx = VersionedTransaction::try_new(VersionedMessage::V1(message), &[&self.signer])?;
+        let size = bincode::serialize(&tx)?.len();
+        if size > MAX_V1_TX_SIZE {
+            return Err(anyhow!(
+                "transaction is {} bytes (max {})",
+                size,
+                MAX_V1_TX_SIZE
+            ));
+        }
+        Ok(tx)
     }
 
     fn compile_tx(

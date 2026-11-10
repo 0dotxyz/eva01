@@ -317,7 +317,6 @@ fn parse_simulate_bundle(resp: &Value, txs: &[VersionedTransaction]) -> Result<B
 
 const TIP_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const TIP_FALLBACK_LAMPORTS: u64 = 10_000;
-const LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.0;
 
 /// Dynamic Jito tip estimator with a max cap and TTL cache.
 ///
@@ -424,7 +423,7 @@ fn parse_tip_floor_lamports(resp: &Value) -> Result<u64> {
     if sol < 0.0 {
         return Err(anyhow!("negative tip floor: {sol}"));
     }
-    Ok((sol * LAMPORTS_PER_SOL_F64) as u64)
+    Ok((sol * solana_native_token::LAMPORTS_PER_SOL as f64) as u64)
 }
 
 #[cfg(test)]

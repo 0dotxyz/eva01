@@ -12,10 +12,6 @@ pub struct TokenAccountWrapper<T: OracleWrapperTrait> {
 }
 
 impl<T: OracleWrapperTrait> TokenAccountWrapper<T> {
-    pub fn get_value(&self) -> anyhow::Result<I80F48> {
-        self.get_value_for_amount(I80F48::from_num(self.balance))
-    }
-
     pub fn get_value_for_amount(&self, amount: I80F48) -> anyhow::Result<I80F48> {
         let ui_amount = {
             let decimal_scale = EXP_10_I80F48[self.bank_wrapper.bank.mint_decimals as usize];
