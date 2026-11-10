@@ -56,6 +56,7 @@ impl IntegrationAccountFetcher {
             account_type: AccountType::Oracle,
             address,
             account,
+            slot: 0,
         }) {
             warn!("IntegrationAccountFetcher: failed to publish the {address} update: {e}");
         }

@@ -35,6 +35,9 @@ pub struct GeyserUpdate {
     pub account_type: AccountType,
     pub address: Pubkey,
     pub account: Account,
+    /// The slot the account was read at, or 0 when the source does not report one. Only wallet
+    /// token updates use it, to never let an older read replace a newer one.
+    pub slot: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -198,6 +201,7 @@ impl GeyserService {
                         } else if let subscribe_update::UpdateOneof::Account(account) = update_oneof
                         {
                             from_slot = Some(account.slot);
+                            let update_slot = account.slot;
 
                             let account_update = ward!(&account.account, continue);
                             let account =
@@ -214,17 +218,27 @@ impl GeyserService {
                                     if marginfi_account.group != self.marginfi_group_pk {
                                         continue;
                                     }
-                                    self.send_update(AccountType::Marginfi, address, &account);
+                                    self.send_update(
+                                        AccountType::Marginfi,
+                                        address,
+                                        &account,
+                                        update_slot,
+                                    );
                                 }
 
                                 if let Ok(bank) = decode_bank(&account.data) {
                                     if bank.group != self.marginfi_group_pk {
                                         continue;
                                     }
-                                    self.send_update(AccountType::Bank, address, &account);
+                                    self.send_update(
+                                        AccountType::Bank,
+                                        address,
+                                        &account,
+                                        update_slot,
+                                    );
                                 }
                             } else if let Some(account_type) = self.tracked_accounts.get(&address) {
-                                self.send_update(*account_type, address, &account);
+                                self.send_update(*account_type, address, &account, update_slot);
                             }
                         }
                     }
@@ -279,11 +293,18 @@ impl GeyserService {
         }
     }
 
-    fn send_update(&self, account_type: AccountType, address: Pubkey, account: &Account) {
+    fn send_update(
+        &self,
+        account_type: AccountType,
+        address: Pubkey,
+        account: &Account,
+        slot: u64,
+    ) {
         let update = GeyserUpdate {
             account_type,
             address,
             account: account.clone(),
+            slot,
         };
         if let Err(e) = self.geyser_tx.send(update) {
             error!("Error channeling update to the Geyser processor! {:?}", e);

@@ -13,9 +13,11 @@
 //! shortfall's oracle value plus the liquidation's margin above `min_profit`. The rebalancer sells
 //! the seized collateral and any excess liability afterwards.
 //!
-//! A sandwich touches no wallet inventory, so the executor runs sandwiches in parallel and sends
-//! each directly over RPC. The fallback spends the wallet, so the executor assembles and lands one
-//! at a time, as a Jito bundle with a sequential RPC fallback.
+//! A sandwich touches no wallet inventory. The fallback claims the wallet tokens it spends (the
+//! liability held, the swap_mint a buy spends and the liability it buys) in the shared
+//! reservations, so fallbacks run in parallel too without two ever counting the same tokens. A
+//! one-transaction plan is sent directly over RPC, a buy plus liquidation as a Jito bundle with a
+//! sequential RPC fallback.
 
 use std::sync::Arc;
 
@@ -38,18 +40,14 @@ use crate::wrappers::{
     token_account::TokenAccountWrapper,
 };
 
-use super::{ExecutionPlan, LiquidationStrategy, Sandwich};
+use super::{
+    reservations::{Claim, TokenReservations},
+    ExecutionPlan, LiquidationStrategy, Sandwich,
+};
 
 /// Liability still to buy: `repay_amount` truncated like the repay ix, minus what the wallet holds.
 fn buy_shortfall(repay_amount: I80F48, wallet_balance: u64) -> u64 {
     repay_amount.to_num::<u64>().saturating_sub(wallet_balance)
-}
-
-/// swap_mint to spend on a buy: what the oracle says the shortfall costs, or everything the wallet
-/// holds when that is less. A smaller buy still liquidates, just a smaller share; refusing would
-/// liquidate nothing until the rebalancer refills the wallet.
-fn affordable_input(wanted: u64, wallet_swap_mint: u64) -> u64 {
-    wanted.min(wallet_swap_mint)
 }
 
 /// Programs marginfi lets a swap call between the start and end of a receivership: the venues'
@@ -71,6 +69,7 @@ pub struct InventoryStrategy {
     swap_mint: Pubkey,
     slippage_bps: u16,
     min_profit: f64,
+    reservations: Arc<TokenReservations>,
 }
 
 impl InventoryStrategy {
@@ -81,6 +80,7 @@ impl InventoryStrategy {
         dex_gate: Arc<DexGate>,
         slippage_bps: u16,
         min_profit: f64,
+        reservations: Arc<TokenReservations>,
     ) -> Result<Self> {
         // Multi-threaded so concurrent liquidations can `block_on` DEX quotes at the same time —
         // a current-thread runtime only supports one `block_on` at a time. A couple of worker
@@ -99,6 +99,7 @@ impl InventoryStrategy {
             swap_mint,
             slippage_bps,
             min_profit,
+            reservations,
         })
     }
 
@@ -119,15 +120,15 @@ impl InventoryStrategy {
     }
 
     /// Builds a signed ExactIn buy of `output_mint`, spending the oracle value of `amount` in
-    /// swap_mint, or all of the `wallet_swap_mint` the wallet holds if that is less. Returns the
-    /// transaction and how much it guarantees to deliver, which may be less than `amount` when the
-    /// market is worse than the oracle or the wallet can't afford the whole buy; the caller
-    /// shrinks the liquidation to what it will hold.
+    /// swap_mint, or all of the unclaimed swap_mint the wallet holds if that is less, and claims
+    /// both what it spends and what it buys. Returns the transaction and how much it guarantees
+    /// to deliver, which may be less than `amount` when the market is worse than the oracle or the
+    /// wallet can't afford the whole buy; the caller shrinks the liquidation to what it will hold.
     fn build_buy_tx(
         &self,
         output_mint: Pubkey,
         amount: u64,
-        wallet_swap_mint: u64,
+        claim: &mut Claim,
     ) -> Result<(VersionedTransaction, u64)> {
         let value = self
             .value_wrapper(&output_mint)?
@@ -136,10 +137,19 @@ impl InventoryStrategy {
             .value_wrapper(&self.swap_mint)?
             .get_amount_from_value(value)?
             .to_num();
-        let input_amount = affordable_input(wanted_input, wallet_swap_mint);
+        let wallet_swap_mint = self
+            .liquidator_account
+            .get_token_balance_for_mint(&self.swap_mint)
+            .unwrap_or(0);
+        let input_amount = self.reservations.claim_available(
+            claim,
+            self.swap_mint,
+            wanted_input,
+            wallet_swap_mint,
+        );
         if input_amount == 0 {
             return Err(anyhow!(
-                "no {} to buy {} {} with (wallet holds {}, wanted {})",
+                "no unclaimed {} to buy {} {} with (wallet holds {}, wanted {})",
                 self.swap_mint,
                 amount,
                 output_mint,
@@ -149,8 +159,8 @@ impl InventoryStrategy {
         }
         if input_amount < wanted_input {
             info!(
-                "InventoryStrategy: the wallet holds {} {}, short of the {} the buy wants; buying what it can",
-                wallet_swap_mint, self.swap_mint, wanted_input
+                "InventoryStrategy: {} {} is free of the {} the wallet holds, short of the {} the buy wants; buying what it can",
+                input_amount, self.swap_mint, wallet_swap_mint, wanted_input
             );
         }
 
@@ -172,6 +182,9 @@ impl InventoryStrategy {
             prepared.aggregator,
             amount
         );
+        // What the buy delivers is this plan's, not free inventory for the others.
+        self.reservations
+            .claim_incoming(claim, output_mint, prepared.min_out_amount);
         Ok((prepared.transaction, prepared.min_out_amount))
     }
 
@@ -264,26 +277,31 @@ impl InventoryStrategy {
         let mut asset_amount = intent.asset_amount;
         let mut repay_amount = intent.liab_amount;
 
-        let wallet_liab = self
+        // The liability the wallet already holds and no other plan has claimed pays first.
+        let mut claim = self.reservations.new_claim();
+        let wallet_balance = self
             .liquidator_account
             .get_token_balance_for_mint(&liab_mint)
             .unwrap_or(0);
-        let wallet_swap_mint = self
-            .liquidator_account
-            .get_token_balance_for_mint(&self.swap_mint)
-            .unwrap_or(0);
+        let wallet_liab = self.reservations.claim_available(
+            &mut claim,
+            liab_mint,
+            repay_amount.to_num::<u64>(),
+            wallet_balance,
+        );
         let shortfall = buy_shortfall(repay_amount, wallet_liab);
 
         let mut txs = Vec::new();
         if shortfall > 0 {
             info!(
-                "InventoryStrategy: buying shortfall of {} {} (have {}, need {})",
+                "InventoryStrategy: buying shortfall of {} {} (have {} free of {}, need {})",
                 shortfall,
                 liab_mint,
                 wallet_liab,
+                wallet_balance,
                 repay_amount.to_num::<u64>()
             );
-            let (buy_tx, bought) = self.build_buy_tx(liab_mint, shortfall, wallet_swap_mint)?;
+            let (buy_tx, bought) = self.build_buy_tx(liab_mint, shortfall, &mut claim)?;
             txs.push(buy_tx);
 
             if bought < shortfall {
@@ -326,7 +344,10 @@ impl InventoryStrategy {
                 .build_liquidate_tx(intent, asset_amount, repay_amount, None)?;
         txs.push(liquidate_tx);
 
-        Ok(ExecutionPlan { txs })
+        Ok(ExecutionPlan {
+            txs,
+            claim: Some(claim),
+        })
     }
 }
 
@@ -341,7 +362,10 @@ impl LiquidationStrategy for InventoryStrategy {
         let asset_mint = cache.banks.try_get_bank(&intent.asset_bank)?.bank.mint;
 
         match self.build_sandwich_tx(intent, asset_mint, liab_mint) {
-            Ok(tx) => Ok(Sandwich::Plan(ExecutionPlan { txs: vec![tx] })),
+            Ok(tx) => Ok(Sandwich::Plan(ExecutionPlan {
+                txs: vec![tx],
+                claim: None,
+            })),
             Err(e) => {
                 info!(
                     "InventoryStrategy: not selling the collateral in-tx for {} ({}); buying the liability instead",
@@ -366,13 +390,6 @@ impl LiquidationStrategy for InventoryStrategy {
 mod tests {
     use super::*;
     use fixed_macro::types::I80F48;
-
-    #[test]
-    fn affordable_input_is_capped_by_the_wallet() {
-        assert_eq!(affordable_input(1_000, 1_500), 1_000);
-        assert_eq!(affordable_input(1_000, 400), 400);
-        assert_eq!(affordable_input(1_000, 0), 0);
-    }
 
     #[test]
     fn test_buy_shortfall_partial() {

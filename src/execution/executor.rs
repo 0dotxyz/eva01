@@ -2,20 +2,21 @@
 //!
 //! `try_execute()` turns a prepared liquidation into a landed liquidation:
 //! 1. ask the strategy for a sandwich (`[liquidate]`, self-funded): a single tx that touches no
-//!    wallet inventory, sent directly over RPC; any number of these run in parallel;
-//! 2. otherwise take the inventory lock and ask for the inventory plan (`[buy] [liquidate]`, or
-//!    `[liquidate]` paid from holdings): simulate-first, then an atomic Jito bundle (with a tip),
-//!    falling back to sequential RPC sends. The lock is held until the plan has landed or failed
-//!    and the wallet balances are re-read, so the next plan is sized against real holdings. The
-//!    wait for the lock can be long, so the intent is re-sized on the current state once it is held.
+//!    wallet inventory, sent directly over RPC;
+//! 2. otherwise ask for the inventory plan, which claims the wallet tokens it spends:
+//!    `[liquidate]` paid from holdings is sent directly over RPC like a sandwich; `[buy]
+//!    [liquidate]` is simulated first, then sent as an atomic Jito bundle (with a tip), falling
+//!    back to sequential RPC sends. The claim is released once the plan has landed or failed and
+//!    the wallet balances have been re-read.
 //!
+//! Nothing waits for another plan: any number of liquidations run at once, bounded by the workers.
 //! The tip is added only on the bundle path; the sequential fallback sends the core txs as-is.
 
 use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -57,6 +58,11 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Hard ceiling on waiting for an RPC send, in case the blockhash validity check misbehaves.
 const SEND_MAX_WAIT: Duration = Duration::from_secs(90);
 
+/// Reads of the wallet balances made while settling a plan, this far apart, before giving up on
+/// a lagging RPC node and releasing the plan's claim on the last read.
+const SETTLE_ATTEMPTS: usize = 10;
+const SETTLE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Re-check a liability mint that has no swap route only after this long (routes can appear).
 const NO_ROUTE_QUARANTINE_TTL: Duration = Duration::from_secs(3600);
 
@@ -69,10 +75,22 @@ const ASSEMBLE_BACKOFF_BASE: Duration = Duration::from_secs(30);
 const EXECUTION_BACKOFF_BASE: Duration = Duration::from_secs(5);
 const TARGET_BACKOFF_MAX: Duration = Duration::from_secs(900);
 
+/// A target rejected twice in a row by `end_liquidation`'s premium cap (6090) is left alone this
+/// long. Once is a price move; twice is usually a dust repay whose rounding the cap can never
+/// accept, and every retry spends a DEX quote.
+const PREMIUM_CAP_BACKOFF: Duration = Duration::from_secs(1200);
+
+/// Whether a failure is `end_liquidation` rejecting the seizure as above the premium cap.
+fn is_premium_cap_failure(message: &str) -> bool {
+    message.contains("0x17ca") || message.contains("LiquidationPremiumTooHigh")
+}
+
 /// Per-target backoff state after a transient (non-route) assemble failure.
 struct TargetBackoff {
     /// Consecutive assemble failures (drives the exponential cooldown).
     failures: u32,
+    /// The last failure was the premium cap.
+    premium_cap: bool,
     /// Don't re-attempt the target before this time.
     retry_after: Instant,
 }
@@ -103,23 +121,32 @@ fn target_backoff_delay(base: Duration, failures: u32) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Bump `target`'s consecutive-failure count and push out its retry time.
+/// Bump `target`'s consecutive-failure count and push out its retry time. A second premium-cap
+/// failure in a row backs the target off for [`PREMIUM_CAP_BACKOFF`].
 fn bump_target_backoff(
     backoffs: &mut HashMap<Pubkey, BackoffState>,
     target: &Pubkey,
     base: Duration,
     kind: &str,
+    premium_cap: bool,
 ) {
-    let failures = match backoffs.get(target) {
-        Some(BackoffState::Target(backoff)) => backoff.failures,
-        _ => 0,
-    }
-    .saturating_add(1);
-    let delay = target_backoff_delay(base, failures);
+    let (failures, repeated_premium_cap) = match backoffs.get(target) {
+        Some(BackoffState::Target(backoff)) => {
+            (backoff.failures, premium_cap && backoff.premium_cap)
+        }
+        _ => (0, false),
+    };
+    let failures = failures.saturating_add(1);
+    let delay = if repeated_premium_cap {
+        PREMIUM_CAP_BACKOFF
+    } else {
+        target_backoff_delay(base, failures)
+    };
     backoffs.insert(
         *target,
         BackoffState::Target(TargetBackoff {
             failures,
+            premium_cap,
             retry_after: Instant::now() + delay,
         }),
     );
@@ -146,10 +173,6 @@ pub struct Executor {
     backoffs: Mutex<HashMap<Pubkey, BackoffState>>,
     /// Count sequential fallback uses so logs reveal how often the non-bundle path is exercised.
     sequential_fallbacks: AtomicU64,
-    /// Held from assembling an inventory plan until it has landed or failed: plans spending the
-    /// wallet must not be sized against the same balance, and the block engine admits one bundle
-    /// at a time anyway.
-    inventory_lock: Mutex<()>,
 }
 
 impl Executor {
@@ -173,19 +196,7 @@ impl Executor {
             tip_estimator: TipEstimator::new(tip_max_lamports),
             backoffs: Mutex::new(HashMap::new()),
             sequential_fallbacks: AtomicU64::new(0),
-            inventory_lock: Mutex::new(()),
         }
-    }
-
-    /// Held while anything spends or sells wallet tokens: an inventory plan, or the rebalancer's
-    /// sweep, which must not sell the tokens a plan was sized against.
-    ///
-    /// A plan that panicked poisons the lock, but the lock guards no data: the wallet balances are
-    /// re-read before every plan, so the next holder can safely proceed.
-    pub fn lock_inventory(&self) -> MutexGuard<'_, ()> {
-        self.inventory_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Whether `try_execute` would skip `intent` for now: its liability mint has no swap route, or
@@ -195,13 +206,11 @@ impl Executor {
             || self.is_backed_off(&intent.liquidatee_account.address)?)
     }
 
-    /// Assemble, gate, simulate-first, and land a single liquidation. `refresh` re-sizes the
-    /// intent on the current state, `None` when the account is no longer worth liquidating.
+    /// Assemble, gate, and land a single liquidation, sized on the current state by the caller.
     pub fn try_execute(
         &self,
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
-        refresh: &dyn Fn() -> Result<Option<PreparedLiquidatableAccount>>,
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
 
@@ -227,9 +236,9 @@ impl Executor {
         // A sandwich funds itself from the seized collateral: no wallet inventory, no bundle, no
         // serialization. Simulated during assembly; the RPC preflight is the second check.
         match strategy.assemble_sandwich(intent) {
-            Ok(Sandwich::Plan(ExecutionPlan { txs })) => {
+            Ok(Sandwich::Plan(ExecutionPlan { txs, .. })) => {
                 let result = self.send_over_rpc(&txs, "Sandwich");
-                self.note_outcome(&liquidatee, result.is_err());
+                self.note_result(&liquidatee, &result);
                 self.refresh_wallet_balances();
                 return result;
             }
@@ -240,51 +249,50 @@ impl Executor {
             }
         };
 
-        // Inventory plans run one at a time, end to end.
         debug!(
-            "{}: no sandwich for {}; waiting for the inventory lock",
+            "{}: no sandwich for {}; funding it from the wallet",
             strategy.name(),
             liquidatee
         );
-        let _inventory = self.lock_inventory();
-        // Other plans or a rebalance may have held the lock for a while; competitors may have
-        // taken the account meanwhile.
-        let intent = match refresh()? {
-            Some(fresh)
-                if fresh.asset_bank == intent.asset_bank && fresh.liab_bank == intent.liab_bank =>
-            {
-                fresh
-            }
-            Some(_) => {
-                info!(
-                    "Leaving {} to the next attempt: its best bank pair changed while waiting for the inventory lock",
-                    liquidatee
-                );
-                return Ok(());
-            }
-            None => {
-                info!(
-                    "Dropping the liquidation of {}: no longer worth it after waiting for the inventory lock",
-                    liquidatee
-                );
-                return Ok(());
+        self.execute_with_inventory(strategy, intent, liab_mint)
+    }
+
+    /// Brings the cached wallet balances up to the moment of the call, after a liquidation or sell
+    /// that may have changed them; the Geyser updates reporting that are only applied when the
+    /// liquidator loop drains them.
+    ///
+    /// The balances are re-read until the read is at or past the slot the RPC was at when this was
+    /// called, which is at or past the slot of any transaction the caller saw confirm. The token
+    /// cache never lets an older read replace a newer one, so once this returns, the tokens the
+    /// caller spent can no longer look free, and its claim on them can be released.
+    pub fn refresh_wallet_balances(&self) {
+        let settled_at = match self
+            .rpc_client
+            .get_slot_with_commitment(CommitmentConfig::processed())
+        {
+            Ok(slot) => slot,
+            Err(e) => {
+                warn!("Failed to read the slot before refreshing the wallet balances: {e}");
+                0
             }
         };
-        let result = self.execute_with_inventory(strategy, &intent, liab_mint);
-        self.refresh_wallet_balances();
-        result
-    }
-
-    /// A landed liquidation or sell changed the wallet's balances, and the Geyser updates reporting
-    /// that are only applied when the liquidator loop drains them. Anything sizing a swap from the
-    /// cache before then (the next inventory plan, the rebalancer's sweep) needs the real balances.
-    pub fn refresh_wallet_balances(&self) {
-        if let Err(e) = self.cache.refresh_wallet_tokens(&self.rpc_client) {
-            warn!("Failed to refresh the wallet balances: {e}");
+        for _ in 0..SETTLE_ATTEMPTS {
+            match self.cache.refresh_wallet_tokens(&self.rpc_client) {
+                Ok(read_at) if read_at >= settled_at => return,
+                Ok(read_at) => debug!(
+                    "Wallet balances read at slot {read_at}, short of {settled_at}; reading again"
+                ),
+                Err(e) => warn!("Failed to refresh the wallet balances: {e}"),
+            }
+            thread::sleep(SETTLE_RETRY_INTERVAL);
         }
+        warn!(
+            "The wallet balances could not be read at or past slot {settled_at}; releasing the claim on the last read"
+        );
     }
 
-    /// Assemble and land a plan that spends wallet inventory. Caller holds the inventory lock.
+    /// Assemble and land a plan that spends wallet inventory, then re-read the wallet balances
+    /// before releasing the tokens it claimed, so the spent tokens never look free.
     fn execute_with_inventory(
         &self,
         strategy: &dyn LiquidationStrategy,
@@ -302,27 +310,42 @@ impl Executor {
             }
         };
 
+        let ExecutionPlan { txs, claim } = plan;
+        let result = self.land_inventory_plan(&liquidatee, &txs);
+        self.refresh_wallet_balances();
+        drop(claim);
+        result
+    }
+
+    /// One transaction goes directly over RPC, whose preflight is the simulation; a bundle would
+    /// add nothing but the block engine's latency. A buy plus liquidation is simulated first, then
+    /// sent as an atomic bundle.
+    fn land_inventory_plan(&self, liquidatee: &Pubkey, txs: &[VersionedTransaction]) -> Result<()> {
+        if txs.len() == 1 {
+            let result = self.send_over_rpc(txs, "Inventory");
+            self.note_result(liquidatee, &result);
+            return result;
+        }
+
         // Simulate-first. The outcome dispatches three ways:
         //  - ran & ok                 -> bundle send
         //  - ran & program error      -> skip (doomed on-chain; don't burn tip+fees)
         //  - couldn't run (infra err) -> sequential RPC send (no bundle)
-        let ExecutionPlan { txs } = plan;
-        let mut attempt_failed = false;
+        let mut failure: Option<String> = None;
         let result = match self.jito.simulate_bundle(
             &self.rpc_url,
             self.bundle_api_key.as_deref(),
-            &txs,
+            txs,
             &[],
         ) {
-            Ok(sim) if sim.succeeded => self.submit(&txs),
+            Ok(sim) if sim.succeeded => self.submit(txs),
             Ok(sim) => {
+                let message = sim.error_message.unwrap_or_default();
                 warn!(
                     "Skipping {}: simulation reports the liquidation would fail (tx index {:?}): {}",
-                    liquidatee,
-                    sim.failed_tx_index,
-                    sim.error_message.unwrap_or_default()
+                    liquidatee, sim.failed_tx_index, message
                 );
-                attempt_failed = true;
+                failure = Some(message);
                 Ok(())
             }
             Err(e) => {
@@ -330,21 +353,23 @@ impl Executor {
                     "simulateBundle unavailable for {} ({}); sending sequentially",
                     liquidatee, e
                 );
-                self.submit_sequential(&txs)
+                self.submit_sequential(txs)
             }
         };
 
-        self.note_outcome(&liquidatee, attempt_failed || result.is_err());
+        match (&failure, &result) {
+            (Some(message), _) => self.note_execution_failure(liquidatee, message),
+            (None, result) => self.note_result(liquidatee, result),
+        }
         result
     }
 
     /// Back off a target whose execution failed just like a failed assembly: every retry
     /// re-quotes the DEX without landing anything.
-    fn note_outcome(&self, liquidatee: &Pubkey, failed: bool) {
-        if failed {
-            self.note_execution_failure(liquidatee);
-        } else {
-            self.clear_target_backoff(liquidatee);
+    fn note_result(&self, liquidatee: &Pubkey, result: &Result<()>) {
+        match result {
+            Ok(()) => self.clear_target_backoff(liquidatee),
+            Err(e) => self.note_execution_failure(liquidatee, &e.to_string()),
         }
     }
 
@@ -406,16 +431,22 @@ impl Executor {
             return Ok(());
         }
 
-        bump_target_backoff(&mut guard, target, ASSEMBLE_BACKOFF_BASE, "assemble");
+        bump_target_backoff(&mut guard, target, ASSEMBLE_BACKOFF_BASE, "assemble", false);
         Ok(())
     }
 
     /// Record an execution failure: the plan assembled, but the liquidation could not be landed
     /// (simulation says it would revert, or the send failed). Same exponential backoff as an
-    /// assemble failure.
-    fn note_execution_failure(&self, target: &Pubkey) {
+    /// assemble failure, and a long one for a repeated premium-cap rejection.
+    fn note_execution_failure(&self, target: &Pubkey, message: &str) {
         if let Ok(mut guard) = self.backoffs.lock() {
-            bump_target_backoff(&mut guard, target, EXECUTION_BACKOFF_BASE, "execution");
+            bump_target_backoff(
+                &mut guard,
+                target,
+                EXECUTION_BACKOFF_BASE,
+                "execution",
+                is_premium_cap_failure(message),
+            );
         }
     }
 
@@ -619,5 +650,70 @@ impl Executor {
                 resends += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn retry_in(backoffs: &HashMap<Pubkey, BackoffState>, target: &Pubkey) -> Duration {
+        backoffs[target]
+            .retry_after()
+            .saturating_duration_since(Instant::now())
+    }
+
+    #[test]
+    fn a_second_premium_cap_failure_in_a_row_backs_off_long() {
+        let mut backoffs = HashMap::new();
+        let target = Pubkey::new_unique();
+        bump_target_backoff(
+            &mut backoffs,
+            &target,
+            EXECUTION_BACKOFF_BASE,
+            "execution",
+            true,
+        );
+        assert!(retry_in(&backoffs, &target) <= EXECUTION_BACKOFF_BASE);
+        bump_target_backoff(
+            &mut backoffs,
+            &target,
+            EXECUTION_BACKOFF_BASE,
+            "execution",
+            true,
+        );
+        assert!(retry_in(&backoffs, &target) > TARGET_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn other_failures_keep_the_exponential_backoff() {
+        let mut backoffs = HashMap::new();
+        let target = Pubkey::new_unique();
+        bump_target_backoff(
+            &mut backoffs,
+            &target,
+            EXECUTION_BACKOFF_BASE,
+            "execution",
+            true,
+        );
+        bump_target_backoff(
+            &mut backoffs,
+            &target,
+            EXECUTION_BACKOFF_BASE,
+            "execution",
+            false,
+        );
+        assert!(retry_in(&backoffs, &target) <= EXECUTION_BACKOFF_BASE * 2);
+    }
+
+    #[test]
+    fn recognizes_the_premium_cap_error() {
+        assert!(is_premium_cap_failure(
+            "Error processing Instruction 4: custom program error: 0x17ca"
+        ));
+        assert!(is_premium_cap_failure(
+            "Error Code: LiquidationPremiumTooHigh. Error Number: 6090."
+        ));
+        assert!(!is_premium_cap_failure("custom program error: 0x17b4"));
     }
 }

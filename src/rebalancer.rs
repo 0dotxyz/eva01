@@ -1,6 +1,7 @@
 use crate::{
     cache::Cache,
     config::Eva01Config,
+    execution::reservations::{Claim, TokenReservations},
     utils::{accessor, rate_limiter::RateLimiter},
 };
 use fixed::types::I80F48;
@@ -71,10 +72,19 @@ const MIN_SELL_PRICE_VS_ORACLE: I80F48 = I80F48!(0.95);
 /// not on every pass.
 const SKIP_WARN_INTERVAL: Duration = Duration::from_secs(1200);
 
+/// One rebalancing pass: how many sells it attempted, each of which may have changed the wallet
+/// even if it failed, and the tokens it claimed to sell. The claim is released once the wallet
+/// balances have been re-read, so sold tokens never look free to a liquidation.
+pub struct RebalancePass {
+    pub sells: usize,
+    pub claim: Claim,
+}
+
 /// The rebalancer keeps the liquidator holding only the swap mint (USDC). Every other token it
 /// ends up with (a liquidation's leftover liability or seized collateral, or a JIT-buy overshoot)
 /// is sold back to USDC on the next pass. Nothing is bought here and no inventory is maintained:
 /// liabilities are funded during the liquidation itself, so this is a pure sell-to-USDC sweep.
+/// Tokens a liquidation in flight has claimed are left alone.
 pub struct Rebalancer {
     swap_mint: Pubkey,
     tokio_rt: Runtime,
@@ -87,10 +97,15 @@ pub struct Rebalancer {
     held_stake: HashMap<Pubkey, u64>,
     /// Reports each unpriceable token at most once per [`SKIP_WARN_INTERVAL`].
     skip_warnings: RateLimiter<Pubkey>,
+    reservations: Arc<TokenReservations>,
 }
 
 impl Rebalancer {
-    pub fn new(config: Eva01Config, cache: Arc<Cache>) -> anyhow::Result<Self> {
+    pub fn new(
+        config: Eva01Config,
+        cache: Arc<Cache>,
+        reservations: Arc<TokenReservations>,
+    ) -> anyhow::Result<Self> {
         let swap_mint = config.swap_mint;
 
         let tokio_rt = Builder::new_multi_thread()
@@ -130,6 +145,7 @@ impl Rebalancer {
             unsweepable_mints: HashMap::new(),
             held_stake: HashMap::new(),
             skip_warnings: RateLimiter::new(SKIP_WARN_INTERVAL),
+            reservations,
         })
     }
 
@@ -141,10 +157,11 @@ impl Rebalancer {
         Arc::clone(&self.dex_gate)
     }
 
-    /// Sell every non-swap-mint token the wallet holds (above the dust floor) back to the swap mint.
-    /// Returns how many sells were attempted: each may have changed the wallet, even a failed one.
-    pub fn run(&mut self) -> anyhow::Result<usize> {
+    /// Sell every unclaimed non-swap-mint token the wallet holds (above the dust floor) back to the
+    /// swap mint.
+    pub fn run(&mut self) -> anyhow::Result<RebalancePass> {
         let mut sells = 0;
+        let mut claim = self.reservations.new_claim();
         info!("Running the Rebalancing process...");
 
         for mint in self.cache.mints.get_mints() {
@@ -205,11 +222,13 @@ impl Rebalancer {
                 }
             };
 
-            if wrapper.balance == 0 {
+            // A liquidation in flight may be about to repay with some of it.
+            let amount = self.reservations.unclaimed(&mint, wrapper.balance);
+            if amount == 0 {
                 continue;
             }
 
-            let value = match wrapper.get_value() {
+            let held_value = match wrapper.get_value() {
                 Ok(value) => value,
                 Err(e) => {
                     if self.skip_warnings.allow(mint, Instant::now()) {
@@ -221,26 +240,37 @@ impl Rebalancer {
                     continue;
                 }
             };
+            let value = held_value * I80F48::from_num(amount) / I80F48::from_num(wrapper.balance);
 
             if value < MIN_REBALANCE_VALUE {
                 continue;
             }
 
+            // Claimed so no liquidation counts the tokens being sold. A liquidation may have
+            // claimed some in the meantime; then this sells only what is still free.
+            let amount =
+                self.reservations
+                    .claim_available(&mut claim, mint, amount, wrapper.balance);
+            if amount == 0 {
+                continue;
+            }
+            let value = held_value * I80F48::from_num(amount) / I80F48::from_num(wrapper.balance);
+
             info!(
                 "Selling {} of {} (~${}) back to the swap mint.",
-                wrapper.balance,
+                amount,
                 mint,
                 value.to_num::<f64>()
             );
             sells += 1;
-            if let Err(e) = self.swap(wrapper.balance, mint, self.swap_mint, value) {
+            if let Err(e) = self.swap(amount, mint, self.swap_mint, value) {
                 error!("Rebalance swap failed for {}: {}", mint, e);
             }
         }
 
         info!("The Rebalancing process is complete.");
 
-        Ok(sells)
+        Ok(RebalancePass { sells, claim })
     }
 
     /// Whether `mint` is the LST of a staked collateral bank.

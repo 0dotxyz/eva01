@@ -6,6 +6,7 @@ use crate::{
         executor::Executor,
         inventory::InventoryStrategy,
         queue::{ExecutionQueue, QueuedIntent},
+        reservations::TokenReservations,
     },
     geyser::{AccountType, GeyserUpdate},
     rebalancer::Rebalancer,
@@ -37,7 +38,7 @@ use marginfi::{
     },
 };
 use marginfi_type_crate::{
-    constants::BANKRUPT_THRESHOLD,
+    constants::{ASSET_TAG_JUPLEND, ASSET_TAG_KAMINO, BANKRUPT_THRESHOLD},
     types::{
         reconcile_emode_configs, BalanceSide, Bank, BankOperationalState, EmodeConfig,
         HealthPriceMode, MarginfiAccount, MarginfiGroup, OracleSetup, ReconciledEmodeConfig,
@@ -77,6 +78,28 @@ const PREMIUM_SAFETY_MARGIN: I80F48 = I80F48!(0.005);
 /// Liquidations are sized to this share of the most the program allows, leaving room for price
 /// moves between evaluation and landing; profit is judged on the same share.
 const LIQUIDATION_SIZE_HAIRCUT: I80F48 = I80F48!(0.90);
+
+/// A pair that is cheaper to execute wins unless the heavier one earns more than this share more:
+/// landing first matters far more than the last few cents of premium.
+const PAIR_PROFIT_TIE_MARGIN: I80F48 = I80F48!(0.30);
+
+/// How much heavier seizing from a bank makes the liquidation transaction. An integration bank
+/// (Kamino, JupLend) withdraws through its venue, adding the accounts an in-tx swap would need to
+/// fit under the account-lock limit.
+fn seize_weight(asset_tag: u8) -> u8 {
+    u8::from(matches!(asset_tag, ASSET_TAG_KAMINO | ASSET_TAG_JUPLEND))
+}
+
+/// Whether a pair earning `profit` and seizing at `weight` should replace the best so far: a
+/// lighter pair wins unless the heavier one earns more than [`PAIR_PROFIT_TIE_MARGIN`] more.
+fn is_better_pair(profit: I80F48, weight: u8, best_profit: I80F48, best_weight: u8) -> bool {
+    let margin = I80F48::ONE + PAIR_PROFIT_TIE_MARGIN;
+    match weight.cmp(&best_weight) {
+        std::cmp::Ordering::Equal => profit > best_profit,
+        std::cmp::Ordering::Less => profit * margin >= best_profit,
+        std::cmp::Ordering::Greater => profit > best_profit * margin,
+    }
+}
 
 /// How often each unhealthy account we are not liquidating is reported.
 const SKIP_REPORT_INTERVAL: Duration = Duration::from_secs(1200);
@@ -243,7 +266,10 @@ impl Liquidator {
         stop_liquidator: Arc<AtomicBool>,
         cache: Arc<Cache>,
     ) -> Result<Self> {
-        let rebalancer = Rebalancer::new(config.clone(), cache.clone())?;
+        // Shared by the liquidation plans and the rebalancer, so neither spends tokens the other
+        // has claimed.
+        let reservations = TokenReservations::new();
+        let rebalancer = Rebalancer::new(config.clone(), cache.clone(), reservations.clone())?;
         let dex_client = rebalancer.dex_client();
         let dex_gate = rebalancer.dex_gate();
 
@@ -271,6 +297,7 @@ impl Liquidator {
             dex_gate,
             config.slippage_bps,
             config.min_profit,
+            reservations,
         )?;
 
         Ok(Liquidator {
@@ -297,7 +324,9 @@ impl Liquidator {
             .rebalancer
             .take()
             .ok_or_else(|| anyhow!("the Liquidator was already started"))?;
-        rebalancer.run()?;
+        if rebalancer.run()?.sells > 0 {
+            self.executor.refresh_wallet_balances();
+        }
         self.spawn_threads(rebalancer)?;
 
         // Geyser only delivers changes, so an account that is already underwater at startup would
@@ -447,6 +476,7 @@ impl Liquidator {
             account_type,
             address,
             account,
+            slot,
         } = update;
 
         debug!("Processing the {:?} {:?} update.", account_type, address);
@@ -487,7 +517,9 @@ impl Liquidator {
                 self.add_accounts_for_bank(&address, account_addresses)?;
             }
             AccountType::Token => {
-                self.cache.tokens.try_update_account(address, account)?;
+                self.cache
+                    .tokens
+                    .try_update_account(address, account, slot)?;
             }
         }
         Ok(())
@@ -597,8 +629,7 @@ fn attempt_liquidation(
     // taken a chunk of the account or prices may have moved, so it is re-sized on the current
     // state and dropped if it is no longer worth it, instead of sending a transaction the program
     // would reject.
-    let refresh = || evaluator.re_evaluate(&liquidatee);
-    match refresh() {
+    match evaluator.re_evaluate(&liquidatee) {
         Ok(Some(fresh)) if executor.is_on_hold(&fresh).unwrap_or(false) => {
             debug!(
                 "Skipping {}: it or its liability mint is backed off after a recent failure",
@@ -615,7 +646,7 @@ fn attempt_liquidation(
                 intent.profit.to_num::<f64>(),
                 queued_at.elapsed().as_millis()
             );
-            if let Err(e) = executor.try_execute(strategy, &fresh, &refresh) {
+            if let Err(e) = executor.try_execute(strategy, &fresh) {
                 error!(
                     "Failed to execute liquidation for {:?}: {:?}",
                     liquidatee, e
@@ -644,11 +675,15 @@ fn run_rebalancer(mut rebalancer: Rebalancer, executor: &Executor, requests: &Re
     while let Ok(()) | Err(RecvTimeoutError::Timeout) =
         requests.recv_timeout(IDLE_REBALANCE_INTERVAL)
     {
-        let _inventory = executor.lock_inventory();
         match panic::catch_unwind(AssertUnwindSafe(|| rebalancer.run())) {
-            // The next inventory plan sizes from the cached balances as soon as the lock is free.
-            Ok(Ok(sells)) if sells > 0 => executor.refresh_wallet_balances(),
-            Ok(Ok(_)) => {}
+            // Liquidations size from the cached balances; the sold tokens stay claimed until the
+            // balances show them gone.
+            Ok(Ok(pass)) => {
+                if pass.sells > 0 {
+                    executor.refresh_wallet_balances();
+                }
+                drop(pass.claim);
+            }
             Ok(Err(error)) => error!("Rebalancing failed: {:?}", error),
             Err(_) => {
                 error!("Rebalancing panicked.");
@@ -940,9 +975,14 @@ impl Evaluator {
 
         // Which collateral is seized and which debt is repaid decides how much the program lets a
         // liquidation take, so every pair is sized and the most profitable one wins.
-        let mut best: Option<(Pubkey, Pubkey, LiquidationAmounts)> = None;
+        let mut best: Option<(Pubkey, Pubkey, LiquidationAmounts, u8)> = None;
         let mut any_taggable = false;
         for asset_bank in asset_banks {
+            let weight = cache
+                .banks
+                .try_get_bank(asset_bank)
+                .map(|bank| seize_weight(bank.bank.config.asset_tag))
+                .unwrap_or(0);
             for liab_bank in liab_banks {
                 let amounts = cache
                     .banks
@@ -972,16 +1012,20 @@ impl Evaluator {
                     }
                 };
                 any_taggable |= amounts.taggable;
-                if best
-                    .as_ref()
-                    .is_none_or(|(_, _, b)| amounts.liquidator_profit > b.liquidator_profit)
-                {
-                    best = Some((*asset_bank, *liab_bank, amounts));
+                if best.as_ref().is_none_or(|(_, _, b, best_weight)| {
+                    is_better_pair(
+                        amounts.liquidator_profit,
+                        weight,
+                        b.liquidator_profit,
+                        *best_weight,
+                    )
+                }) {
+                    best = Some((*asset_bank, *liab_bank, amounts, weight));
                 }
             }
         }
         // Tagging helps every pair, so it is worth it when any pair would profit from it.
-        Ok(best.map(|(asset_bank, liab_bank, amounts)| Sizing {
+        Ok(best.map(|(asset_bank, liab_bank, amounts, _)| Sizing {
             asset_bank,
             liab_bank,
             amounts: LiquidationAmounts {
@@ -1275,5 +1319,37 @@ mod bank_solvency_tests {
         let mut in_bad_debt = bank(100, 90);
         in_bad_debt.liability_share_value = I80F48::from_num(1.2).into();
         assert!(!bank_covers_its_borrows(&in_bad_debt).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod pair_preference_tests {
+    use super::*;
+
+    #[test]
+    fn a_lighter_pair_wins_within_the_margin() {
+        // Plain SOL earning 20% less than Kamino SOL is still the better pair.
+        assert!(is_better_pair(I80F48!(0.8), 0, I80F48!(1), 1));
+        // Kamino SOL needs more than 30% more to beat plain SOL.
+        assert!(!is_better_pair(I80F48!(1.25), 1, I80F48!(1), 0));
+        assert!(is_better_pair(I80F48!(1.31), 1, I80F48!(1), 0));
+    }
+
+    #[test]
+    fn a_much_better_heavier_pair_still_wins() {
+        assert!(!is_better_pair(I80F48!(0.5), 0, I80F48!(1), 1));
+    }
+
+    #[test]
+    fn equal_weights_compare_on_profit() {
+        assert!(is_better_pair(I80F48!(1.001), 0, I80F48!(1), 0));
+        assert!(!is_better_pair(I80F48!(1), 0, I80F48!(1), 0));
+    }
+
+    #[test]
+    fn integration_banks_are_heavier() {
+        assert_eq!(seize_weight(ASSET_TAG_KAMINO), 1);
+        assert_eq!(seize_weight(ASSET_TAG_JUPLEND), 1);
+        assert_eq!(seize_weight(0), 0);
     }
 }
