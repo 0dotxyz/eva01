@@ -1,6 +1,8 @@
 use crate::{
     config::Eva01Config,
-    utils::{account_update_to_account, decode_bank},
+    utils::{
+        account_update_to_account, decode_bank, INITIAL_RECONNECT_BACKOFF, MAX_RECONNECT_BACKOFF,
+    },
     ward,
 };
 use anchor_lang::AccountDeserialize;
@@ -24,8 +26,6 @@ use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::prelude::*;
 
 const RATE_LIMIT_LOG_INTERVAL_SECS: u64 = 60;
-const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 /// A stream silent for this long is dead: the slot subscription alone delivers several messages a
 /// second.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5);

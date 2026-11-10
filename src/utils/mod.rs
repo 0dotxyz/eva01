@@ -8,6 +8,11 @@ pub mod pyth_push;
 pub mod rate_limiter;
 pub mod rent_sysvar;
 
+/// A dropped stream (Geyser, Hermes) is reconnected after this, doubling per failed attempt up to
+/// [`MAX_RECONNECT_BACKOFF`].
+pub const INITIAL_RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+pub const MAX_RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
 use anyhow::{anyhow, Error, Result};
 use backoff::ExponentialBackoff;
 use log::{debug, error};

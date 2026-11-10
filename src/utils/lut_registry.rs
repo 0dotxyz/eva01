@@ -1,8 +1,8 @@
 //! Eva's own address lookup tables.
 //!
 //! Every liquidation references the group's banks, vaults, oracles and venue accounts, far more
-//! than fit in a 1232-byte transaction as 32-byte keys. The registry keeps those addresses in
-//! lookup tables the wallet owns, so the transaction compiler can shrink each one to an index:
+//! than fit in a v0 transaction (`MAX_V0_TX_SIZE`) as 32-byte keys. The registry keeps those
+//! addresses in lookup tables the wallet owns, so the transaction compiler can shrink each one to an index:
 //!
 //! - at startup the tables already on-chain (authority = the wallet) are discovered, and every
 //!   address the liquidation instructions can reference is added to them if missing;
@@ -46,7 +46,8 @@ use solana_signer::Signer;
 /// u64`, `last_extended_slot_start_index: u8`, then `authority: Option<Pubkey>` (1-byte tag + key).
 const AUTHORITY_OFFSET: usize = 22;
 /// Addresses one table can hold.
-const TABLE_CAPACITY: usize = 256;
+const TABLE_CAPACITY: usize =
+    solana_address_lookup_table_interface::state::LOOKUP_TABLE_MAX_ADDRESSES;
 /// Addresses one `extend` instruction can add.
 const EXTEND_CHUNK: usize = 20;
 

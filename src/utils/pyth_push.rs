@@ -26,20 +26,15 @@ use anchor_lang::AccountDeserialize;
 use pyth_solana_receiver_sdk::pda::get_config_address;
 
 use crate::config::Eva01Config;
+use crate::transaction_limits::{MAX_BUNDLE_TXS, MAX_COMPUTE_UNIT_LIMIT, MAX_V0_TX_SIZE};
 use crate::utils::pyth_cranker::{
     close_encoded_vaa_ix, fetch_hermes_update, guardian_set_index, init_encoded_vaa_ix,
     update_price_feed_ix, verify_encoded_vaa_ix, write_encoded_vaa_ix, VAA_HEADER_SIZE,
     VAA_SPLIT_INDEX,
 };
 
-/// Max serialized size of a v0 transaction, which is what a Jito bundle can carry.
-const MAX_TX_SIZE: usize = 1232;
-
-/// A Jito bundle holds five transactions; the liquidation and the tip take two of them.
-pub const MAX_PUSH_TXS: usize = 3;
-
-/// Compute budget of each push transaction: VAA verification is the heaviest step.
-const PUSH_CU_LIMIT: u32 = 1_400_000;
+/// The push transactions a bundle has room for: the liquidation and the tip take two.
+pub const MAX_PUSH_TXS: usize = MAX_BUNDLE_TXS - 2;
 
 pub struct PythPusher {
     wormhole_program_id: Pubkey,
@@ -215,15 +210,18 @@ impl PythPusher {
         blockhash: solana_message::Hash,
     ) -> Result<VersionedTransaction> {
         let mut all = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(PUSH_CU_LIMIT),
+            // VAA verification is the heaviest step.
+            ComputeBudgetInstruction::set_compute_unit_limit(MAX_COMPUTE_UNIT_LIMIT),
             ComputeBudgetInstruction::set_compute_unit_price(self.cu_price_micro_lamports),
         ];
         all.extend_from_slice(ixs);
         let message = v0::Message::try_compile(&self.payer.pubkey(), &all, &[], blockhash)?;
         let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), signers)?;
         let size = bincode::serialize(&tx)?.len();
-        if size > MAX_TX_SIZE {
-            return Err(anyhow!("transaction is {size} bytes (max {MAX_TX_SIZE})"));
+        if size > MAX_V0_TX_SIZE {
+            return Err(anyhow!(
+                "transaction is {size} bytes (max {MAX_V0_TX_SIZE})"
+            ));
         }
         Ok(tx)
     }

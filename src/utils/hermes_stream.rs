@@ -32,11 +32,12 @@ use crate::{
     cache::{pyth_prices::price_update, Cache},
     config::Eva01Config,
     geyser::{AccountType, GeyserUpdate},
-    utils::pyth_cranker::{hex_encode, price_feed_address},
+    utils::{
+        pyth_cranker::{hex_encode, price_feed_address},
+        INITIAL_RECONNECT_BACKOFF, MAX_RECONNECT_BACKOFF,
+    },
 };
 
-const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 /// A connection that streamed at least this long counts as healthy, resetting the backoff.
 const HEALTHY_CONNECTION: Duration = Duration::from_secs(60);
 

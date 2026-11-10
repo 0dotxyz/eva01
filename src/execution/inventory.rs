@@ -24,10 +24,9 @@ use tokio::runtime::{Builder, Runtime};
 
 use crate::clock_manager;
 use crate::rebalancer::DexGate;
+use crate::transaction_limits::MAX_TX_ACCOUNT_LOCKS;
 use crate::wrappers::{
-    liquidator_account::{
-        locked_accounts, LiquidatorAccount, PreparedLiquidatableAccount, MAX_TX_ACCOUNT_LOCKS,
-    },
+    liquidator_account::{locked_accounts, LiquidatorAccount, PreparedLiquidatableAccount},
     oracle::OracleWrapper,
     token_account::TokenAccountWrapper,
 };

@@ -37,6 +37,10 @@ use std::{collections::HashSet, sync::Arc};
 
 use crate::execution::Landing;
 use crate::juplend_ixs::juplend_underlying_amount;
+use crate::transaction_limits::{
+    priority_fee_lamports, MAX_COMPUTE_UNIT_LIMIT, MAX_LOADED_ACCOUNTS_DATA, MAX_TX_ACCOUNT_LOCKS,
+    MAX_V0_TX_SIZE, MAX_V1_TX_SIZE,
+};
 
 /// Collateral tags `build_liquidate_tx` can withdraw. Staked banks hold a plain SPL LST, so they go
 /// through the standard withdraw like DEFAULT/SOL.
@@ -46,18 +50,6 @@ pub fn is_seizable_asset_tag(tag: u8) -> bool {
         ASSET_TAG_DEFAULT | ASSET_TAG_SOL | ASSET_TAG_STAKED | ASSET_TAG_KAMINO | ASSET_TAG_JUPLEND
     )
 }
-
-/// Max serialized Solana transaction size on the wire.
-const MAX_TX_SIZE: usize = 1232;
-
-/// Compute budget of a liquidation transaction.
-const LIQUIDATION_CU_LIMIT: u32 = 1_400_000;
-
-/// The account data a v1 transaction may load. Unset in a v1 header means 0, which fails every
-/// transaction, so it is set to the runtime's maximum.
-const V1_MAX_LOADED_ACCOUNTS_DATA: u32 = 64 * 1024 * 1024;
-/// Runtime cap on accounts one transaction may load, LUT-resolved or not.
-pub const MAX_TX_ACCOUNT_LOCKS: usize = 64;
 
 /// Unique accounts the compiled transaction will lock: the payer, every program and every account
 /// meta. (The blockhash is not an account.)
@@ -98,7 +90,7 @@ pub struct LiquidatorAccount {
     rpc_url: String,
     cu_limit_ix: Instruction,
     /// The priority fee of a v1 liquidation transaction, in lamports: the configured price per
-    /// compute unit times [`LIQUIDATION_CU_LIMIT`], as a v1 header states a total.
+    /// compute unit times [`MAX_COMPUTE_UNIT_LIMIT`], as a v1 header states a total.
     v1_priority_fee: u64,
     /// Priority-fee instruction (from `COMPUTE_UNIT_PRICE_MICRO_LAMPORTS`). Without it the heavy
     /// liquidation tx carries a CU limit but no price, so it confirms slowly under load.
@@ -125,11 +117,8 @@ impl LiquidatorAccount {
             group: marginfi_group_id,
             rpc_client,
             rpc_url: config.rpc_url.clone(),
-            cu_limit_ix: ComputeBudgetInstruction::set_compute_unit_limit(LIQUIDATION_CU_LIMIT),
-            v1_priority_fee: config
-                .compute_unit_price_micro_lamports
-                .saturating_mul(u64::from(LIQUIDATION_CU_LIMIT))
-                / 1_000_000,
+            cu_limit_ix: ComputeBudgetInstruction::set_compute_unit_limit(MAX_COMPUTE_UNIT_LIMIT),
+            v1_priority_fee: priority_fee_lamports(config.compute_unit_price_micro_lamports),
             cu_price_ix: ComputeBudgetInstruction::set_compute_unit_price(
                 config.compute_unit_price_micro_lamports,
             ),
@@ -524,7 +513,7 @@ impl LiquidatorAccount {
 
         let tx = self.compile_tx(&signer_pk, ixs, luts)?;
         let size = bincode::serialize(&tx)?.len();
-        if size <= MAX_TX_SIZE {
+        if size <= MAX_V0_TX_SIZE {
             return Ok(tx);
         }
 
@@ -551,7 +540,7 @@ impl LiquidatorAccount {
         Err(anyhow!(
             "transaction is {} bytes (max {}) with {} account(s) no lookup table holds{}",
             size,
-            MAX_TX_SIZE,
+            MAX_V0_TX_SIZE,
             uncovered.len(),
             if learnable.is_empty() {
                 String::new()
@@ -575,8 +564,8 @@ impl LiquidatorAccount {
         }
         let config = v1::TransactionConfig {
             priority_fee: Some(self.v1_priority_fee),
-            compute_unit_limit: Some(LIQUIDATION_CU_LIMIT),
-            loaded_accounts_data_size_limit: Some(V1_MAX_LOADED_ACCOUNTS_DATA),
+            compute_unit_limit: Some(MAX_COMPUTE_UNIT_LIMIT),
+            loaded_accounts_data_size_limit: Some(MAX_LOADED_ACCOUNTS_DATA),
             ..v1::TransactionConfig::empty()
         };
         let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
@@ -585,11 +574,11 @@ impl LiquidatorAccount {
                 .map_err(|e| anyhow!("{e:?}"))?;
         let tx = VersionedTransaction::try_new(VersionedMessage::V1(message), &[&self.signer])?;
         let size = bincode::serialize(&tx)?.len();
-        if size > v1::MAX_TRANSACTION_SIZE {
+        if size > MAX_V1_TX_SIZE {
             return Err(anyhow!(
                 "transaction is {} bytes (max {})",
                 size,
-                v1::MAX_TRANSACTION_SIZE
+                MAX_V1_TX_SIZE
             ));
         }
         Ok(tx)

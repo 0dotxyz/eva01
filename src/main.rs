@@ -32,6 +32,7 @@ mod liquidator;
 mod marginfi_ixs;
 mod rebalancer;
 mod tag_policy;
+mod transaction_limits;
 mod utils;
 #[warn(clippy::type_complexity)]
 mod wrappers;
