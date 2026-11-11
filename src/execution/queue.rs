@@ -142,6 +142,7 @@ mod tests {
             liab_amount: I80F48::ONE,
             profit: I80F48::from_num(profit),
             needs_price_push: false,
+            sandwich_pair: None,
         }
     }
 

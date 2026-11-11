@@ -22,7 +22,7 @@ use crate::{
     wrappers::{
         bank::BankWrapper,
         liquidator_account::{
-            is_seizable_asset_tag, LiquidatorAccount, PreparedLiquidatableAccount,
+            is_seizable_asset_tag, LiquidationPair, LiquidatorAccount, PreparedLiquidatableAccount,
         },
         marginfi_account::{MarginfiAccountWrapper, ObservationAccounts},
         oracle::{oracle_publish_time, OracleWrapper, OracleWrapperTrait},
@@ -108,6 +108,32 @@ fn is_better_pair(profit: I80F48, weight: u8, best_profit: I80F48, best_weight: 
     }
 }
 
+/// Of pairs earning `profit` and seizing at `weight`, in order: the most profitable (the lighter on
+/// a tie), and, when it is heavy, the pair an in-tx swap should take instead if that differs (a
+/// lighter one unless the heavier earns more than [`PAIR_PROFIT_TIE_MARGIN`] more). Indexes into
+/// the pairs; `None` when there are none.
+fn choose_pairs(pairs: impl Iterator<Item = (I80F48, u8)>) -> Option<(usize, Option<usize>)> {
+    let mut main: Option<(usize, I80F48, u8)> = None;
+    let mut sandwich: Option<(usize, I80F48, u8)> = None;
+    for (index, (profit, weight)) in pairs.enumerate() {
+        if main.is_none_or(|(_, best_profit, best_weight)| {
+            profit > best_profit || (profit == best_profit && weight < best_weight)
+        }) {
+            main = Some((index, profit, weight));
+        }
+        if sandwich.is_none_or(|(_, best_profit, best_weight)| {
+            is_better_pair(profit, weight, best_profit, best_weight)
+        }) {
+            sandwich = Some((index, profit, weight));
+        }
+    }
+    let (main, _, main_weight) = main?;
+    let sandwich = sandwich
+        .map(|(index, _, _)| index)
+        .filter(|index| main_weight > 0 && *index != main);
+    Some((main, sandwich))
+}
+
 /// How often each unhealthy account we are not liquidating is reported.
 const SKIP_REPORT_INTERVAL: Duration = Duration::from_secs(1200);
 
@@ -177,9 +203,13 @@ impl LiquidationAmounts {
 
 /// The best bank pair for an unhealthy account and what it allows.
 struct Sizing {
+    /// The most profitable pair.
     asset_bank: Pubkey,
     liab_bank: Pubkey,
     amounts: LiquidationAmounts,
+    /// The pair an in-tx swap should take instead, when the most profitable one seizes from a
+    /// Kamino or JupLend bank and a lighter pair earns nearly as much (`is_better_pair`).
+    sandwich: Option<(Pubkey, Pubkey, LiquidationAmounts)>,
     maintenance_health: I80F48,
     /// The account is healthy on the Pyth prices the chain holds; only newer ones make it
     /// liquidatable.
@@ -703,6 +733,15 @@ fn attempt_liquidation(
                     ""
                 }
             );
+            if let Some(pair) = &fresh.sandwich_pair {
+                debug!(
+                    "{}: a sandwich would seize {} for {} instead (est. profit ${:.4})",
+                    liquidatee,
+                    pair.asset_bank,
+                    pair.liab_bank,
+                    pair.profit.to_num::<f64>()
+                );
+            }
             let mut attempt = activity.attempt(liquidatee);
             match executor.try_execute(strategy, &fresh) {
                 Ok(()) => attempt.succeeded(),
@@ -852,6 +891,7 @@ impl Evaluator {
             asset_bank: asset_bank_pk,
             liab_bank: liab_bank_pk,
             amounts: liquidation_amounts,
+            sandwich,
             maintenance_health,
             needs_price_push,
         }) = self.compute_max_liquidatable_amounts_with_banks(
@@ -907,6 +947,17 @@ impl Evaluator {
                 liquidation_amounts.max_liquidatable_asset_amount, slippage_adjusted_asset_amount, slippage_adjusted_liab_amount
             );
 
+        // Sized like the main pair; a pair the program won't let liquidate is no alternative.
+        let sandwich_pair = sandwich
+            .filter(|(_, _, amounts)| amounts.is_liquidatable())
+            .map(|(asset_bank, liab_bank, amounts)| LiquidationPair {
+                asset_bank,
+                liab_bank,
+                asset_amount: amounts.max_liquidatable_asset_amount * LIQUIDATION_SIZE_HAIRCUT,
+                liab_amount: amounts.max_liquidatable_liab_amount * LIQUIDATION_SIZE_HAIRCUT,
+                profit: amounts.liquidator_profit * LIQUIDATION_SIZE_HAIRCUT,
+            });
+
         Ok(Some(Evaluation::Liquidate(PreparedLiquidatableAccount {
             liquidatee_account: account.clone(),
             observation_accounts,
@@ -916,6 +967,7 @@ impl Evaluator {
             liab_amount: slippage_adjusted_liab_amount,
             profit,
             needs_price_push,
+            sandwich_pair,
         })))
     }
 
@@ -1072,8 +1124,10 @@ impl Evaluator {
         )?;
 
         // Which collateral is seized and which debt is repaid decides how much the program lets a
-        // liquidation take, so every pair is sized and the most profitable one wins.
-        let mut best: Option<(Pubkey, Pubkey, LiquidationAmounts, u8)> = None;
+        // liquidation take, so every pair is sized. The most profitable one wins for a repay from
+        // the wallet; an in-tx swap needs room for its route, so for it a lighter pair wins unless
+        // the heavier earns much more.
+        let mut candidates: Vec<(Pubkey, Pubkey, LiquidationAmounts, u8)> = Vec::new();
         let mut any_taggable = false;
         for asset_bank in asset_banks {
             let weight = cache
@@ -1110,26 +1164,30 @@ impl Evaluator {
                     }
                 };
                 any_taggable |= amounts.taggable;
-                if best.as_ref().is_none_or(|(_, _, b, best_weight)| {
-                    is_better_pair(
-                        amounts.liquidator_profit,
-                        weight,
-                        b.liquidator_profit,
-                        *best_weight,
-                    )
-                }) {
-                    best = Some((*asset_bank, *liab_bank, amounts, weight));
-                }
+                candidates.push((*asset_bank, *liab_bank, amounts, weight));
             }
         }
+        let Some((main, sandwich)) = choose_pairs(
+            candidates
+                .iter()
+                .map(|(_, _, amounts, weight)| (amounts.liquidator_profit, *weight)),
+        ) else {
+            return Ok(None);
+        };
+        let (asset_bank, liab_bank, amounts, _) = candidates[main];
+        let sandwich = sandwich.map(|index| {
+            let (asset_bank, liab_bank, amounts, _) = candidates[index];
+            (asset_bank, liab_bank, amounts)
+        });
         // Tagging helps every pair, so it is worth it when any pair would profit from it.
-        Ok(best.map(|(asset_bank, liab_bank, amounts, _)| Sizing {
+        Ok(Some(Sizing {
             asset_bank,
             liab_bank,
             amounts: LiquidationAmounts {
                 taggable: any_taggable,
                 ..amounts
             },
+            sandwich,
             maintenance_health,
             needs_price_push,
         }))
@@ -1493,6 +1551,22 @@ mod pair_preference_tests {
     fn equal_weights_compare_on_profit() {
         assert!(is_better_pair(I80F48!(1.001), 0, I80F48!(1), 0));
         assert!(!is_better_pair(I80F48!(1), 0, I80F48!(1), 0));
+    }
+
+    #[test]
+    fn a_heavy_most_profitable_pair_gets_a_native_one_for_the_sandwich() {
+        let pairs =
+            |list: &[(f64, u8)]| choose_pairs(list.iter().map(|(p, w)| (I80F48::from_num(*p), *w)));
+        // A Kamino pair earning 1.2 against a native one earning 1: the wallet repay takes the
+        // Kamino one, the sandwich the native one (within the 30% margin).
+        assert_eq!(pairs(&[(1.0, 0), (1.2, 1)]), Some((1, Some(0))));
+        // A native pair is the most profitable: one pair suffices.
+        assert_eq!(pairs(&[(1.2, 0), (1.0, 1)]), Some((0, None)));
+        // A Kamino pair earning far more: the sandwich takes it too.
+        assert_eq!(pairs(&[(1.0, 0), (2.0, 1)]), Some((1, None)));
+        // Only heavy pairs: the sandwich has nothing lighter.
+        assert_eq!(pairs(&[(1.0, 1), (1.1, 1)]), Some((1, None)));
+        assert_eq!(pairs(&[]), None);
     }
 
     #[test]

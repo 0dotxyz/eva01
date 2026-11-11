@@ -42,7 +42,7 @@ mod tests {
 
     #[test]
     fn the_v1_priority_fee_matches_the_price_per_compute_unit() {
-        // 10,000 micro-lamports per CU over 1.4M CU, what the competitors pay.
+        // 10,000 micro-lamports per CU over 1.4M CU.
         assert_eq!(priority_fee_lamports(10_000), 14_000);
         assert_eq!(priority_fee_lamports(0), 0);
         assert_eq!(

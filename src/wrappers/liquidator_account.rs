@@ -77,6 +77,17 @@ fn lookupable_accounts(signer_pk: &Pubkey, ixs: &[Instruction]) -> Vec<Pubkey> {
         .collect()
 }
 
+/// A bank pair to liquidate, sized.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiquidationPair {
+    pub asset_bank: Pubkey,
+    pub liab_bank: Pubkey,
+    pub asset_amount: I80F48,
+    pub liab_amount: I80F48,
+    pub profit: I80F48,
+}
+
+#[derive(Clone)]
 pub struct PreparedLiquidatableAccount {
     pub liquidatee_account: MarginfiAccountWrapper,
     pub observation_accounts: ObservationAccounts,
@@ -88,6 +99,28 @@ pub struct PreparedLiquidatableAccount {
     /// The account is liquidatable only on Pyth prices the chain doesn't hold yet (from
     /// Hermes), so the liquidation must go behind a push of them.
     pub needs_price_push: bool,
+    /// The pair for an in-tx swap, when it differs from the most profitable one above: that one
+    /// seizes from a Kamino or JupLend bank, whose withdrawal leaves less room for the route, and a
+    /// native pair earns nearly as much (`is_better_pair`).
+    pub sandwich_pair: Option<LiquidationPair>,
+}
+
+impl PreparedLiquidatableAccount {
+    /// This liquidation on `sandwich_pair`, when there is one.
+    pub fn for_sandwich(&self) -> std::borrow::Cow<'_, Self> {
+        match &self.sandwich_pair {
+            None => std::borrow::Cow::Borrowed(self),
+            Some(pair) => std::borrow::Cow::Owned(Self {
+                asset_bank: pair.asset_bank,
+                liab_bank: pair.liab_bank,
+                asset_amount: pair.asset_amount,
+                liab_amount: pair.liab_amount,
+                profit: pair.profit,
+                sandwich_pair: None,
+                ..self.clone()
+            }),
+        }
+    }
 }
 
 pub struct LiquidatorAccount {
@@ -369,6 +402,7 @@ impl LiquidatorAccount {
             liab_amount: I80F48::ONE,
             profit: I80F48::ZERO,
             needs_price_push: false,
+            sandwich_pair: None,
         };
         let (ixs, _, record) = self.liquidation_ixs(&intent, I80F48::ONE, I80F48::ONE, None)?;
         Ok(lookupable_accounts(&self.signer.pubkey(), &ixs)

@@ -151,12 +151,10 @@ impl Eva01Config {
 
         let price_push_enabled = std::env::var("PRICE_PUSH_ENABLED").map_or(true, |v| v != "false");
         let jito_block_engine_url = std::env::var("JITO_BLOCK_ENGINE_URL").ok();
-        // Default cap 0.005 SOL: competitors' largest tips on marginfi liquidations (Nov 2026).
         let jito_tip_max_lamports: u64 = std::env::var("JITO_TIP_MAX_LAMPORTS")
             .unwrap_or_else(|_| "5000000".to_string())
             .parse()
             .expect("Invalid JITO_TIP_MAX_LAMPORTS number");
-        // Competitors tipped 6–9% of their profit (Nov 2026).
         let bundle_tip_profit_share = share_from_env("BUNDLE_TIP_PROFIT_SHARE", 0.08);
         let wallet_min_profit_share = share_from_env("LIQUIDATION_WALLET_MIN_PROFIT_SHARE", 0.1);
         let bundle_api_key = std::env::var("JITO_API_KEY").ok();

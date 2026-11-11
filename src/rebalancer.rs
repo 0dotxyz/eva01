@@ -231,8 +231,7 @@ impl Rebalancer {
             }),
             ..Default::default()
         };
-        // A liquidation's venue slower than this loses the race to the others, or the
-        // liquidation to a competitor, anyway.
+        // A liquidation can't wait for a slow venue.
         let liquidation_config = ClientConfig {
             quote_timeout: SWAP_VENUE_TIMEOUT,
             build_timeout: SWAP_VENUE_TIMEOUT,
@@ -316,7 +315,6 @@ impl Rebalancer {
 
             // Mints backed only by integration banks (Kamino/JupLend) have no bank that
             // prices the raw SPL token, so they can never be swept.
-            // Expected to only ever happen on staging.
             if self.cache.banks.try_get_account_for_mint(&mint).is_err() {
                 let balance = self.token_balance(&token);
                 // The condition is permanent, so report a mint only when its held amount changes.
@@ -530,7 +528,7 @@ impl Rebalancer {
             "Swapping {} tokens of mint {} to mint {} (at least {}) ...",
             amount, input_mint, output_mint, min_out
         );
-        // A route that closes the wSOL account pays the SOL out natively; measured to wrap it back.
+        // A route that closes the wSOL account pays out native SOL, measured here to wrap it back.
         let native_before = if output_mint == WSOL {
             Some(self.rpc_client.get_balance(&self.signer.pubkey())?)
         } else {

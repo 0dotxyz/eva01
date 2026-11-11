@@ -273,12 +273,10 @@ const TIP_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// The floor until the first read succeeds.
 const TIP_FALLBACK_LAMPORTS: u64 = 10_000;
 
-/// Jito tips: a share of the bundle's expected profit, between the market's tip floor and a cap.
+/// Jito tips: a share of the bundle's expected profit, between a floor and a cap.
 ///
 /// The floor is the EMA of the 50th-percentile landed tip from Jito's `tip_floor` endpoint,
-/// refreshed hourly on a background thread, so sizing a tip never waits on HTTP. Competitors on
-/// marginfi tipped about 6–9% of their liquidation profit in November 2026, 0.0004–0.0047 SOL,
-/// around Jito's 99th percentile.
+/// refreshed hourly on a background thread, so sizing a tip never waits on HTTP.
 pub struct TipEstimator {
     floor: Arc<Mutex<u64>>,
     max_lamports: u64,
@@ -427,10 +425,16 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
         let started = Instant::now();
         assert!(jito.try_reserve().is_none());
-        assert!(started.elapsed() < Duration::from_millis(10), "the try didn't wait");
+        assert!(
+            started.elapsed() < Duration::from_millis(10),
+            "the try didn't wait"
+        );
         drop(held);
         waiter.join().unwrap();
-        assert!(jito.try_reserve().is_none(), "the waiter took it and used it");
+        assert!(
+            jito.try_reserve().is_none(),
+            "the waiter took it and used it"
+        );
     }
 
     #[test]

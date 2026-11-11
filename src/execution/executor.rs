@@ -44,8 +44,7 @@ use solana_keypair::Keypair;
 
 use super::{ExecutionPlan, Landing, LiquidationStrategy, Sandwich};
 
-/// How often a bundle being watched is asked about at the block engine, which allows about one
-/// request a second across all workers.
+/// How often a watched bundle's status is asked of the block engine.
 const INFLIGHT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// Polls of the liquidation's signature, after an unconfirmed bundle, this far apart.
 const SIGNATURE_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -350,10 +349,9 @@ impl Executor {
         }
     }
 
-    /// While a liquidation behind a price push waits for a bundle slot: the wallet-funded plan
-    /// over RPC, if the chain's prices already let it pass (another push may have landed since
-    /// evaluation, our own among them). Its simulation fits in the wait and costs nothing when it
-    /// fails, which is the usual case; a sandwich isn't tried, as its quote would be spent twice.
+    /// While a liquidation behind a price push waits for a bundle slot: the wallet-funded plan over
+    /// RPC, if the chain's prices already let it pass (another push may have landed). Its
+    /// simulation fits in the wait; a sandwich isn't tried, as its quote would be spent twice.
     fn wallet_plan_while_waiting(
         &self,
         strategy: &dyn LiquidationStrategy,
@@ -384,7 +382,7 @@ impl Executor {
         }
 
         // A sandwich funds itself from the seized collateral and touches no wallet inventory.
-        match strategy.assemble_sandwich(intent, Landing::Rpc) {
+        match strategy.assemble_sandwich(&intent.for_sandwich(), Landing::Rpc) {
             Ok(Sandwich::Plan(ExecutionPlan { tx, .. })) => {
                 // Simulated while it was built: no second check on the way out.
                 // It claims no wallet tokens, so nothing waits for the balances to be re-read.
@@ -405,7 +403,7 @@ impl Executor {
     }
 
     /// Neither plan: the wallet funds too little and no sandwich fits. Backed off like a failed
-    /// assembly, so the next cycles don't quote it again right away.
+    /// assembly.
     fn no_plan(&self, liquidatee: &Pubkey, liab_mint: Pubkey) -> Result<()> {
         let e = anyhow!(
             "no plan for {liquidatee}: the wallet funds too little of it and no sandwich fits"
@@ -515,10 +513,8 @@ impl Executor {
         }
     }
 
-    /// Lands the liquidation as a Jito bundle, behind a push of `feeds` when there are any, in
-    /// the request slot the caller reserved. Nothing is simulated: a bundle that fails doesn't
-    /// land and costs nothing. Fastest first: the wallet-funded plan when it earns enough (no
-    /// quote at all), then the sandwich.
+    /// Lands the liquidation as an unsimulated Jito bundle in `slot`, behind a push of `feeds` when
+    /// there are any: the wallet-funded plan when it earns enough, otherwise the sandwich.
     fn execute_as_bundle(
         &self,
         strategy: &dyn LiquidationStrategy,
@@ -557,7 +553,7 @@ impl Executor {
                 slot,
             );
         }
-        match strategy.assemble_sandwich(intent, Landing::Bundle) {
+        match strategy.assemble_sandwich(&intent.for_sandwich(), Landing::Bundle) {
             Ok(Sandwich::Plan(plan)) => self.land_bundle(
                 strategy,
                 bundles,
@@ -576,7 +572,6 @@ impl Executor {
     }
 
     /// Sends `[push..] [liquidation] [tip]`, the tip a share of the plan's profit, and settles it.
-    /// Nothing goes out if the bundle doesn't land: the push never lands without the liquidation.
     fn land_bundle(
         &self,
         strategy: &dyn LiquidationStrategy,
@@ -668,12 +663,9 @@ impl Executor {
         }
     }
 
-    /// Whether `sig` lands while its `blockhash` is valid. Until that is settled the bundle may
-    /// still land, so the caller keeps its claim on the wallet's tokens and doesn't report a
-    /// failure: a later plan spending the same tokens would fail on chain, and an account
-    /// liquidated late would be backed off. A bundle the block engine reports failed or unknown
-    /// settles it early, which is how most lost auctions end, so a worker isn't held for the
-    /// blockhash's whole life on each of them.
+    /// Whether `sig` lands while its `blockhash` is valid. Until settled, the caller keeps its claim
+    /// and reports no failure, since the bundle may still land. A bundle the block engine reports
+    /// failed or unknown settles it early, as most lost auctions do.
     fn landed_before_expiry(
         &self,
         sig: &Signature,

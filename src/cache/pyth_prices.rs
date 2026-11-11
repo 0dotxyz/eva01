@@ -35,10 +35,9 @@ pub struct SignedUpdate {
     pub update: MerklePriceUpdate,
 }
 
-/// The signed updates kept per feed: Hermes streams one a second, so about 10 s worth. An event
-/// carries only the feeds that published in it, so a thin feed's last update can be behind an
-/// active feed's; a push needs a VAA both are under. A feed quiet for longer than this can't be
-/// pushed together with an active one.
+/// Signed updates kept per feed: about 10 s, at one Hermes event a second. An event carries only
+/// the feeds that published in it, so pushing a quiet feed with an active one needs an older VAA
+/// both are under.
 const SIGNED_HISTORY: usize = 10;
 
 #[derive(Default)]
@@ -86,8 +85,8 @@ impl PythPrices {
         }
     }
 
-    /// Records a signed update streamed for `feed_id`. One already known for its publish time, as
-    /// every event arrives once per stream, is ignored.
+    /// Records a signed update streamed for `feed_id`, ignoring one already known for its publish
+    /// time (each stream delivers every event).
     pub fn record_signed(&self, feed_id: [u8; 32], signed: SignedUpdate) {
         let mut all = self.signed.write().unwrap_or_else(|e| e.into_inner());
         let history = all.entry(feed_id).or_default();
@@ -104,10 +103,9 @@ impl PythPrices {
         }
     }
 
-    /// One VAA and an update per feed, in the order of `feed_ids`: the newest VAA under which
-    /// every feed has an update that `ahead` accepts (given the feed and the update's publish
-    /// time). A push carries a single VAA, and feeds published in different seconds share none
-    /// for their newest updates, so an older one may cover them all. `None` when none does.
+    /// The newest VAA under which every feed in `feed_ids` has an update `ahead` accepts (given the
+    /// feed and the update's publish time), with those updates in order. A push carries one VAA.
+    /// `None` when no VAA covers them all.
     pub fn signed_together(
         &self,
         feed_ids: &[[u8; 32]],
