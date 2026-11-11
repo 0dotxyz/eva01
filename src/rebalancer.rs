@@ -39,6 +39,9 @@ const MAX_CONCURRENT_DEX_CALLS: usize = 2;
 /// keeps the request rate steady instead.
 const DEX_CALL_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How long the other venues still get once one returns a quote that covers a liquidation.
+const LIQUIDATION_QUOTE_GRACE: Duration = Duration::from_millis(100);
+
 /// How long a swap venue gets to quote, or to build its route, before it is left out.
 const SWAP_VENUE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -233,6 +236,7 @@ impl Rebalancer {
         let liquidation_config = ClientConfig {
             quote_timeout: SWAP_VENUE_TIMEOUT,
             build_timeout: SWAP_VENUE_TIMEOUT,
+            quote_grace: Some(LIQUIDATION_QUOTE_GRACE),
             ..client_config.clone()
         };
         let signer = || Keypair::try_from(config.wallet_keypair.as_slice());
