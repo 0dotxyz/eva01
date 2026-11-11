@@ -4,7 +4,7 @@ use crate::{
     config::Eva01Config,
     execution::{
         activity::LiquidationActivity,
-        executor::{Executor, PricePushLanding},
+        executor::{BundleLanding, Executor},
         inventory::InventoryStrategy,
         queue::{ExecutionQueue, QueuedIntent},
         reservations::TokenReservations,
@@ -295,22 +295,28 @@ impl Liquidator {
 
         let rpc_client =
             RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
-        let price_push = if config.price_push_enabled {
-            Some(PricePushLanding {
+        let bundles = if config.price_push_enabled {
+            Some(BundleLanding {
                 pusher: PythPusher::new(&config, cache.clone())?,
                 jito: JitoClient::new(
                     config.jito_block_engine_url.clone(),
                     config.bundle_api_key.clone(),
                 ),
-                tip_estimator: TipEstimator::new(config.jito_tip_max_lamports),
+                tip_estimator: TipEstimator::new(
+                    config.jito_tip_max_lamports,
+                    config.bundle_tip_profit_share,
+                ),
                 signer: Keypair::try_from(config.wallet_keypair.as_slice())?,
-                rpc_url: config.rpc_url.clone(),
-                bundle_api_key: config.bundle_api_key.clone(),
             })
         } else {
             None
         };
-        let executor = Executor::new(rpc_client, cache.clone(), price_push);
+        let executor = Executor::new(
+            rpc_client,
+            cache.clone(),
+            bundles,
+            I80F48::from_num(config.wallet_min_profit_share),
+        );
 
         let strategy = InventoryStrategy::new(
             liquidator_account.clone(),

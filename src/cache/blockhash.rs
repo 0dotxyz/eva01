@@ -15,8 +15,10 @@ use log::{info, warn};
 use solana_client::rpc_client::RpcClient;
 use solana_message::Hash;
 
-/// How often the background refresh asks for a new blockhash: about once a slot (~210 ms).
-pub const REFRESH_INTERVAL: Duration = Duration::from_millis(200);
+/// How often the background refresh asks for a new blockhash. A blockhash stays valid for 150
+/// blocks (about 30 s at ~210 ms slots), and its age only shortens how long a transaction can be
+/// re-sent, so being up to a second old costs nothing that matters.
+pub const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A blockhash this old is no longer served; the caller asks the RPC itself. A blockhash stays
 /// valid for 150 blocks, about 30 s, so this only matters when the refresh has stalled.

@@ -35,8 +35,11 @@ pub struct SignedUpdate {
     pub update: MerklePriceUpdate,
 }
 
-/// The signed updates kept per feed: Hermes streams one a second, so a few seconds' worth.
-const SIGNED_HISTORY: usize = 8;
+/// The signed updates kept per feed: Hermes streams one a second, so about 10 s worth. An event
+/// carries only the feeds that published in it, so a thin feed's last update can be behind an
+/// active feed's; a push needs a VAA both are under. A feed quiet for longer than this can't be
+/// pushed together with an active one.
+const SIGNED_HISTORY: usize = 10;
 
 #[derive(Default)]
 pub struct PythPrices {

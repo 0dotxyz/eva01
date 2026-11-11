@@ -14,6 +14,7 @@ pub mod reservations;
 
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 use anyhow::Result;
+use fixed::types::I80F48;
 use reservations::Claim;
 use solana_transaction::versioned::VersionedTransaction;
 
@@ -24,6 +25,9 @@ pub struct ExecutionPlan {
     /// The wallet tokens the plan repays with, held until it has landed or failed and the
     /// balances have been re-read. `None` for a plan that touches no wallet inventory.
     pub claim: Option<Claim>,
+    /// What the plan is expected to earn (USD): the intent's profit, or the share of it the
+    /// wallet can fund. Sizes the bundle tip and picks between plans.
+    pub profit: I80F48,
 }
 
 /// How a liquidation will be landed, which decides how it is built.
@@ -31,9 +35,9 @@ pub struct ExecutionPlan {
 pub enum Landing {
     /// Sent alone over RPC: a v1 transaction, simulated while it is built.
     Rpc,
-    /// Sent in a Jito bundle after a price push: a v0 transaction, since the block engine cannot
-    /// decode v1, and not simulated alone, since it relies on prices the push has not landed
-    /// yet. The executor simulates the whole bundle instead.
+    /// Sent in a Jito bundle, behind a price push when it needs one: a v0 transaction, since the
+    /// block engine cannot decode v1. Not simulated: a bundle that fails doesn't land and costs
+    /// nothing, and one behind a push relies on prices the chain doesn't hold yet.
     Bundle,
 }
 
@@ -47,15 +51,15 @@ pub enum Landing {
 ///   it repays with in the shared reservations, so any number of them also run in parallel
 ///   without two ever counting the same tokens.
 pub trait LiquidationStrategy {
-    /// Stable name for logs/metrics (e.g. "inventory", "flashloan").
-    fn name(&self) -> &'static str;
-
     /// Assemble the self-funded single-tx plan, or say why the inventory plan is needed instead.
     fn assemble_sandwich(
         &self,
         intent: &PreparedLiquidatableAccount,
         landing: Landing,
     ) -> Result<Sandwich>;
+
+    /// The SOL amount (lamports) worth `usd` at the oracle price, for sizing a tip.
+    fn lamports_for_value(&self, usd: I80F48) -> Result<u64>;
 
     /// Assemble the plan that spends wallet inventory, claiming the tokens it spends.
     fn assemble_with_inventory(

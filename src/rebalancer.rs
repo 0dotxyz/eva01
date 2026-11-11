@@ -12,12 +12,14 @@ use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{error, info, warn};
 use marginfi_type_crate::constants::ASSET_TAG_STAKED;
-use solana_commitment_config::CommitmentLevel;
+use solana_client::rpc_client::RpcClient;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_dex_superagg::{
     ClientConfig, DexSuperAggClient, DflowConfig, JupiterConfig, TitanConfig,
 };
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
+use solana_signer::Signer;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -166,7 +168,17 @@ pub struct Rebalancer {
     /// The working balance per inventory token (USD).
     inventory_target: I80F48,
     cooldown: TradeCooldown,
+    /// Where the last pass stopped early, which the next one starts from.
+    resume_at: Option<Pubkey>,
+    /// Recreates the wallet's wSOL account when a route has closed it.
+    rpc_client: RpcClient,
+    signer: Keypair,
 }
+
+const WSOL: Pubkey = spl_token::native_mint::ID;
+
+/// The size of an SPL token account, whose rent a recreated wSOL account costs.
+const TOKEN_ACCOUNT_SIZE: usize = 165;
 
 impl Rebalancer {
     pub fn new(
@@ -244,6 +256,12 @@ impl Rebalancer {
             inventory_mints,
             inventory_target,
             cooldown: TradeCooldown::default(),
+            resume_at: None,
+            rpc_client: RpcClient::new_with_commitment(
+                config.rpc_url.clone(),
+                CommitmentConfig::confirmed(),
+            ),
+            signer: signer()?,
         })
     }
 
@@ -264,10 +282,20 @@ impl Rebalancer {
         let mut claim = self.reservations.new_claim();
         let started = Instant::now();
         info!("Running the Rebalancing process...");
+        // Everything that repays or seizes SOL needs the account; a closed one makes those fail
+        // until it exists again.
+        if self.wsol_account_closed() {
+            if let Err(e) = self.recreate_wsol_account(0) {
+                error!("Failed to recreate the wSOL account: {:?}", e);
+            }
+        }
 
-        for mint in self.cache.mints.get_mints() {
+        for mint in pass_order(self.cache.mints.get_mints(), self.resume_at) {
             if self.activity.attempted_since(started) {
                 info!("Stopping the Rebalancing process: a liquidation was attempted.");
+                // The next pass starts here, or in a long burst the same first few tokens would
+                // be the only ones ever traded.
+                self.resume_at = Some(mint);
                 return Ok(RebalancePass { trades, claim });
             }
             if mint == self.swap_mint
@@ -377,6 +405,7 @@ impl Rebalancer {
             }
         }
 
+        self.resume_at = None;
         info!("The Rebalancing process is complete.");
 
         Ok(RebalancePass { trades, claim })
@@ -497,6 +526,12 @@ impl Rebalancer {
             "Swapping {} tokens of mint {} to mint {} (at least {}) ...",
             amount, input_mint, output_mint, min_out
         );
+        // A route that closes the wSOL account pays the SOL out natively; measured to wrap it back.
+        let native_before = if output_mint == WSOL {
+            Some(self.rpc_client.get_balance(&self.signer.pubkey())?)
+        } else {
+            None
+        };
 
         let (prepared, signature) = self.tokio_rt.block_on(async {
             // The gate admits aggregator calls only; waiting for the confirmation must not hold a
@@ -519,8 +554,121 @@ impl Rebalancer {
             prepared.aggregator, signature, prepared.min_out_amount, output_mint
         );
 
+        if let Some(before) = native_before {
+            self.wrap_unwrapped_sol(before, signature);
+        }
+
         Ok(prepared.min_out_amount)
     }
+
+    /// Whether the cache shows the wallet's wSOL account closed (Geyser reports a closed account
+    /// with no data).
+    fn wsol_account_closed(&self) -> bool {
+        self.cache
+            .tokens
+            .try_get_token_for_mint(&WSOL)
+            .and_then(|token| self.cache.tokens.try_get_account(&token))
+            .is_ok_and(|account| account.data.is_empty())
+    }
+
+    /// After a buy of SOL: if the route closed the wSOL account, recreates it and wraps the SOL
+    /// the swap paid out natively (`before` is the native balance just before it).
+    fn wrap_unwrapped_sol(&self, before: u64, signature: solana_signature::Signature) {
+        let wsol_account = associated_wsol_account(&self.signer.pubkey());
+        let closed = match self
+            .rpc_client
+            .get_account_with_commitment(&wsol_account, CommitmentConfig::confirmed())
+        {
+            Ok(response) => response.value.is_none(),
+            Err(e) => {
+                warn!(
+                    "Could not check the wSOL account after {}: {}",
+                    signature, e
+                );
+                return;
+            }
+        };
+        if !closed {
+            return;
+        }
+        let returned = match self.rpc_client.get_balance(&self.signer.pubkey()) {
+            Ok(after) => after.saturating_sub(before),
+            Err(e) => {
+                warn!(
+                    "Could not read the native balance after {}: {}",
+                    signature, e
+                );
+                0
+            }
+        };
+        warn!(
+            "The swap {} closed the wSOL account and paid {} lamports out natively; recreating it",
+            signature, returned
+        );
+        if let Err(e) = self.recreate_wsol_account(returned) {
+            error!("Failed to recreate the wSOL account: {:?}", e);
+        }
+    }
+
+    /// Creates the wallet's wSOL account and wraps up to `lamports` of native SOL into it, less
+    /// the account's rent (which the close refunded).
+    fn recreate_wsol_account(&self, lamports: u64) -> anyhow::Result<()> {
+        let owner = self.signer.pubkey();
+        let wsol_account = associated_wsol_account(&owner);
+        let mut instructions = vec![
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &owner,
+                &owner,
+                &WSOL,
+                &spl_token::ID,
+            ),
+        ];
+        let rent = self
+            .rpc_client
+            .get_minimum_balance_for_rent_exemption(TOKEN_ACCOUNT_SIZE)?;
+        let wrapped = lamports.saturating_sub(rent);
+        if wrapped > 0 {
+            instructions.push(solana_system_interface::instruction::transfer(
+                &owner,
+                &wsol_account,
+                wrapped,
+            ));
+            instructions.push(spl_token::instruction::sync_native(
+                &spl_token::ID,
+                &wsol_account,
+            )?);
+        }
+        let blockhash = self.cache.blockhash.get(&self.rpc_client)?;
+        let tx = solana_transaction::Transaction::new_signed_with_payer(
+            &instructions,
+            Some(&owner),
+            &[&self.signer],
+            blockhash,
+        );
+        let signature = self.rpc_client.send_and_confirm_transaction(&tx)?;
+        info!(
+            "Recreated the wSOL account {} with {} lamports wrapped: {}",
+            wsol_account, wrapped, signature
+        );
+        Ok(())
+    }
+}
+
+/// The mints in a fixed order, starting from `resume_at` when it is still one of them.
+fn pass_order(mut mints: Vec<Pubkey>, resume_at: Option<Pubkey>) -> Vec<Pubkey> {
+    mints.sort();
+    if let Some(start) = resume_at.and_then(|mint| mints.iter().position(|m| *m == mint)) {
+        mints.rotate_left(start);
+    }
+    mints
+}
+
+fn associated_wsol_account(owner: &Pubkey) -> Pubkey {
+    spl_associated_token_account::get_associated_token_address_with_program_id(
+        owner,
+        &WSOL,
+        &spl_token::ID,
+    )
 }
 
 #[cfg(test)]
@@ -528,6 +676,19 @@ mod tests {
     use super::*;
 
     const TARGET: I80F48 = I80F48!(50);
+
+    #[test]
+    fn a_pass_resumes_where_the_last_one_stopped() {
+        let mut mints: Vec<Pubkey> = (0..4).map(|_| Pubkey::new_unique()).collect();
+        mints.sort();
+        let shuffled = vec![mints[2], mints[0], mints[3], mints[1]];
+        assert_eq!(pass_order(shuffled.clone(), None), mints);
+        assert_eq!(
+            pass_order(shuffled.clone(), Some(mints[2])),
+            vec![mints[2], mints[3], mints[0], mints[1]]
+        );
+        assert_eq!(pass_order(shuffled, Some(Pubkey::new_unique())), mints);
+    }
 
     #[test]
     fn an_inventory_token_inside_its_band_is_held() {

@@ -196,9 +196,9 @@ impl InventoryStrategy {
             Some(&swap),
             landing,
         )?;
-        // This is its only check: the executor sends it without preflight. A failure caught here
-        // falls back to the wallet-funded plan. A bundled liquidation relies on prices its push
-        // has not landed yet, so the executor simulates it inside the bundle instead.
+        // Over RPC this is its only check: the executor sends it without preflight. A bundled one
+        // isn't simulated at all: a bundle that fails doesn't land, and one behind a push relies
+        // on prices the chain doesn't hold yet.
         if landing == Landing::Rpc {
             self.liquidator_account
                 .simulate_tx(&tx)
@@ -275,15 +275,16 @@ impl InventoryStrategy {
         Ok(ExecutionPlan {
             tx,
             claim: Some(claim),
+            profit: if share < I80F48::ONE {
+                intent.profit * share
+            } else {
+                intent.profit
+            },
         })
     }
 }
 
 impl LiquidationStrategy for InventoryStrategy {
-    fn name(&self) -> &'static str {
-        "inventory"
-    }
-
     fn assemble_sandwich(
         &self,
         intent: &PreparedLiquidatableAccount,
@@ -294,7 +295,11 @@ impl LiquidationStrategy for InventoryStrategy {
         let asset_mint = cache.banks.try_get_bank(&intent.asset_bank)?.bank.mint;
 
         match self.build_sandwich_tx(intent, asset_mint, liab_mint, landing) {
-            Ok(tx) => Ok(Sandwich::Plan(ExecutionPlan { tx, claim: None })),
+            Ok(tx) => Ok(Sandwich::Plan(ExecutionPlan {
+                tx,
+                claim: None,
+                profit: intent.profit,
+            })),
             Err(e) => {
                 info!(
                     "InventoryStrategy: not selling the collateral in-tx for {} ({}); repaying from the wallet instead",
@@ -307,6 +312,13 @@ impl LiquidationStrategy for InventoryStrategy {
                 }
             }
         }
+    }
+
+    fn lamports_for_value(&self, usd: I80F48) -> Result<u64> {
+        Ok(self
+            .value_wrapper(&spl_token::native_mint::ID)?
+            .get_amount_from_value(usd)?
+            .to_num())
     }
 
     fn assemble_with_inventory(
