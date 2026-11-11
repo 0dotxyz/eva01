@@ -62,6 +62,10 @@ impl ClockManager {
                 }
                 Err(e) => {
                     error!("Failed to update the Solana Clock! {:?}", e);
+                    // Keep time moving while the RPC is out, or every staleness check freezes.
+                    if let Ok(mut clock_guard) = self.clock.lock() {
+                        clock_guard.unix_timestamp += TICK_INTERVAL.as_secs() as i64;
+                    }
                 }
             }
         }

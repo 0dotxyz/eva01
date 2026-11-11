@@ -3,7 +3,8 @@ use crate::{
     clock_manager,
     config::Eva01Config,
     execution::{
-        executor::{Executor, PricePushLanding},
+        activity::LiquidationActivity,
+        executor::{BundleLanding, Executor},
         inventory::InventoryStrategy,
         queue::{ExecutionQueue, QueuedIntent},
         reservations::TokenReservations,
@@ -21,7 +22,7 @@ use crate::{
     wrappers::{
         bank::BankWrapper,
         liquidator_account::{
-            is_seizable_asset_tag, LiquidatorAccount, PreparedLiquidatableAccount,
+            is_seizable_asset_tag, LiquidationPair, LiquidatorAccount, PreparedLiquidatableAccount,
         },
         marginfi_account::{MarginfiAccountWrapper, ObservationAccounts},
         oracle::{oracle_publish_time, OracleWrapper, OracleWrapperTrait},
@@ -29,7 +30,7 @@ use crate::{
 };
 use anchor_lang::AccountDeserialize;
 use anyhow::{anyhow, Result};
-use crossbeam::channel::{bounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam::channel::{bounded, Receiver, RecvTimeoutError};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{debug, error, info};
@@ -74,8 +75,8 @@ use std::{
 /// than one-at-a-time.
 const MAX_CONCURRENT_LIQUIDATIONS: usize = 8;
 
-/// How often the rebalancing sweep runs when no liquidation has been attempted.
-const IDLE_REBALANCE_INTERVAL: Duration = Duration::from_secs(3600);
+/// How often the rebalancer checks whether a pass is due (see `LiquidationActivity`).
+const REBALANCE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Taken off the premium `end_liquidation` allows, so price moves between evaluation and landing
 /// cannot push the seizure over the cap.
@@ -107,6 +108,32 @@ fn is_better_pair(profit: I80F48, weight: u8, best_profit: I80F48, best_weight: 
     }
 }
 
+/// Of pairs earning `profit` and seizing at `weight`, in order: the most profitable (the lighter on
+/// a tie), and, when it is heavy, the pair an in-tx swap should take instead if that differs (a
+/// lighter one unless the heavier earns more than [`PAIR_PROFIT_TIE_MARGIN`] more). Indexes into
+/// the pairs; `None` when there are none.
+fn choose_pairs(pairs: impl Iterator<Item = (I80F48, u8)>) -> Option<(usize, Option<usize>)> {
+    let mut main: Option<(usize, I80F48, u8)> = None;
+    let mut sandwich: Option<(usize, I80F48, u8)> = None;
+    for (index, (profit, weight)) in pairs.enumerate() {
+        if main.is_none_or(|(_, best_profit, best_weight)| {
+            profit > best_profit || (profit == best_profit && weight < best_weight)
+        }) {
+            main = Some((index, profit, weight));
+        }
+        if sandwich.is_none_or(|(_, best_profit, best_weight)| {
+            is_better_pair(profit, weight, best_profit, best_weight)
+        }) {
+            sandwich = Some((index, profit, weight));
+        }
+    }
+    let (main, _, main_weight) = main?;
+    let sandwich = sandwich
+        .map(|(index, _, _)| index)
+        .filter(|index| main_weight > 0 && *index != main);
+    Some((main, sandwich))
+}
+
 /// How often each unhealthy account we are not liquidating is reported.
 const SKIP_REPORT_INTERVAL: Duration = Duration::from_secs(1200);
 
@@ -123,6 +150,8 @@ pub struct Liquidator {
     strategy: Arc<InventoryStrategy>,
     evaluator: Arc<Evaluator>,
     queue: Arc<ExecutionQueue>,
+    /// The liquidation attempts the rebalancer stays out of the way of.
+    activity: Arc<LiquidationActivity>,
     threads: Vec<JoinHandle<()>>,
     liquidator_account: Arc<LiquidatorAccount>,
     tag_policy: TagPolicy,
@@ -174,10 +203,17 @@ impl LiquidationAmounts {
 
 /// The best bank pair for an unhealthy account and what it allows.
 struct Sizing {
+    /// The most profitable pair.
     asset_bank: Pubkey,
     liab_bank: Pubkey,
     amounts: LiquidationAmounts,
+    /// The pair an in-tx swap should take instead, when the most profitable one seizes from a
+    /// Kamino or JupLend bank and a lighter pair earns nearly as much (`is_better_pair`).
+    sandwich: Option<(Pubkey, Pubkey, LiquidationAmounts)>,
     maintenance_health: I80F48,
+    /// The account is healthy on the Pyth prices the chain holds; only newer ones make it
+    /// liquidatable.
+    needs_price_push: bool,
 }
 
 /// A bank's maintenance price over its equity price on one side.
@@ -277,28 +313,40 @@ impl Liquidator {
         // Shared by the liquidation plans and the rebalancer, so neither spends tokens the other
         // has claimed.
         let reservations = TokenReservations::new();
-        let rebalancer = Rebalancer::new(config.clone(), cache.clone(), reservations.clone())?;
-        let dex_client = rebalancer.dex_client();
+        let activity = Arc::new(LiquidationActivity::default());
+        let rebalancer = Rebalancer::new(
+            config.clone(),
+            cache.clone(),
+            reservations.clone(),
+            activity.clone(),
+        )?;
+        let dex_client = rebalancer.liquidation_dex_client();
         let dex_gate = rebalancer.dex_gate();
 
         let rpc_client =
             RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
-        let price_push = if config.price_push_enabled {
-            Some(PricePushLanding {
-                pusher: PythPusher::new(&config)?,
+        let bundles = if config.price_push_enabled {
+            Some(BundleLanding {
+                pusher: PythPusher::new(&config, cache.clone())?,
                 jito: JitoClient::new(
                     config.jito_block_engine_url.clone(),
                     config.bundle_api_key.clone(),
                 ),
-                tip_estimator: TipEstimator::new(config.jito_tip_max_lamports),
+                tip_estimator: TipEstimator::new(
+                    config.jito_tip_max_lamports,
+                    config.bundle_tip_profit_share,
+                ),
                 signer: Keypair::try_from(config.wallet_keypair.as_slice())?,
-                rpc_url: config.rpc_url.clone(),
-                bundle_api_key: config.bundle_api_key.clone(),
             })
         } else {
             None
         };
-        let executor = Executor::new(rpc_client, cache.clone(), price_push);
+        let executor = Executor::new(
+            rpc_client,
+            cache.clone(),
+            bundles,
+            I80F48::from_num(config.wallet_min_profit_share),
+        );
 
         let strategy = InventoryStrategy::new(
             liquidator_account.clone(),
@@ -319,6 +367,7 @@ impl Liquidator {
                 max_profit: config.max_profit,
             }),
             queue: Arc::new(ExecutionQueue::new(ATTEMPT_COOLDOWN)),
+            activity,
             threads: Vec::new(),
             liquidator_account,
             tag_policy: TagPolicy::new(),
@@ -339,6 +388,14 @@ impl Liquidator {
         }
         self.spawn_threads(rebalancer)?;
 
+        // Updates only reach the cache through this loop, so everything Geyser and Hermes sent
+        // since the cache was loaded (the startup rebalance alone takes seconds) is still queued.
+        // Apply it first, or the initial scan prices every account on the load-time snapshot.
+        let mut backlog = HashSet::new();
+        while let Ok(update) = self.geyser_rx.try_recv() {
+            self.process_geyser_update(update, &mut backlog);
+        }
+
         // Geyser only delivers changes, so an account that is already underwater at startup would
         // wait for an unrelated update to touch one of its banks. Sweep them all once up front.
         match self
@@ -347,7 +404,10 @@ impl Liquidator {
             .try_get_accounts_with_liabilities()
         {
             Ok(accounts) => {
-                info!("Running the initial Liquidation scan...");
+                info!(
+                    "Running the initial Liquidation scan (updates queued during startup applied; {} account(s) touched)...",
+                    backlog.len()
+                );
                 self.run_liquidation_cycle(accounts);
             }
             Err(error) => error!(
@@ -382,27 +442,33 @@ impl Liquidator {
     /// send waiting for confirmation or a sweep selling seized collateral never holds up the loop
     /// that applies Geyser updates.
     fn spawn_threads(&mut self, rebalancer: Rebalancer) -> Result<()> {
-        let (rebalance_tx, rebalance_rx) = bounded::<()>(1);
+        // Nothing is ever sent: the channel disconnects once every worker holding a sender has
+        // exited, which stops the rebalancer.
+        let (workers_alive, workers_gone) = bounded::<()>(1);
         for index in 0..MAX_CONCURRENT_LIQUIDATIONS {
             let queue = Arc::clone(&self.queue);
             let evaluator = Arc::clone(&self.evaluator);
             let executor = Arc::clone(&self.executor);
             let strategy = Arc::clone(&self.strategy);
-            let rebalance_tx = rebalance_tx.clone();
+            let activity = Arc::clone(&self.activity);
+            let alive = workers_alive.clone();
             self.threads.push(
                 thread::Builder::new()
                     .name(format!("liquidation-worker-{index}"))
                     .spawn(move || {
-                        run_worker(&queue, &evaluator, &executor, &strategy, &rebalance_tx)
+                        let _alive = alive;
+                        run_worker(&queue, &evaluator, &executor, &strategy, &activity)
                     })?,
             );
         }
+        drop(workers_alive);
 
         let executor = Arc::clone(&self.executor);
+        let activity = Arc::clone(&self.activity);
         self.threads.push(
             thread::Builder::new()
                 .name("rebalancer".to_string())
-                .spawn(move || run_rebalancer(rebalancer, &executor, &rebalance_rx))?,
+                .spawn(move || run_rebalancer(rebalancer, &executor, &activity, &workers_gone))?,
         );
         Ok(())
     }
@@ -494,11 +560,7 @@ impl Liquidator {
         match account_type {
             AccountType::Oracle | AccountType::HermesPrice => {
                 if matches!(account_type, AccountType::Oracle) {
-                    if let Some(update) = crate::cache::pyth_prices::price_update(&account) {
-                        self.cache
-                            .pyth_prices
-                            .record_onchain(address, update.price_message.publish_time);
-                    }
+                    self.cache.pyth_prices.record_onchain(address, &account);
                 }
                 let banks = self.cache.banks.get_banks_for_oracle(&address)?;
                 self.advance_clock_to_oracle(&address, &account, &banks);
@@ -622,13 +684,13 @@ fn run_worker(
     evaluator: &Evaluator,
     executor: &Executor,
     strategy: &InventoryStrategy,
-    rebalance: &Sender<()>,
+    activity: &LiquidationActivity,
 ) {
     while let Some(queued) = queue.take() {
         let liquidatee = queued.intent.liquidatee_account.address;
         // A panic would otherwise end the worker and leave the account marked in flight for good.
         let attempt = panic::catch_unwind(AssertUnwindSafe(|| {
-            attempt_liquidation(queued, evaluator, executor, strategy, rebalance)
+            attempt_liquidation(queued, evaluator, executor, strategy, activity)
         }));
         if attempt.is_err() {
             error!("The liquidation attempt on {} panicked.", liquidatee);
@@ -642,7 +704,7 @@ fn attempt_liquidation(
     evaluator: &Evaluator,
     executor: &Executor,
     strategy: &InventoryStrategy,
-    rebalance: &Sender<()>,
+    activity: &LiquidationActivity,
 ) {
     let liquidatee = intent.liquidatee_account.address;
     // The intent was sized on the state at evaluation time. By now another liquidator may have
@@ -658,23 +720,36 @@ fn attempt_liquidation(
         }
         Ok(Some(fresh)) => {
             info!(
-                "Liquidating {}: seizing {} for {} (est. profit ${:.4}, ${:.4} when queued {} ms ago)",
+                "Liquidating {}: seizing {} for {} (est. profit ${:.4}, ${:.4} when queued {} ms ago){}",
                 liquidatee,
                 fresh.asset_bank,
                 fresh.liab_bank,
                 fresh.profit.to_num::<f64>(),
                 intent.profit.to_num::<f64>(),
-                queued_at.elapsed().as_millis()
+                queued_at.elapsed().as_millis(),
+                if fresh.needs_price_push {
+                    "; healthy on the chain's prices, so behind a price push"
+                } else {
+                    ""
+                }
             );
-            if let Err(e) = executor.try_execute(strategy, &fresh) {
-                error!(
-                    "Failed to execute liquidation for {:?}: {:?}",
-                    liquidatee, e
+            if let Some(pair) = &fresh.sandwich_pair {
+                debug!(
+                    "{}: a sandwich would seize {} for {} instead (est. profit ${:.4})",
+                    liquidatee,
+                    pair.asset_bank,
+                    pair.liab_bank,
+                    pair.profit.to_num::<f64>()
                 );
             }
-            // The wallet may now hold seized collateral to sell. A request already pending
-            // covers this one.
-            let _ = rebalance.try_send(());
+            let mut attempt = activity.attempt(liquidatee);
+            match executor.try_execute(strategy, &fresh) {
+                Ok(()) => attempt.succeeded(),
+                Err(e) => error!(
+                    "Failed to execute liquidation for {:?}: {:?}",
+                    liquidatee, e
+                ),
+            }
         }
         Ok(None) => info!(
             "Dropping the liquidation of {}: no longer worth it on the current state ({} ms after it was queued)",
@@ -688,13 +763,21 @@ fn attempt_liquidation(
     }
 }
 
-/// Sells leftover tokens back to the swap mint after each liquidation attempt and on a heartbeat,
-/// until every worker is gone.
-fn run_rebalancer(mut rebalancer: Rebalancer, executor: &Executor, requests: &Receiver<()>) {
-    // A request or the heartbeat timeout; disconnected once every worker has exited.
-    while let Ok(()) | Err(RecvTimeoutError::Timeout) =
-        requests.recv_timeout(IDLE_REBALANCE_INTERVAL)
-    {
+/// Sells leftover tokens back to the swap mint and refills the inventory whenever a pass is due
+/// (see `LiquidationActivity`), until every worker is gone.
+fn run_rebalancer(
+    mut rebalancer: Rebalancer,
+    executor: &Executor,
+    activity: &LiquidationActivity,
+    workers_gone: &Receiver<()>,
+) {
+    // The startup pass just ran.
+    let mut last_pass = Instant::now();
+    while let Err(RecvTimeoutError::Timeout) = workers_gone.recv_timeout(REBALANCE_CHECK_INTERVAL) {
+        if !activity.rebalance_due(last_pass, Instant::now()) {
+            continue;
+        }
+        last_pass = Instant::now();
         match panic::catch_unwind(AssertUnwindSafe(|| rebalancer.run())) {
             // Liquidations size from the cached balances; the sold tokens stay claimed until the
             // balances show them gone.
@@ -808,7 +891,9 @@ impl Evaluator {
             asset_bank: asset_bank_pk,
             liab_bank: liab_bank_pk,
             amounts: liquidation_amounts,
+            sandwich,
             maintenance_health,
+            needs_price_push,
         }) = self.compute_max_liquidatable_amounts_with_banks(
             &self.cache,
             clock,
@@ -862,6 +947,17 @@ impl Evaluator {
                 liquidation_amounts.max_liquidatable_asset_amount, slippage_adjusted_asset_amount, slippage_adjusted_liab_amount
             );
 
+        // Sized like the main pair; a pair the program won't let liquidate is no alternative.
+        let sandwich_pair = sandwich
+            .filter(|(_, _, amounts)| amounts.is_liquidatable())
+            .map(|(asset_bank, liab_bank, amounts)| LiquidationPair {
+                asset_bank,
+                liab_bank,
+                asset_amount: amounts.max_liquidatable_asset_amount * LIQUIDATION_SIZE_HAIRCUT,
+                liab_amount: amounts.max_liquidatable_liab_amount * LIQUIDATION_SIZE_HAIRCUT,
+                profit: amounts.liquidator_profit * LIQUIDATION_SIZE_HAIRCUT,
+            });
+
         Ok(Some(Evaluation::Liquidate(PreparedLiquidatableAccount {
             liquidatee_account: account.clone(),
             observation_accounts,
@@ -870,6 +966,8 @@ impl Evaluator {
             asset_amount: slippage_adjusted_asset_amount,
             liab_amount: slippage_adjusted_liab_amount,
             profit,
+            needs_price_push,
+            sandwich_pair,
         })))
     }
 
@@ -996,6 +1094,24 @@ impl Evaluator {
             );
             return Ok(None);
         }
+        let needs_price_push = match self.maintenance_health_on_chain_prices(
+            cache,
+            &clock,
+            account,
+            group,
+            banks_and_oracles,
+        ) {
+            Ok(health) => health.is_some_and(|health| health >= I80F48::ZERO),
+            // The chain's price is unusable as it stands (too old for the program, say): only a
+            // pushed one can make this liquidation pass.
+            Err(e) => {
+                debug!(
+                    "Account {}: can't price it on the chain's Pyth prices ({e}); a push is needed",
+                    account.address
+                );
+                true
+            }
+        };
 
         let (total_assets_equity, total_liabs_equity) = get_health_components(
             &account.account,
@@ -1008,8 +1124,10 @@ impl Evaluator {
         )?;
 
         // Which collateral is seized and which debt is repaid decides how much the program lets a
-        // liquidation take, so every pair is sized and the most profitable one wins.
-        let mut best: Option<(Pubkey, Pubkey, LiquidationAmounts, u8)> = None;
+        // liquidation take, so every pair is sized. The most profitable one wins for a repay from
+        // the wallet; an in-tx swap needs room for its route, so for it a lighter pair wins unless
+        // the heavier earns much more.
+        let mut candidates: Vec<(Pubkey, Pubkey, LiquidationAmounts, u8)> = Vec::new();
         let mut any_taggable = false;
         for asset_bank in asset_banks {
             let weight = cache
@@ -1046,28 +1164,83 @@ impl Evaluator {
                     }
                 };
                 any_taggable |= amounts.taggable;
-                if best.as_ref().is_none_or(|(_, _, b, best_weight)| {
-                    is_better_pair(
-                        amounts.liquidator_profit,
-                        weight,
-                        b.liquidator_profit,
-                        *best_weight,
-                    )
-                }) {
-                    best = Some((*asset_bank, *liab_bank, amounts, weight));
-                }
+                candidates.push((*asset_bank, *liab_bank, amounts, weight));
             }
         }
+        let Some((main, sandwich)) = choose_pairs(
+            candidates
+                .iter()
+                .map(|(_, _, amounts, weight)| (amounts.liquidator_profit, *weight)),
+        ) else {
+            return Ok(None);
+        };
+        let (asset_bank, liab_bank, amounts, _) = candidates[main];
+        let sandwich = sandwich.map(|index| {
+            let (asset_bank, liab_bank, amounts, _) = candidates[index];
+            (asset_bank, liab_bank, amounts)
+        });
         // Tagging helps every pair, so it is worth it when any pair would profit from it.
-        Ok(best.map(|(asset_bank, liab_bank, amounts, _)| Sizing {
+        Ok(Some(Sizing {
             asset_bank,
             liab_bank,
             amounts: LiquidationAmounts {
                 taggable: any_taggable,
                 ..amounts
             },
+            sandwich,
             maintenance_health,
+            needs_price_push,
         }))
+    }
+
+    /// The account's maintenance health on the Pyth prices the chain holds, where eva prices any
+    /// of its feeds ahead of them; `None` when every price it reads is the chain's already. This is
+    /// what the program would compute without a push, so it tells a liquidation that needs one
+    /// apart before anything is built.
+    fn maintenance_health_on_chain_prices(
+        &self,
+        cache: &Cache,
+        clock: &Clock,
+        account: &MarginfiAccountWrapper,
+        group: &MarginfiGroup,
+        banks_and_oracles: &[Pubkey],
+    ) -> Result<Option<I80F48>> {
+        let mut behind = false;
+        let mut accounts = Vec::with_capacity(banks_and_oracles.len());
+        for pk in banks_and_oracles {
+            let account = match cache.banks.try_get_bank(pk) {
+                Ok(wrapper) => wrapper.account,
+                Err(_) => {
+                    let cached = cache.oracles.try_get_account(pk)?;
+                    match cache.pyth_prices.onchain_if_behind(pk, &cached) {
+                        Some(onchain) => {
+                            behind = true;
+                            onchain
+                        }
+                        None => cached,
+                    }
+                }
+            };
+            accounts.push(account);
+        }
+        if !behind {
+            return Ok(None);
+        }
+        let remaining_ais: Vec<_> = accounts
+            .iter_mut()
+            .zip(banks_and_oracles.iter())
+            .map(|(account, pk)| (pk, account).into_account_info())
+            .collect();
+        let (assets, liabilities) = get_health_components(
+            &account.account,
+            group,
+            &remaining_ais,
+            RequirementType::Maintenance,
+            &mut None,
+            HealthPriceMode::Client(clock.clone()),
+            &mut None,
+        )?;
+        Ok(Some(assets - liabilities))
     }
 
     /// How much seizing `asset_bank_wrapper` for `liab_bank_wrapper` may repay and earn, as
@@ -1378,6 +1551,22 @@ mod pair_preference_tests {
     fn equal_weights_compare_on_profit() {
         assert!(is_better_pair(I80F48!(1.001), 0, I80F48!(1), 0));
         assert!(!is_better_pair(I80F48!(1), 0, I80F48!(1), 0));
+    }
+
+    #[test]
+    fn a_heavy_most_profitable_pair_gets_a_native_one_for_the_sandwich() {
+        let pairs =
+            |list: &[(f64, u8)]| choose_pairs(list.iter().map(|(p, w)| (I80F48::from_num(*p), *w)));
+        // A Kamino pair earning 1.2 against a native one earning 1: the wallet repay takes the
+        // Kamino one, the sandwich the native one (within the 30% margin).
+        assert_eq!(pairs(&[(1.0, 0), (1.2, 1)]), Some((1, Some(0))));
+        // A native pair is the most profitable: one pair suffices.
+        assert_eq!(pairs(&[(1.2, 0), (1.0, 1)]), Some((0, None)));
+        // A Kamino pair earning far more: the sandwich takes it too.
+        assert_eq!(pairs(&[(1.0, 0), (2.0, 1)]), Some((1, None)));
+        // Only heavy pairs: the sandwich has nothing lighter.
+        assert_eq!(pairs(&[(1.0, 1), (1.1, 1)]), Some((1, None)));
+        assert_eq!(pairs(&[]), None);
     }
 
     #[test]

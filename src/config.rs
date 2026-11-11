@@ -45,14 +45,19 @@ pub struct Eva01Config {
     pub titan_api_key: String,
     pub dflow_api_key: Option<String>,
     pub jupiter_api_key: String,
-    /// Price liquidations on Hermes prices and push them on chain in the same Jito bundle
-    /// (`PRICE_PUSH_ENABLED`, on unless "false").
+    /// Land liquidations as Jito bundles, and price them on Hermes prices pushed on chain in the
+    /// same bundle when the chain's aren't enough (`PRICE_PUSH_ENABLED`, on unless "false").
     pub price_push_enabled: bool,
     /// Jito block-engine `sendBundle` endpoint; `None` uses the client's built-in default.
     pub jito_block_engine_url: Option<String>,
     /// Hard cap on the Jito tip per bundle (lamports).
     pub jito_tip_max_lamports: u64,
-    /// API key/uuid for `sendBundle`/`simulateBundle`; `None` for the public (unauthenticated) path.
+    /// The share of a bundle's expected profit tipped (`BUNDLE_TIP_PROFIT_SHARE`).
+    pub bundle_tip_profit_share: f64,
+    /// The share of a liquidation's full profit a wallet-funded plan must earn to go first, ahead
+    /// of the plans that quote a swap (`LIQUIDATION_WALLET_MIN_PROFIT_SHARE`).
+    pub wallet_min_profit_share: f64,
+    /// API key/uuid for `sendBundle`; `None` for the public (unauthenticated) path.
     pub bundle_api_key: Option<String>,
 }
 
@@ -146,11 +151,12 @@ impl Eva01Config {
 
         let price_push_enabled = std::env::var("PRICE_PUSH_ENABLED").map_or(true, |v| v != "false");
         let jito_block_engine_url = std::env::var("JITO_BLOCK_ENGINE_URL").ok();
-        // Default cap 0.001 SOL (matches Jito's typical max tip floor).
         let jito_tip_max_lamports: u64 = std::env::var("JITO_TIP_MAX_LAMPORTS")
-            .unwrap_or_else(|_| "1000000".to_string())
+            .unwrap_or_else(|_| "5000000".to_string())
             .parse()
             .expect("Invalid JITO_TIP_MAX_LAMPORTS number");
+        let bundle_tip_profit_share = share_from_env("BUNDLE_TIP_PROFIT_SHARE", 0.08);
+        let wallet_min_profit_share = share_from_env("LIQUIDATION_WALLET_MIN_PROFIT_SHARE", 0.1);
         let bundle_api_key = std::env::var("JITO_API_KEY").ok();
 
         Ok(Eva01Config {
@@ -182,9 +188,27 @@ impl Eva01Config {
             price_push_enabled,
             jito_block_engine_url,
             jito_tip_max_lamports,
+            bundle_tip_profit_share,
+            wallet_min_profit_share,
             bundle_api_key,
         })
     }
+}
+
+/// A share between 0 and 1 from `env_var`, or `default` when it is unset.
+fn share_from_env(env_var: &str, default: f64) -> f64 {
+    let share: f64 = std::env::var(env_var)
+        .map(|value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("Invalid {env_var} number"))
+        })
+        .unwrap_or(default);
+    assert!(
+        (0.0..=1.0).contains(&share),
+        "{env_var} must be between 0 and 1, got {share}"
+    );
+    share
 }
 
 fn derive_rpc_url(yellowstone_endpoint: &str, yellowstone_x_token: Option<&str>) -> String {

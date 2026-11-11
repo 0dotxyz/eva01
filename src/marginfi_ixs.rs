@@ -215,6 +215,14 @@ pub fn make_end_liquidate_ix(
     }
     .to_account_metas(None);
     mark_signer(&mut accounts, liquidator_account);
+    // The program ID stands in for the absent fee payer, but the generated meta is writable (the
+    // field is a signer); the runtime only demotes that lock because the program is invoked.
+    for meta in accounts
+        .iter_mut()
+        .filter(|meta| meta.pubkey == marginfi_type_crate::ID)
+    {
+        meta.is_writable = false;
+    }
 
     accounts.extend(banks.iter().map(|a| AccountMeta::new(a.key(), false)));
 
@@ -372,5 +380,36 @@ pub fn make_juplend_withdraw_ix(
             withdraw_all: Some(withdraw_all),
         }
         .data(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn end_liquidation_locks_neither_the_program_nor_an_absent_fee_payer() {
+        let liquidator = Pubkey::new_unique();
+        let ix = make_end_liquidate_ix(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            liquidator,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            &[],
+        );
+        let program = ix
+            .accounts
+            .iter()
+            .find(|meta| meta.pubkey == marginfi_type_crate::ID)
+            .expect("the fee payer placeholder");
+        assert!(!program.is_writable && !program.is_signer);
+        let receiver = ix
+            .accounts
+            .iter()
+            .find(|meta| meta.pubkey == liquidator)
+            .unwrap();
+        assert!(receiver.is_signer);
     }
 }

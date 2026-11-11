@@ -173,6 +173,12 @@ impl GeyserService {
                     Ok(Some(msg)) => msg,
                     Ok(None) => {
                         warn!("The Geyser stream ended, reconnecting");
+                        // A stream the server closes before delivering anything (a refused
+                        // subscription, a quota) would otherwise be reopened in a tight loop.
+                        if !delivered {
+                            self.sleep_interruptible(backoff);
+                            backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                        }
                         break;
                     }
                     Err(_) => {

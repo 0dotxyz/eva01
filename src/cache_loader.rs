@@ -285,11 +285,9 @@ impl CacheLoader {
 
         for (oracle_address, oracle_account) in oracle_map.iter() {
             debug!("Loaded the Oracle {:?} .", oracle_address);
-            if let Some(update) = crate::cache::pyth_prices::price_update(oracle_account) {
-                cache
-                    .pyth_prices
-                    .record_onchain(*oracle_address, update.price_message.publish_time);
-            }
+            cache
+                .pyth_prices
+                .record_onchain(*oracle_address, oracle_account);
             cache
                 .oracles
                 .try_insert(*oracle_address, oracle_account.clone())?;

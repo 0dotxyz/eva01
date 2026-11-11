@@ -1,26 +1,26 @@
 //! Minimal Jito block-engine bundle client.
 //!
 //! Submits an ordered set of transactions as an atomic bundle via the public block-engine
-//! JSON-RPC (`sendBundle`) and polls `getBundleStatuses` for confirmation. Tip accounts are
-//! fetched from the Jito REST endpoint. No extra crates: plain `reqwest` + `serde_json`,
-//! mirroring p0-app's `send-bundle` route.
+//! JSON-RPC (`sendBundle`). Whether the bundle landed is read from the chain, by its last
+//! transaction's signature, so landing it costs one block-engine request; the block engine is
+//! asked about it again only to learn early that it won't land. No extra crates: plain `reqwest`
+//! + `serde_json`.
 
 use std::{
     str::FromStr,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use log::{debug, warn};
+use log::warn;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use solana_client::rpc_client::RpcClient;
 use solana_keypair::Keypair;
-use solana_message::{v0, VersionedMessage};
+use solana_message::{v0, Hash, VersionedMessage};
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_system_interface::instruction::transfer;
@@ -40,64 +40,57 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
 ];
 const TIP_FLOOR_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_floor";
 
-/// How long to wait after submission before the first status poll, and between polls.
-const POLL_INITIAL_DELAY: Duration = Duration::from_millis(500);
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
-/// The block engine admits one request per second per endpoint (`sendBundle` and
-/// `getBundleStatuses` alike); anything faster is rejected with `-32097`.
+/// The block engine admits one request per second per endpoint (`sendBundle` and the status
+/// methods alike); anything faster is rejected with `-32097`.
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Outcome of a bundle that the block engine *accepted*. (Rejection / infra failure is an `Err`.)
-#[derive(Debug, Clone)]
-pub enum BundleOutcome {
-    /// Landed on-chain (confirmed or finalized).
-    Confirmed(String),
-    /// Accepted but not confirmed within the poll window; it may still land, so the caller must
-    /// not re-send (no sequential fallback) to avoid double execution.
-    Unconfirmed(String),
-}
 
 pub struct JitoClient {
     http: Client,
     endpoint: String,
     api_key: Option<String>,
-    /// When the last block-engine request went out; see [`MIN_REQUEST_INTERVAL`].
-    last_request: Mutex<Instant>,
+    slot: Mutex<SlotState>,
 }
 
-impl JitoClient {
-    pub fn new(endpoint: Option<String>, api_key: Option<String>) -> Self {
-        Self {
-            http: Client::new(),
-            endpoint: endpoint.unwrap_or_else(|| DEFAULT_BUNDLE_ENDPOINT.to_string()),
-            api_key,
-            last_request: Mutex::new(Instant::now() - MIN_REQUEST_INTERVAL),
-        }
+/// The one request the block engine admits per [`MIN_REQUEST_INTERVAL`].
+struct SlotState {
+    /// When the last request went out.
+    last_request: Instant,
+    /// Whether a caller holds the slot, between reserving it and sending.
+    held: bool,
+}
+
+/// How often a caller waiting for the slot looks again while another caller holds it.
+const HELD_SLOT_RECHECK: Duration = Duration::from_millis(20);
+
+/// A request slot, reserved until its request goes out or it is dropped. While it is held, nobody
+/// else gets one, so a caller that quotes a swap after reserving can't be overtaken into a second
+/// request within the interval; dropping it unused gives it back.
+pub struct JitoSlot<'a> {
+    jito: &'a JitoClient,
+}
+
+impl Drop for JitoSlot<'_> {
+    fn drop(&mut self) {
+        self.jito
+            .slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .held = false;
+    }
+}
+
+impl JitoSlot<'_> {
+    /// Counts the slot as used from now.
+    fn mark_sent(&self) {
+        self.jito
+            .slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_request = Instant::now();
     }
 
-    /// Spaces block-engine requests out to the rate limit, across every caller.
-    fn throttle(&self) {
-        let mut last = match self.last_request.lock() {
-            Ok(last) => last,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let since = last.elapsed();
-        if since < MIN_REQUEST_INTERVAL {
-            thread::sleep(MIN_REQUEST_INTERVAL - since);
-        }
-        *last = Instant::now();
-    }
-
-    /// The block-engine URL with the optional auth uuid appended (matches p0-app).
-    fn url(&self) -> String {
-        match &self.api_key {
-            Some(key) => format!("{}?uuid={}", self.endpoint, key),
-            None => self.endpoint.clone(),
-        }
-    }
-
-    /// Submit a bundle of transactions. Returns the bundle id on success.
-    pub fn send_bundle(&self, txs: &[VersionedTransaction]) -> Result<String> {
+    /// Submits a bundle in this slot. An `Err` is a request that may or may not have arrived.
+    pub fn send_bundle(self, txs: &[VersionedTransaction]) -> Result<BundleSend> {
         if txs.is_empty() {
             return Err(anyhow!("Cannot send an empty bundle"));
         }
@@ -108,100 +101,105 @@ impl JitoClient {
             "method": "sendBundle",
             "params": [encoded, { "encoding": "base64" }],
         });
-
-        self.throttle();
-        let resp: Value = self.http.post(self.url()).json(&body).send()?.json()?;
-        parse_send_bundle_result(&resp)
+        self.mark_sent();
+        let resp: Value = self
+            .jito
+            .http
+            .post(self.jito.url())
+            .json(&body)
+            .send()?
+            .json()?;
+        Ok(match parse_send_bundle_result(&resp) {
+            Ok(id) => BundleSend::Accepted(id),
+            Err(e) => BundleSend::Rejected(e.to_string()),
+        })
     }
 
-    /// Returns the `confirmation_status` of the bundle, if the block engine reports one yet.
-    pub fn get_bundle_status(&self, bundle_id: &str) -> Result<Option<String>> {
+    /// The block engine's view of a bundle sent in the last few minutes, asked in this slot.
+    /// `None` when the response carries no status.
+    pub fn inflight_bundle_status(self, bundle_id: &str) -> Result<Option<InflightStatus>> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "getBundleStatuses",
+            "method": "getInflightBundleStatuses",
             "params": [[bundle_id]],
         });
-        self.throttle();
-        let resp: Value = self.http.post(self.url()).json(&body).send()?.json()?;
-        parse_bundle_status(&resp)
-    }
-
-    /// Submit a bundle and poll for confirmation. Returns `Err` only when the bundle was never
-    /// accepted (infra error / rejection) — safe to retry via another path. A bundle that is
-    /// accepted but doesn't confirm within `max_attempts` returns `Ok(Unconfirmed)`, since it may
-    /// still land and must not be re-sent.
-    pub fn send_bundle_and_confirm(
-        &self,
-        txs: &[VersionedTransaction],
-        max_attempts: usize,
-    ) -> Result<BundleOutcome> {
-        let bundle_id = self.send_bundle(txs)?;
-        // "0x0" is the block engine's "already processed" sentinel — nothing to poll.
-        if bundle_id == "0x0" {
-            return Ok(BundleOutcome::Confirmed(bundle_id));
-        }
-
-        thread::sleep(POLL_INITIAL_DELAY);
-        for attempt in 0..max_attempts {
-            match self.get_bundle_status(&bundle_id) {
-                Ok(Some(status)) if status == "confirmed" || status == "finalized" => {
-                    debug!(
-                        "Bundle {} {} after {} poll(s)",
-                        bundle_id,
-                        status,
-                        attempt + 1
-                    );
-                    return Ok(BundleOutcome::Confirmed(bundle_id));
-                }
-                Ok(_) => {}
-                Err(e) => warn!("Bundle {} status poll failed: {}", bundle_id, e),
-            }
-            thread::sleep(POLL_INTERVAL);
-        }
-        Ok(BundleOutcome::Unconfirmed(bundle_id))
-    }
-
-    /// Simulate a bundle atomically against a `simulateBundle`-capable RPC endpoint.
-    ///
-    /// Uses `skipSigVerify` + `replaceRecentBlockhash` so unsigned, blockhash-less txs can be
-    /// simulated. This is how the executor does its simulate-first check: simulate
-    /// `[buy?, liquidate]` and skip the target when the program reports it would fail.
-    /// `rpc_url` must support `simulateBundle` (block-engine sim is on the RPC, not the bundle
-    /// endpoint); `sim_api_key` is sent as a Bearer token when present.
-    pub fn simulate_bundle(
-        &self,
-        rpc_url: &str,
-        sim_api_key: Option<&str>,
-        txs: &[VersionedTransaction],
-        accounts_to_inspect: &[Pubkey],
-    ) -> Result<BundleSimulation> {
-        let encoded = encode_transactions(txs)?;
-        let config = build_simulate_config(txs.len(), accounts_to_inspect);
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "simulateBundle",
-            "params": [{ "encodedTransactions": encoded }, config],
-        });
-
-        let mut req = self.http.post(rpc_url).json(&body);
-        if let Some(key) = sim_api_key {
-            req = req.bearer_auth(key);
-        }
-        let resp: Value = req.send()?.json()?;
-        parse_simulate_bundle(&resp, txs)
+        self.mark_sent();
+        let resp: Value = self
+            .jito
+            .http
+            .post(self.jito.url())
+            .json(&body)
+            .send()?
+            .json()?;
+        parse_inflight_status(&resp)
     }
 }
 
-/// Outcome of a `simulateBundle` call.
-#[derive(Debug, Clone)]
-pub struct BundleSimulation {
-    pub succeeded: bool,
-    /// The on-chain error message of the first failing tx (e.g. "... custom program error: 0x17a1").
-    pub error_message: Option<String>,
-    /// Index of the first failing tx within the bundle, if reported.
-    pub failed_tx_index: Option<usize>,
+impl JitoClient {
+    pub fn new(endpoint: Option<String>, api_key: Option<String>) -> Self {
+        Self {
+            http: Client::new(),
+            endpoint: endpoint.unwrap_or_else(|| DEFAULT_BUNDLE_ENDPOINT.to_string()),
+            api_key,
+            slot: Mutex::new(SlotState {
+                last_request: Instant::now() - MIN_REQUEST_INTERVAL,
+                held: false,
+            }),
+        }
+    }
+
+    /// The request slot, if it is free now, without waiting: a liquidation that finds none goes
+    /// out another way instead of queueing behind the other workers. The lock is held only to
+    /// read and flip the state, never across a wait.
+    pub fn try_reserve(&self) -> Option<JitoSlot<'_>> {
+        let mut state = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if state.held || state.last_request.elapsed() < MIN_REQUEST_INTERVAL {
+            return None;
+        }
+        state.held = true;
+        Some(JitoSlot { jito: self })
+    }
+
+    /// Waits for the request slot and takes it, for a bundle that has no other way out. Sleeps
+    /// without the lock, so others' `try_reserve` never waits behind it.
+    pub fn reserve(&self) -> JitoSlot<'_> {
+        loop {
+            let wait = {
+                let state = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+                let since = state.last_request.elapsed();
+                if state.held {
+                    HELD_SLOT_RECHECK
+                } else {
+                    MIN_REQUEST_INTERVAL.saturating_sub(since)
+                }
+            };
+            if wait.is_zero() {
+                if let Some(slot) = self.try_reserve() {
+                    return slot;
+                }
+                continue;
+            }
+            thread::sleep(wait);
+        }
+    }
+
+    /// The block-engine URL with the optional auth uuid appended (matches p0-app).
+    fn url(&self) -> String {
+        match &self.api_key {
+            Some(key) => format!("{}?uuid={}", self.endpoint, key),
+            None => self.endpoint.clone(),
+        }
+    }
+}
+
+/// The block engine's answer to `sendBundle`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BundleSend {
+    /// Accepted for the auction, with its id ("0x0" when already processed).
+    Accepted(String),
+    /// Refused, such as over the rate limit: it will never land.
+    Rejected(String),
 }
 
 /// Serialize each transaction with bincode and base64-encode it for the bundle payload.
@@ -233,168 +231,115 @@ fn parse_send_bundle_result(resp: &Value) -> Result<String> {
         .ok_or_else(|| anyhow!("Jito sendBundle: missing result in response: {}", resp))
 }
 
-/// Extract the first bundle's `confirmation_status` from a `getBundleStatuses` response.
-fn parse_bundle_status(resp: &Value) -> Result<Option<String>> {
+/// Where a recently sent bundle stands, per `getInflightBundleStatuses`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InflightStatus {
+    /// Still being auctioned; it may land.
+    Pending,
+    Landed,
+    /// Every region gave up on it: it won't land.
+    Failed,
+    /// Unknown to the block engine, which forgets bundles after a few minutes: it won't land.
+    Invalid,
+}
+
+impl InflightStatus {
+    /// Whether the bundle can no longer land.
+    pub fn is_dead(self) -> bool {
+        matches!(self, Self::Failed | Self::Invalid)
+    }
+}
+
+fn parse_inflight_status(resp: &Value) -> Result<Option<InflightStatus>> {
     if let Some(err) = resp.get("error") {
-        return Err(anyhow!("Jito getBundleStatuses error: {}", err));
+        return Err(anyhow!("Jito getInflightBundleStatuses error: {}", err));
     }
-    Ok(resp
-        .pointer("/result/value/0/confirmation_status")
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string()))
+    Ok(
+        match resp
+            .pointer("/result/value/0/status")
+            .and_then(|s| s.as_str())
+        {
+            Some("Pending") => Some(InflightStatus::Pending),
+            Some("Landed") => Some(InflightStatus::Landed),
+            Some("Failed") => Some(InflightStatus::Failed),
+            Some("Invalid") => Some(InflightStatus::Invalid),
+            _ => None,
+        },
+    )
 }
 
-/// Build the `simulateBundle` config, mirroring p0-app's `createBundleConfig`: skip sig
-/// verification, replace the recent blockhash, and only inspect accounts after the last tx.
-fn build_simulate_config(num_txs: usize, accounts_to_inspect: &[Pubkey]) -> Value {
-    let pre: Vec<Value> = (0..num_txs).map(|_| json!({ "addresses": [] })).collect();
-    let post: Vec<Value> = (0..num_txs)
-        .map(|i| {
-            if i + 1 == num_txs && !accounts_to_inspect.is_empty() {
-                let addrs: Vec<String> =
-                    accounts_to_inspect.iter().map(|a| a.to_string()).collect();
-                json!({ "addresses": addrs })
-            } else {
-                json!({ "addresses": [] })
-            }
-        })
-        .collect();
-    json!({
-        "skipSigVerify": true,
-        "replaceRecentBlockhash": true,
-        "preExecutionAccountsConfigs": pre,
-        "postExecutionAccountsConfigs": post,
-    })
-}
-
-/// Parse a `simulateBundle` response into a [`BundleSimulation`]. On failure, extract the first
-/// failing tx index and its on-chain error message from `summary.failed.error.TransactionFailure`.
-fn parse_simulate_bundle(resp: &Value, txs: &[VersionedTransaction]) -> Result<BundleSimulation> {
-    if let Some(err) = resp.get("error") {
-        return Err(anyhow!("Jito simulateBundle error: {}", err));
-    }
-    let summary = resp
-        .pointer("/result/value/summary")
-        .ok_or_else(|| anyhow!("simulateBundle: missing result.value.summary: {}", resp))?;
-
-    if summary.as_str() == Some("succeeded") {
-        return Ok(BundleSimulation {
-            succeeded: true,
-            error_message: None,
-            failed_tx_index: None,
-        });
-    }
-
-    // Failure: `{ "failed": { "error": { "TransactionFailure": [[signature bytes], "msg"] }, .. } }`
-    let tf = summary.pointer("/failed/error/TransactionFailure");
-    let (failed_tx_index, error_message) = match tf {
-        Some(tf) => {
-            let signature: Vec<u8> = tf
-                .get(0)
-                .and_then(|a| a.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|n| n.as_u64())
-                        .map(|n| n as u8)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let idx = txs
-                .iter()
-                .position(|tx| tx.signatures.first().map(|s| s.as_ref()) == Some(&signature[..]));
-            let msg = tf.get(1).and_then(|m| m.as_str()).map(|s| s.to_string());
-            (idx, msg)
-        }
-        None => (None, summary.get("failed").map(|f| f.to_string())),
-    };
-
-    Ok(BundleSimulation {
-        succeeded: false,
-        error_message,
-        failed_tx_index,
-    })
-}
-
+/// How often the tip floor is re-read, in the background.
 const TIP_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// The floor until the first read succeeds.
 const TIP_FALLBACK_LAMPORTS: u64 = 10_000;
 
-/// Dynamic Jito tip estimator with a max cap and TTL cache.
+/// Jito tips: a share of the bundle's expected profit, between a floor and a cap.
 ///
-/// Reads the EMA 50th-percentile landed tip from Jito's `tip_floor` endpoint, converts SOL ->
-/// lamports, and clamps to `max_lamports`. The value is cached for `TIP_REFRESH_INTERVAL`, so it
-/// is not refetched on every execution.
+/// The floor is the EMA of the 50th-percentile landed tip from Jito's `tip_floor` endpoint,
+/// refreshed hourly on a background thread, so sizing a tip never waits on HTTP.
 pub struct TipEstimator {
-    http: Client,
+    floor: Arc<Mutex<u64>>,
     max_lamports: u64,
-    cached: Mutex<Option<(u64, Instant)>>,
+    profit_share: f64,
 }
 
 impl TipEstimator {
-    pub fn new(max_lamports: u64) -> Self {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| Client::new());
-        Self {
-            http,
-            max_lamports,
-            cached: Mutex::new(None),
-        }
-    }
-
-    /// Current tip in lamports (EMA-50th landed tip, clamped to the max cap), cached on a TTL so
-    /// repeated executions reuse the same value instead of refetching.
-    pub fn current_tip(&self) -> u64 {
-        let now = Instant::now();
-        if let Ok(guard) = self.cached.lock() {
-            if let Some((tip, at)) = *guard {
-                if now.duration_since(at) < TIP_REFRESH_INTERVAL {
-                    return tip;
+    pub fn new(max_lamports: u64, profit_share: f64) -> Self {
+        let floor = Arc::new(Mutex::new(TIP_FALLBACK_LAMPORTS));
+        let refreshed = Arc::clone(&floor);
+        thread::spawn(move || {
+            let http = Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| Client::new());
+            loop {
+                match fetch_tip_floor(&http) {
+                    Ok(lamports) => {
+                        *refreshed.lock().unwrap_or_else(|e| e.into_inner()) = lamports;
+                    }
+                    Err(e) => warn!("Tip floor fetch failed ({e}); keeping the last value"),
                 }
+                thread::sleep(TIP_REFRESH_INTERVAL);
             }
+        });
+        Self {
+            floor,
+            max_lamports,
+            profit_share,
         }
-
-        let tip = match self.fetch_tip_lamports() {
-            Ok(lamports) => lamports.min(self.max_lamports),
-            Err(e) => {
-                // Back off to the last good value (or the fallback), capped, and reuse it for the
-                // refresh interval so a flaky endpoint doesn't add latency to every execution.
-                let last = self
-                    .cached
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.map(|(t, _)| t))
-                    .unwrap_or(TIP_FALLBACK_LAMPORTS)
-                    .min(self.max_lamports);
-                warn!("Tip floor fetch failed ({e}); using {last} lamports");
-                last
-            }
-        };
-
-        if let Ok(mut guard) = self.cached.lock() {
-            *guard = Some((tip, now));
-        }
-        tip
     }
 
-    /// Build the required Jito tip transfer transaction for a bundle.
+    /// The tip for a bundle expected to earn `profit_lamports`.
+    pub fn tip_for(&self, profit_lamports: u64) -> u64 {
+        let floor = *self.floor.lock().unwrap_or_else(|e| e.into_inner());
+        tip(profit_lamports, self.profit_share, floor, self.max_lamports)
+    }
+
+    /// The tip transfer, the bundle's last transaction. It can't go inside the liquidation:
+    /// marginfi accepts only swap programs between a receivership's start and end, and nothing
+    /// after the end.
     pub fn build_tip_transaction(
         &self,
         signer: &Keypair,
-        rpc_client: &RpcClient,
+        blockhash: Hash,
+        lamports: u64,
     ) -> Result<VersionedTransaction> {
         let tip_account = select_tip_account()?;
-        let tip_lamports = self.current_tip();
-        let ix = transfer(&signer.pubkey(), &tip_account, tip_lamports);
-        let blockhash = rpc_client.get_latest_blockhash()?;
+        let ix = transfer(&signer.pubkey(), &tip_account, lamports);
         let msg = v0::Message::try_compile(&signer.pubkey(), &[ix], &[], blockhash)?;
         VersionedTransaction::try_new(VersionedMessage::V0(msg), &[signer]).map_err(Into::into)
     }
+}
 
-    fn fetch_tip_lamports(&self) -> Result<u64> {
-        let resp: Value = self.http.get(TIP_FLOOR_URL).send()?.json()?;
-        parse_tip_floor_lamports(&resp)
-    }
+/// `share` of `profit_lamports`, at least `floor` and at most `cap` (the cap wins).
+fn tip(profit_lamports: u64, share: f64, floor: u64, cap: u64) -> u64 {
+    let wanted = (profit_lamports as f64 * share.max(0.0)) as u64;
+    wanted.max(floor).min(cap)
+}
+
+fn fetch_tip_floor(http: &Client) -> Result<u64> {
+    let resp: Value = http.get(TIP_FLOOR_URL).send()?.json()?;
+    parse_tip_floor_lamports(&resp)
 }
 
 fn select_tip_account() -> Result<Pubkey> {
@@ -431,6 +376,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_inflight_status_tells_whether_the_bundle_can_still_land() {
+        let status = |value: Value| {
+            parse_inflight_status(
+                &json!({ "result": { "context": { "slot": 1 }, "value": [value] } }),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            status(json!({ "bundle_id": "x", "status": "Pending", "landed_slot": null })),
+            Some(InflightStatus::Pending)
+        );
+        assert!(status(json!({ "status": "Failed" })).unwrap().is_dead());
+        assert!(status(json!({ "status": "Invalid" })).unwrap().is_dead());
+        assert!(!status(json!({ "status": "Landed", "landed_slot": 5 }))
+            .unwrap()
+            .is_dead());
+        assert_eq!(status(json!({})), None);
+        assert!(parse_inflight_status(&json!({ "error": { "code": -32602 } })).is_err());
+    }
+
+    #[test]
+    fn a_request_slot_is_held_until_used_and_then_spaced_out() {
+        let jito = JitoClient::new(None, None);
+        let slot = jito.try_reserve().expect("free at start");
+        assert!(jito.try_reserve().is_none(), "held by the first caller");
+        drop(slot);
+        let slot = jito.try_reserve().expect("given back unused");
+        slot.mark_sent();
+        drop(slot);
+        assert!(
+            jito.try_reserve().is_none(),
+            "used: the next one is a second away"
+        );
+    }
+
+    #[test]
+    fn waiting_for_the_slot_never_makes_a_try_wait() {
+        let jito = std::sync::Arc::new(JitoClient::new(None, None));
+        let held = jito.try_reserve().unwrap();
+        let waiter = {
+            let jito = std::sync::Arc::clone(&jito);
+            thread::spawn(move || {
+                let slot = jito.reserve();
+                slot.mark_sent();
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        assert!(jito.try_reserve().is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(10),
+            "the try didn't wait"
+        );
+        drop(held);
+        waiter.join().unwrap();
+        assert!(
+            jito.try_reserve().is_none(),
+            "the waiter took it and used it"
+        );
+    }
+
+    #[test]
+    fn the_tip_is_a_share_of_the_profit_between_the_floor_and_the_cap() {
+        // 8% of 10M lamports of profit.
+        assert_eq!(tip(10_000_000, 0.08, 5_000, 5_000_000), 800_000);
+        assert_eq!(
+            tip(10_000, 0.08, 5_000, 5_000_000),
+            5_000,
+            "at least the floor"
+        );
+        assert_eq!(
+            tip(1_000_000_000, 0.08, 5_000, 5_000_000),
+            5_000_000,
+            "the cap"
+        );
+        assert_eq!(
+            tip(10_000, 0.08, 9_000_000, 5_000_000),
+            5_000_000,
+            "the cap wins"
+        );
+    }
+
+    #[test]
     fn test_parse_send_bundle_result_ok() {
         let resp = json!({ "jsonrpc": "2.0", "id": 1, "result": "abc123" });
         assert_eq!(parse_send_bundle_result(&resp).unwrap(), "abc123");
@@ -455,29 +483,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_bundle_status_confirmed() {
-        let resp = json!({
-            "result": { "context": { "slot": 1 }, "value": [ { "confirmation_status": "confirmed" } ] }
-        });
-        assert_eq!(
-            parse_bundle_status(&resp).unwrap().as_deref(),
-            Some("confirmed")
-        );
-    }
-
-    #[test]
-    fn test_parse_bundle_status_none_yet() {
-        let resp = json!({ "result": { "context": { "slot": 1 }, "value": [] } });
-        assert_eq!(parse_bundle_status(&resp).unwrap(), None);
-    }
-
-    #[test]
-    fn test_parse_bundle_status_error() {
-        let resp = json!({ "error": { "code": -32000, "message": "boom" } });
-        assert!(parse_bundle_status(&resp).is_err());
-    }
-
-    #[test]
     fn test_static_tip_accounts() {
         assert_eq!(JITO_TIP_ACCOUNTS.len(), 8);
         let accts: Vec<_> = JITO_TIP_ACCOUNTS
@@ -486,64 +491,6 @@ mod tests {
             .collect();
         let unique: std::collections::HashSet<_> = accts.iter().collect();
         assert_eq!(unique.len(), 8);
-    }
-
-    #[test]
-    fn test_parse_simulate_bundle_succeeded() {
-        let resp = json!({
-            "result": { "context": { "slot": 1 }, "value": {
-                "summary": "succeeded",
-                "transactionResults": []
-            } }
-        });
-        let sim = parse_simulate_bundle(&resp, &[]).unwrap();
-        assert!(sim.succeeded);
-        assert!(sim.error_message.is_none());
-    }
-
-    fn signed(byte: u8) -> VersionedTransaction {
-        VersionedTransaction {
-            signatures: vec![solana_signature::Signature::from([byte; 64])],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn test_parse_simulate_bundle_reports_failed_index() {
-        let resp = json!({
-            "result": { "context": { "slot": 1 }, "value": {
-                "summary": { "failed": { "error": { "TransactionFailure": [
-                    vec![2u8; 64],
-                    "Error processing Instruction 3: custom program error: 0x17a1"
-                ] }, "tx_signature": "sig" } },
-                "transactionResults": []
-            } }
-        });
-        let sim = parse_simulate_bundle(&resp, &[signed(1), signed(2)]).unwrap();
-        assert!(!sim.succeeded);
-        assert_eq!(sim.failed_tx_index, Some(1));
-    }
-
-    #[test]
-    fn test_parse_simulate_bundle_other_failure() {
-        let resp = json!({
-            "result": { "context": { "slot": 1 }, "value": {
-                "summary": { "failed": { "error": { "TransactionFailure": [
-                    vec![9u8; 64],
-                    "Error processing Instruction 1: custom program error: 0x1"
-                ] } } },
-                "transactionResults": []
-            } }
-        });
-        let sim = parse_simulate_bundle(&resp, &[signed(1)]).unwrap();
-        assert!(!sim.succeeded);
-        assert_eq!(sim.failed_tx_index, None);
-    }
-
-    #[test]
-    fn test_parse_simulate_bundle_rpc_error() {
-        let resp = json!({ "error": { "code": -32601, "message": "method not found" } });
-        assert!(parse_simulate_bundle(&resp, &[]).is_err());
     }
 
     #[test]
@@ -562,18 +509,5 @@ mod tests {
     fn test_parse_tip_floor_lamports_empty() {
         let resp = json!([]);
         assert!(parse_tip_floor_lamports(&resp).is_err());
-    }
-
-    #[test]
-    fn test_build_simulate_config_inspect_last_only() {
-        let acct = Pubkey::new_unique();
-        let cfg = build_simulate_config(3, std::slice::from_ref(&acct));
-        let post = cfg["postExecutionAccountsConfigs"].as_array().unwrap();
-        assert_eq!(post.len(), 3);
-        assert_eq!(post[0]["addresses"].as_array().unwrap().len(), 0);
-        assert_eq!(post[2]["addresses"].as_array().unwrap().len(), 1);
-        assert_eq!(post[2]["addresses"][0].as_str().unwrap(), acct.to_string());
-        assert_eq!(cfg["skipSigVerify"], json!(true));
-        assert_eq!(cfg["replaceRecentBlockhash"], json!(true));
     }
 }
