@@ -4,7 +4,7 @@ use crate::{
     config::Eva01Config,
     execution::{
         activity::LiquidationActivity,
-        executor::{pushable_feed, BundleLanding, Executor},
+        executor::{pending_feeds, pushable_feed, BundleLanding, Executor},
         inventory::InventoryStrategy,
         queue::{ExecutionQueue, QueuedIntent},
         reservations::TokenReservations,
@@ -26,7 +26,7 @@ use crate::{
             is_seizable_asset_tag, LiquidationPair, LiquidatorAccount, PreparedLiquidatableAccount,
         },
         marginfi_account::{MarginfiAccountWrapper, ObservationAccounts},
-        oracle::{oracle_publish_time, OracleWrapper, OracleWrapperTrait},
+        oracle::{oracle_publish_time, stake_pool_is_empty, OracleWrapper, OracleWrapperTrait},
     },
 };
 use anchor_lang::AccountDeserialize;
@@ -124,6 +124,10 @@ const PREMIUM_SAFETY_MARGIN: I80F48 = I80F48!(0.005);
 /// Liquidations are sized to this share of the most the program allows, leaving room for price
 /// moves between evaluation and landing; profit is judged on the same share.
 const LIQUIDATION_SIZE_HAIRCUT: I80F48 = I80F48!(0.90);
+
+/// A liquidation the chain's prices already allow goes behind a push only when the push lets it
+/// earn this much more: a push takes a bundle slot and can lose to the chain catching up.
+const PUSH_PROFIT_GAIN: I80F48 = I80F48!(1.2);
 
 /// A pair that is cheaper to execute wins unless the heavier one earns more than this share more:
 /// landing first matters far more than the last few cents of premium.
@@ -236,6 +240,9 @@ pub struct Liquidator {
 /// re-evaluate an account on the current state right before liquidating it).
 struct Evaluator {
     cache: Arc<Cache>,
+    /// Builds price pushes, to check which a liquidation can go behind; `None` with bundles off,
+    /// when nothing is pushed.
+    pusher: Option<Arc<PythPusher>>,
     min_profit: f64,
     /// Liquidations earning more than this are left to another instance (a dust instance's cap).
     max_profit: Option<f64>,
@@ -474,9 +481,14 @@ impl Liquidator {
 
         let rpc_client =
             RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
-        let bundles = if config.price_push_enabled {
+        let pusher = if config.price_push_enabled {
+            Some(Arc::new(PythPusher::new(&config, cache.clone())?))
+        } else {
+            None
+        };
+        let bundles = if let Some(pusher) = &pusher {
             Some(BundleLanding {
-                pusher: PythPusher::new(&config, cache.clone())?,
+                pusher: pusher.clone(),
                 jito: JitoClient::new(
                     config.jito_block_engine_url.clone(),
                     config.bundle_api_key.clone(),
@@ -512,6 +524,7 @@ impl Liquidator {
             strategy: Arc::new(strategy),
             evaluator: Arc::new(Evaluator {
                 cache: cache.clone(),
+                pusher,
                 min_profit: config.min_profit,
                 max_profit: config.max_profit,
             }),
@@ -1166,6 +1179,16 @@ impl Evaluator {
         if deposit_shares.is_empty() || liab_shares.is_empty() {
             return Ok(None);
         }
+        // The program can't price such an account at all, so nobody can liquidate it.
+        let active = MarginfiAccountWrapper::get_active_banks(&account.account.lending_account);
+        if active.iter().any(|bank| {
+            self.cache
+                .banks
+                .try_get_bank(bank)
+                .is_ok_and(|bank| stake_pool_is_empty(&self.cache, &bank.bank))
+        }) {
+            return Ok(None);
+        }
 
         let deposit_values = self.get_value_of_shares(
             &clock,
@@ -1344,10 +1367,10 @@ impl Evaluator {
         }
     }
 
-    /// Sizes the account's pairs on the prices the program will read. A liquidation that's
-    /// liquidatable only on Pyth prices the chain doesn't hold yet goes behind a push of the few
-    /// feeds that lower its health the most, and is sized on them with every other feed at the
-    /// chain's price.
+    /// Sizes the account's pairs on the prices the program will read. Where eva prices Pyth feeds
+    /// ahead of the chain, a liquidation goes behind a push of the few that lower the account's
+    /// health the most, sized on them with every other feed at the chain's price, unless the
+    /// chain's prices already allow one earning nearly as much.
     #[allow(clippy::too_many_arguments)]
     fn compute_max_liquidatable_amounts_with_banks(
         &self,
@@ -1384,22 +1407,20 @@ impl Evaluator {
             return Ok(PairSearch::Sized(sizing));
         }
 
-        let pushed = match self.choose_pushes(
-            cache,
-            &clock,
-            account,
-            group,
-            banks_and_oracles,
-            &behind,
-        ) {
-            Ok(Some(pushed)) => pushed,
-            Ok(None) => {
-                debug!(
-                    "Account {}: liquidatable only on more Pyth prices than one bundle pushes",
-                    account.address
-                );
-                return Ok(PairSearch::None);
-            }
+        let health = |pushed: &[Pubkey]| -> Result<I80F48> {
+            let mut accounts = program_accounts(cache, banks_and_oracles, Some(pushed))?;
+            let (assets, liabilities) = health_components(
+                account,
+                group,
+                &clock,
+                banks_and_oracles,
+                &mut accounts,
+                RequirementType::Maintenance,
+            )?;
+            Ok(assets - liabilities)
+        };
+        let on_chain = match health(&[]) {
+            Ok(health) => health,
             // The chain's price is unusable as it stands (too old for the program, say): only
             // pushing every feed can make this liquidation pass.
             Err(e) => {
@@ -1413,53 +1434,78 @@ impl Evaluator {
                 }));
             }
         };
-        match size(program_accounts(cache, banks_and_oracles, Some(&pushed))?)? {
-            PairSearch::Sized(sizing) => Ok(PairSearch::Sized(Sizing {
-                push_oracles: pushed,
-                ..sizing
-            })),
-            // Healthy on the prices the program will read.
-            _ => Ok(PairSearch::None),
-        }
+
+        // On the chain's prices as they stand, when those already find the account unhealthy.
+        let unpushed = if on_chain < I80F48::ZERO {
+            match size(program_accounts(cache, banks_and_oracles, Some(&[]))?)? {
+                PairSearch::Sized(sizing) => Some(sizing),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // Behind a push of the feeds that lower its health the most, as many as a bundle carries.
+        let pushed = self
+            .strongest_fitting_pushes(cache, on_chain, &behind, |oracle| health(&[*oracle]).ok());
+        let pushed = if pushed.is_empty() {
+            None
+        } else {
+            match size(program_accounts(cache, banks_and_oracles, Some(&pushed))?)? {
+                PairSearch::Sized(sizing) => Some(Sizing {
+                    push_oracles: pushed,
+                    ..sizing
+                }),
+                _ => None,
+            }
+        };
+
+        let earned = |sizing: &Sizing| {
+            if sizing.amounts.is_liquidatable() {
+                sizing.amounts.liquidator_profit
+            } else {
+                I80F48::ZERO
+            }
+        };
+        Ok(match (unpushed, pushed) {
+            (Some(unpushed), Some(pushed))
+                if earned(&pushed) > earned(&unpushed) * PUSH_PROFIT_GAIN =>
+            {
+                PairSearch::Sized(pushed)
+            }
+            (Some(unpushed), _) => PairSearch::Sized(unpushed),
+            (None, Some(pushed)) => PairSearch::Sized(pushed),
+            (None, None) => {
+                debug!(
+                    "Account {}: liquidatable only on Pyth prices one bundle can't push",
+                    account.address
+                );
+                PairSearch::None
+            }
+        })
     }
 
-    /// The Pyth oracles to push for the program to find the account unhealthy: none when the
-    /// chain's prices already do, otherwise the ones whose newer price lowers its health the most,
-    /// as many as one push carries. `None` when those aren't enough; an error when the chain's
-    /// prices can't price the account.
-    fn choose_pushes(
+    /// Of the `behind` oracles, those whose newer price alone (`health_with`) lowers the account's
+    /// health below `on_chain` the most, as many as one bundle's push carries. None with bundles
+    /// off, when nothing is pushed.
+    fn strongest_fitting_pushes(
         &self,
         cache: &Cache,
-        clock: &Clock,
-        account: &MarginfiAccountWrapper,
-        group: &MarginfiGroup,
-        banks_and_oracles: &[Pubkey],
+        on_chain: I80F48,
         behind: &[Pubkey],
-    ) -> Result<Option<Vec<Pubkey>>> {
-        let health = |pushed: &[Pubkey]| -> Result<I80F48> {
-            let mut accounts = program_accounts(cache, banks_and_oracles, Some(pushed))?;
-            let (assets, liabilities) = health_components(
-                account,
-                group,
-                clock,
-                banks_and_oracles,
-                &mut accounts,
-                RequirementType::Maintenance,
-            )?;
-            Ok(assets - liabilities)
+        health_with: impl Fn(&Pubkey) -> Option<I80F48>,
+    ) -> Vec<Pubkey> {
+        let Some(pusher) = &self.pusher else {
+            return Vec::new();
         };
-        let on_chain = health(&[])?;
-        if on_chain < I80F48::ZERO {
-            return Ok(Some(Vec::new()));
-        }
         let singles = behind
             .iter()
-            .filter_map(|oracle| health(&[*oracle]).ok().map(|h| (h, *oracle)));
-        let pushed = strongest_pushes(on_chain, singles);
-        if pushed.is_empty() || health(&pushed)? >= I80F48::ZERO {
-            return Ok(None);
+            .filter_map(|oracle| health_with(oracle).map(|h| (h, *oracle)));
+        let mut pushed = strongest_pushes(on_chain, singles);
+        // Dropping the weakest first.
+        while !pushed.is_empty() && pusher.check(&pending_feeds(cache, &pushed)).is_err() {
+            pushed.pop();
         }
-        Ok(Some(pushed))
+        pushed
     }
 
     /// Sizes every pair on `accounts`, the bank and oracle accounts behind `banks_and_oracles`.
@@ -1961,13 +2007,24 @@ mod push_choice_tests {
         ];
         assert_eq!(
             strongest_pushes(I80F48!(5), singles.into_iter()),
-            vec![sol, eth]
+            vec![sol, eth, jup]
         );
         // A feed that moved in the account's favour is never pushed, even with room to spare.
         assert_eq!(
             strongest_pushes(I80F48!(5), [(I80F48!(6), usdc)].into_iter()),
             Vec::<Pubkey>::new()
         );
+    }
+
+    #[test]
+    fn no_more_feeds_are_ranked_than_a_push_carries() {
+        let singles: Vec<(I80F48, Pubkey)> = (0..MAX_PUSHED_FEEDS + 3)
+            .map(|i| (I80F48::from_num(-(i as i32)), Pubkey::new_unique()))
+            .collect();
+        let ranked = strongest_pushes(I80F48!(1), singles.clone().into_iter());
+        assert_eq!(ranked.len(), MAX_PUSHED_FEEDS);
+        // The one lowering health most comes first, so dropping from the end drops the weakest.
+        assert_eq!(ranked[0], singles.last().unwrap().1);
     }
 
     #[test]

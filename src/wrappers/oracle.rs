@@ -20,6 +20,22 @@ use crate::{cache::Cache, utils::staked_onramp};
 
 const SOL_POOL_INDEX: usize = 2;
 
+/// Where an SPL mint's `supply: u64` sits, after its `mint_authority: COption<Pubkey>`.
+const MINT_SUPPLY: std::ops::Range<usize> = 36..44;
+
+/// Whether `bank` prices staked collateral from a stake pool whose LST mint has no supply. The
+/// program can't price it (`ZeroSupplyInStakePool`), and prints so every time it tries.
+pub fn stake_pool_is_empty(cache: &Cache, bank: &Bank) -> bool {
+    bank.config.oracle_setup == OracleSetup::StakedWithPythPush
+        && cache
+            .oracles
+            .try_get_account(&bank.config.oracle_keys[1])
+            .ok()
+            .and_then(|mint| mint.data.get(MINT_SUPPLY)?.try_into().ok())
+            .map(u64::from_le_bytes)
+            == Some(0)
+}
+
 pub fn oracle_account_keys(bank: &Bank, bank_address: &Pubkey) -> Result<Vec<Pubkey>> {
     let key = |index: usize| -> Result<Pubkey> {
         let key = bank.config.oracle_keys[index];
@@ -149,6 +165,11 @@ impl OracleWrapper {
             None => &bank_wrapper.bank,
         };
 
+        if stake_pool_is_empty(cache, bank) {
+            return Err(anyhow!(
+                "Bank {bank_address} can't be priced: its stake pool has no supply"
+            ));
+        }
         let addresses = oracle_account_keys(bank, bank_address)?;
         let mut accounts = addresses
             .iter()
@@ -262,5 +283,40 @@ mod tests {
 
         assert_eq!(oracle_publish_time(&account, &[]), Some(1_234));
         assert_eq!(oracle_publish_time(&Account::default(), &[]), None);
+    }
+
+    #[test]
+    fn a_staked_bank_is_unpriceable_only_while_its_stake_pool_has_no_supply() {
+        let mut cache = Cache::new(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            std::sync::Arc::new(std::sync::Mutex::new(Clock::default())),
+            std::collections::HashSet::new(),
+        );
+        let mint_with = |supply: u64| {
+            let mut data = vec![0u8; 82];
+            data[MINT_SUPPLY].copy_from_slice(&supply.to_le_bytes());
+            Account {
+                data,
+                ..Account::default()
+            }
+        };
+        let (empty, held) = (Pubkey::new_unique(), Pubkey::new_unique());
+        cache.oracles.try_insert(empty, mint_with(0)).unwrap();
+        cache.oracles.try_insert(held, mint_with(1_000)).unwrap();
+        let staked = |mint: Pubkey| {
+            let mut bank: Bank = bytemuck::Zeroable::zeroed();
+            bank.config.oracle_setup = OracleSetup::StakedWithPythPush;
+            bank.config.oracle_keys[1] = mint;
+            bank
+        };
+
+        assert!(stake_pool_is_empty(&cache, &staked(empty)));
+        assert!(!stake_pool_is_empty(&cache, &staked(held)));
+        // Not cached: priced as usual, and the program says what's missing.
+        assert!(!stake_pool_is_empty(&cache, &staked(Pubkey::new_unique())));
+        let mut plain = staked(empty);
+        plain.config.oracle_setup = OracleSetup::PythPushOracle;
+        assert!(!stake_pool_is_empty(&cache, &plain));
     }
 }

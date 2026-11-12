@@ -19,6 +19,7 @@ use log::warn;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_message::{v0, Hash, VersionedMessage};
 use solana_pubkey::Pubkey;
@@ -315,20 +316,24 @@ impl TipEstimator {
         tip(profit_lamports, self.profit_share, floor, self.max_lamports)
     }
 
-    /// The tip transfer, the bundle's last transaction. It can't go inside the liquidation:
-    /// marginfi accepts only swap programs between a receivership's start and end, and nothing
-    /// after the end.
+    /// The tip transfer as the bundle's last transaction, unless a price push carries it. It can't
+    /// go inside the liquidation: marginfi accepts only swap programs between a receivership's
+    /// start and end, and nothing after the end.
     pub fn build_tip_transaction(
         &self,
         signer: &Keypair,
         blockhash: Hash,
         lamports: u64,
     ) -> Result<VersionedTransaction> {
-        let tip_account = select_tip_account()?;
-        let ix = transfer(&signer.pubkey(), &tip_account, lamports);
+        let ix = tip_instruction(&signer.pubkey(), lamports)?;
         let msg = v0::Message::try_compile(&signer.pubkey(), &[ix], &[], blockhash)?;
         VersionedTransaction::try_new(VersionedMessage::V0(msg), &[signer]).map_err(Into::into)
     }
+}
+
+/// A transfer of `lamports` from `payer` to one of Jito's tip accounts.
+pub fn tip_instruction(payer: &Pubkey, lamports: u64) -> Result<Instruction> {
+    Ok(transfer(payer, &select_tip_account()?, lamports))
 }
 
 /// `share` of `profit_lamports`, at least `floor` and at most `cap` (the cap wins).

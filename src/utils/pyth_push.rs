@@ -15,8 +15,9 @@ use solana_client::rpc_client::RpcClient;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
-use solana_message::{v0, VersionedMessage};
+use solana_message::{v0, Hash, VersionedMessage};
 use solana_pubkey::Pubkey;
+use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
 use solana_transaction::versioned::VersionedTransaction;
@@ -29,18 +30,24 @@ use std::sync::Arc;
 use crate::cache::Cache;
 use crate::config::Eva01Config;
 use crate::transaction_limits::{MAX_BUNDLE_TXS, MAX_COMPUTE_UNIT_LIMIT, MAX_V0_TX_SIZE};
+use crate::utils::jito::tip_instruction;
 use crate::utils::pyth_cranker::{
     close_encoded_vaa_ix, guardian_set_index, init_encoded_vaa_ix, price_feed_address,
     update_price_feed_ix, verify_encoded_vaa_ix, write_encoded_vaa_ix, VAA_HEADER_SIZE,
     VAA_SPLIT_INDEX,
 };
 
-/// The push transactions a bundle has room for: the liquidation and the tip take two.
-pub const MAX_PUSH_TXS: usize = MAX_BUNDLE_TXS - 2;
+/// The push transactions a bundle has room for when the tip is a transaction of its own: the
+/// liquidation and the tip take two.
+const MAX_PUSH_TXS: usize = MAX_BUNDLE_TXS - 2;
 
-/// The feeds one push carries within `MAX_PUSH_TXS`: posting and verifying the VAA fill the first
-/// two transactions, and the third holds two feed updates and the VAA's close.
-pub const MAX_PUSHED_FEEDS: usize = 2;
+/// The push transactions a bundle has room for when the last of them carries the tip.
+const MAX_PUSH_TXS_WITH_TIP: usize = MAX_BUNDLE_TXS - 1;
+
+/// The most feeds a liquidation is sized on pushing. Posting and verifying the VAA take two
+/// transactions and each further one holds about two updates, so a bundle carries about four;
+/// how many fit is checked by building the push (`PythPusher::check`).
+pub const MAX_PUSHED_FEEDS: usize = 4;
 
 pub struct PythPusher {
     cache: Arc<Cache>,
@@ -55,6 +62,8 @@ pub struct PythPusher {
 /// always closed by the last.
 pub struct PricePush {
     pub txs: Vec<VersionedTransaction>,
+    /// The last transaction carries the bundle's tip: a tip transaction of its own didn't fit.
+    pub carries_tip: bool,
 }
 
 impl PythPusher {
@@ -73,8 +82,86 @@ impl PythPusher {
         })
     }
 
-    /// Builds the transactions that post the latest Hermes prices of `feed_ids`.
-    pub fn push_transactions(&self, feed_ids: &[[u8; 32]]) -> Result<PricePush> {
+    /// The transactions that post the latest Hermes prices of `feed_ids` ahead of a liquidation.
+    /// The bundle's tip of `tip_lamports` stays a transaction of its own, the bundle's last, when
+    /// the push leaves room for it; otherwise the push's last transaction pays it.
+    pub fn push_transactions(&self, feed_ids: &[[u8; 32]], tip_lamports: u64) -> Result<PricePush> {
+        let tip = tip_instruction(&self.payer.pubkey(), tip_lamports)?;
+        let (layout, encoded_vaa) = self.layout(feed_ids, &tip)?;
+        let blockhash = self.cache.blockhash.get(&self.rpc_client)?;
+        let mut txs = Vec::with_capacity(layout.chunks.len());
+        for (i, chunk) in layout.chunks.iter().enumerate() {
+            // The first transaction creates the VAA account, which signs for itself.
+            let signers: &[&Keypair] = if i == 0 {
+                &[&self.payer, &encoded_vaa]
+            } else {
+                &[&self.payer]
+            };
+            txs.push(self.sign(chunk, signers, blockhash)?);
+        }
+        debug!(
+            "PythPusher: {} transaction(s) push {} feed(s){}",
+            txs.len(),
+            feed_ids.len(),
+            if layout.carries_tip {
+                ", the last carrying the tip"
+            } else {
+                ""
+            }
+        );
+        Ok(PricePush {
+            txs,
+            carries_tip: layout.carries_tip,
+        })
+    }
+
+    /// Whether a push of `feed_ids` fits a bundle on the updates streamed so far. Nothing is
+    /// signed or fetched: only the transactions' sizes are measured.
+    pub fn check(&self, feed_ids: &[[u8; 32]]) -> Result<()> {
+        // A tip's size doesn't depend on its amount.
+        let tip = tip_instruction(&self.payer.pubkey(), 0)?;
+        self.layout(feed_ids, &tip).map(|_| ())
+    }
+
+    /// The push's instructions split into the transactions that fit a bundle: without the tip
+    /// when there's room for a tip transaction of its own, otherwise with it in the last one.
+    fn layout(&self, feed_ids: &[[u8; 32]], tip: &Instruction) -> Result<(Layout, Keypair)> {
+        let encoded_vaa = Keypair::new();
+        let (post, mut rest) = self.instructions(feed_ids, &encoded_vaa.pubkey())?;
+        let mut chunks = vec![post.clone()];
+        chunks.extend(self.pack(&rest)?);
+        if chunks.len() <= MAX_PUSH_TXS {
+            let layout = Layout {
+                chunks,
+                carries_tip: false,
+            };
+            return Ok((layout, encoded_vaa));
+        }
+        rest.push(tip.clone());
+        let mut chunks = vec![post];
+        chunks.extend(self.pack(&rest)?);
+        if chunks.len() > MAX_PUSH_TXS_WITH_TIP {
+            return Err(anyhow!(
+                "pushing {} feeds takes {} transactions (max {})",
+                feed_ids.len(),
+                chunks.len(),
+                MAX_PUSH_TXS_WITH_TIP
+            ));
+        }
+        let layout = Layout {
+            chunks,
+            carries_tip: true,
+        };
+        Ok((layout, encoded_vaa))
+    }
+
+    /// The push's instructions: the first transaction's, which create the VAA account at
+    /// `vaa_account` and write its head, then the rest in order.
+    fn instructions(
+        &self,
+        feed_ids: &[[u8; 32]],
+        vaa_account: &Pubkey,
+    ) -> Result<(Vec<Instruction>, Vec<Instruction>)> {
         // A streamed update is pushed only while it is still ahead of the chain.
         let prices = &self.cache.pyth_prices;
         let (vaa, updates) = prices
@@ -93,8 +180,6 @@ impl PythPusher {
 
         let payer = self.payer.pubkey();
         let wormhole = &self.wormhole_program_id;
-        let encoded_vaa = Keypair::new();
-        let vaa_account = encoded_vaa.pubkey();
         let vaa_account_size = VAA_HEADER_SIZE + vaa.len();
         // The chain's rent, served at startup (see `rent_sysvar`); the RPC only if it isn't.
         let lamports = match <solana_sysvar::rent::Rent as solana_sysvar::Sysvar>::get() {
@@ -108,23 +193,23 @@ impl PythPusher {
         let post = vec![
             system_instruction::create_account(
                 &payer,
-                &vaa_account,
+                vaa_account,
                 lamports,
                 vaa_account_size as u64,
                 wormhole,
             ),
-            init_encoded_vaa_ix(wormhole, &payer, &vaa_account),
-            write_encoded_vaa_ix(wormhole, &payer, &vaa_account, 0, &vaa[..split]),
+            init_encoded_vaa_ix(wormhole, &payer, vaa_account),
+            write_encoded_vaa_ix(wormhole, &payer, vaa_account, 0, &vaa[..split]),
         ];
 
-        // Everything after the first transaction, in order: the VAA's tail, its verification, one
-        // update per feed, then the close that reclaims the VAA account's rent.
+        // The VAA's tail, its verification, one update per feed, then the close that reclaims the
+        // VAA account's rent.
         let mut rest = Vec::new();
         if split < vaa.len() {
             rest.push(write_encoded_vaa_ix(
                 wormhole,
                 &payer,
-                &vaa_account,
+                vaa_account,
                 split as u32,
                 &vaa[split..],
             ));
@@ -132,51 +217,28 @@ impl PythPusher {
         rest.push(verify_encoded_vaa_ix(
             wormhole,
             &payer,
-            &vaa_account,
+            vaa_account,
             guardian_set_index(vaa)?,
         ));
         for (feed_id, merkle_price_update) in feed_ids.iter().zip(updates) {
             rest.push(update_price_feed_ix(
                 &payer,
-                &vaa_account,
+                vaa_account,
                 *feed_id,
                 merkle_price_update,
             )?);
         }
-        rest.push(close_encoded_vaa_ix(wormhole, &payer, &vaa_account));
-
-        let blockhash = self.cache.blockhash.get(&self.rpc_client)?;
-        let mut txs = vec![self.compile(&post, &[&self.payer, &encoded_vaa], blockhash)?];
-        for chunk in self.pack(&rest, blockhash)? {
-            txs.push(self.compile(&chunk, &[&self.payer], blockhash)?);
-        }
-        if txs.len() > MAX_PUSH_TXS {
-            return Err(anyhow!(
-                "pushing {} feeds takes {} transactions (max {})",
-                feed_ids.len(),
-                txs.len(),
-                MAX_PUSH_TXS
-            ));
-        }
-        debug!(
-            "PythPusher: {} transaction(s) push {} feed(s)",
-            txs.len(),
-            feed_ids.len()
-        );
-        Ok(PricePush { txs })
+        rest.push(close_encoded_vaa_ix(wormhole, &payer, vaa_account));
+        Ok((post, rest))
     }
 
     /// Splits `ixs`, in order, into as few transactions as fit.
-    fn pack(
-        &self,
-        ixs: &[Instruction],
-        blockhash: solana_message::Hash,
-    ) -> Result<Vec<Vec<Instruction>>> {
+    fn pack(&self, ixs: &[Instruction]) -> Result<Vec<Vec<Instruction>>> {
         let mut chunks: Vec<Vec<Instruction>> = Vec::new();
         let mut current: Vec<Instruction> = Vec::new();
         for ix in ixs {
             current.push(ix.clone());
-            if self.compile(&current, &[&self.payer], blockhash).is_err() {
+            if !self.fits(&current)? {
                 current.pop();
                 if current.is_empty() {
                     return Err(anyhow!(
@@ -193,28 +255,52 @@ impl PythPusher {
         Ok(chunks)
     }
 
-    fn compile(
-        &self,
-        ixs: &[Instruction],
-        signers: &[&Keypair],
-        blockhash: solana_message::Hash,
-    ) -> Result<VersionedTransaction> {
+    /// The message for `ixs` behind the compute budget, paid by the payer.
+    fn message(&self, ixs: &[Instruction], blockhash: Hash) -> Result<v0::Message> {
         let mut all = vec![
             // VAA verification is the heaviest step.
             ComputeBudgetInstruction::set_compute_unit_limit(MAX_COMPUTE_UNIT_LIMIT),
             ComputeBudgetInstruction::set_compute_unit_price(self.cu_price_micro_lamports),
         ];
         all.extend_from_slice(ixs);
-        let message = v0::Message::try_compile(&self.payer.pubkey(), &all, &[], blockhash)?;
-        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), signers)?;
-        let size = bincode::serialize(&tx)?.len();
-        if size > MAX_V0_TX_SIZE {
-            return Err(anyhow!(
-                "transaction is {size} bytes (max {MAX_V0_TX_SIZE})"
-            ));
-        }
-        Ok(tx)
+        Ok(v0::Message::try_compile(
+            &self.payer.pubkey(),
+            &all,
+            &[],
+            blockhash,
+        )?)
     }
+
+    /// Whether `ixs` fit one transaction. The size depends on neither the blockhash nor the
+    /// signatures' values, so nothing is fetched or signed.
+    fn fits(&self, ixs: &[Instruction]) -> Result<bool> {
+        let message = self.message(ixs, Hash::default())?;
+        let signatures = usize::from(message.header.num_required_signatures);
+        let tx = VersionedTransaction {
+            signatures: vec![Signature::default(); signatures],
+            message: VersionedMessage::V0(message),
+        };
+        Ok(bincode::serialize(&tx)?.len() <= MAX_V0_TX_SIZE)
+    }
+
+    fn sign(
+        &self,
+        ixs: &[Instruction],
+        signers: &[&Keypair],
+        blockhash: Hash,
+    ) -> Result<VersionedTransaction> {
+        let message = self.message(ixs, blockhash)?;
+        Ok(VersionedTransaction::try_new(
+            VersionedMessage::V0(message),
+            signers,
+        )?)
+    }
+}
+
+/// A push's instructions per transaction.
+struct Layout {
+    chunks: Vec<Vec<Instruction>>,
+    carries_tip: bool,
 }
 
 #[cfg(test)]
@@ -245,14 +331,17 @@ mod tests {
                 data: vec![i; 400],
             })
             .collect();
-        let blockhash = solana_message::Hash::default();
-        let chunks = pusher.pack(&ixs, blockhash).unwrap();
+        let chunks = pusher.pack(&ixs).unwrap();
 
         assert!(chunks.len() > 1);
         let order: Vec<u8> = chunks.iter().flatten().map(|ix| ix.data[0]).collect();
         assert_eq!(order, (0..6).collect::<Vec<u8>>());
+        // Measured unsigned, each still fits once signed on a real blockhash.
         for chunk in &chunks {
-            assert!(pusher.compile(chunk, &[&pusher.payer], blockhash).is_ok());
+            let tx = pusher
+                .sign(chunk, &[&pusher.payer], Hash::new_unique())
+                .unwrap();
+            assert!(bincode::serialize(&tx).unwrap().len() <= MAX_V0_TX_SIZE);
         }
     }
 }
