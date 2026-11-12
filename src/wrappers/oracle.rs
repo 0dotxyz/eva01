@@ -20,6 +20,32 @@ use crate::{cache::Cache, utils::staked_onramp};
 
 const SOL_POOL_INDEX: usize = 2;
 
+/// Where an SPL mint's `supply: u64` sits, after its `mint_authority: COption<Pubkey>`.
+const MINT_SUPPLY: std::ops::Range<usize> = 36..44;
+
+/// Where an SPL stake pool's `pool_token_supply: u64` sits: after its account type, five
+/// authorities and accounts, a bump, four more accounts and `total_lamports`.
+const POOL_TOKEN_SUPPLY: std::ops::Range<usize> = 266..274;
+
+/// Whether `bank` prices from a stake pool with no supply: the LST mint of staked collateral, or
+/// the SPL stake pool of an LST. The program can't price it (`ZeroSupplyInStakePool`), and
+/// prints so every time it tries.
+pub fn stake_pool_is_empty(cache: &Cache, bank: &Bank) -> bool {
+    let (key_index, supply) = match bank.config.oracle_setup {
+        OracleSetup::StakedWithPythPush => (1, MINT_SUPPLY),
+        OracleSetup::PythLST => (1, POOL_TOKEN_SUPPLY),
+        OracleSetup::KaminoLST | OracleSetup::JuplendLST => (2, POOL_TOKEN_SUPPLY),
+        _ => return false,
+    };
+    cache
+        .oracles
+        .try_get_account(&bank.config.oracle_keys[key_index])
+        .ok()
+        .and_then(|account| account.data.get(supply)?.try_into().ok())
+        .map(u64::from_le_bytes)
+        == Some(0)
+}
+
 pub fn oracle_account_keys(bank: &Bank, bank_address: &Pubkey) -> Result<Vec<Pubkey>> {
     let key = |index: usize| -> Result<Pubkey> {
         let key = bank.config.oracle_keys[index];
@@ -128,7 +154,19 @@ impl OracleWrapper {
     /// use cases where an approximate price is acceptable (e.g. the rebalancer's
     /// threshold comparisons) and a stale feed should not block execution.
     pub fn build_lenient(cache: &Cache, clock: &Clock, bank_address: &Pubkey) -> Result<Self> {
-        Self::build_inner(cache, clock, bank_address, Some(u16::MAX))
+        Self::build_inner(cache, clock, bank_address, Some(u16::MAX), None)
+    }
+
+    /// Builds the OracleWrapper on the prices the program reads once the Pyth oracles in `pushed`
+    /// are pushed: every other oracle eva prices ahead of the chain at the chain's price. `None`
+    /// keeps eva's prices.
+    pub fn build_on(
+        cache: &Cache,
+        clock: &Clock,
+        bank_address: &Pubkey,
+        pushed: Option<&[Pubkey]>,
+    ) -> Result<Self> {
+        Self::build_inner(cache, clock, bank_address, None, pushed)
     }
 
     fn build_inner(
@@ -136,6 +174,7 @@ impl OracleWrapper {
         clock: &Clock,
         bank_address: &Pubkey,
         max_age_override: Option<u16>,
+        pushed: Option<&[Pubkey]>,
     ) -> Result<Self> {
         let bank_wrapper = cache.banks.try_get_bank(bank_address)?;
 
@@ -149,10 +188,24 @@ impl OracleWrapper {
             None => &bank_wrapper.bank,
         };
 
+        if stake_pool_is_empty(cache, bank) {
+            return Err(anyhow!(
+                "Bank {bank_address} can't be priced: its stake pool has no supply"
+            ));
+        }
         let addresses = oracle_account_keys(bank, bank_address)?;
         let mut accounts = addresses
             .iter()
-            .map(|address| cache.oracles.try_get_account(address))
+            .map(|address| {
+                let cached = cache.oracles.try_get_account(address)?;
+                Ok(match pushed {
+                    Some(pushed) if !pushed.contains(address) => cache
+                        .pyth_prices
+                        .onchain_if_behind(address, &cached)
+                        .unwrap_or(cached),
+                    _ => cached,
+                })
+            })
             .collect::<Result<Vec<Account>>>()?;
 
         let remaining_ais: Vec<_> = addresses
@@ -180,7 +233,7 @@ impl OracleWrapperTrait for OracleWrapper {
     }
 
     fn build(cache: &Cache, clock: &Clock, bank_address: &Pubkey) -> Result<Self> {
-        Self::build_inner(cache, clock, bank_address, None)
+        Self::build_inner(cache, clock, bank_address, None, None)
     }
 }
 
@@ -262,5 +315,89 @@ mod tests {
 
         assert_eq!(oracle_publish_time(&account, &[]), Some(1_234));
         assert_eq!(oracle_publish_time(&Account::default(), &[]), None);
+    }
+
+    #[test]
+    fn a_staked_bank_is_unpriceable_only_while_its_stake_pool_has_no_supply() {
+        let mut cache = Cache::new(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            std::sync::Arc::new(std::sync::Mutex::new(Clock::default())),
+            std::collections::HashSet::new(),
+        );
+        let mint_with = |supply: u64| {
+            let mut data = vec![0u8; 82];
+            data[MINT_SUPPLY].copy_from_slice(&supply.to_le_bytes());
+            Account {
+                data,
+                ..Account::default()
+            }
+        };
+        let (empty, held) = (Pubkey::new_unique(), Pubkey::new_unique());
+        cache.oracles.try_insert(empty, mint_with(0)).unwrap();
+        cache.oracles.try_insert(held, mint_with(1_000)).unwrap();
+        let staked = |mint: Pubkey| {
+            let mut bank: Bank = bytemuck::Zeroable::zeroed();
+            bank.config.oracle_setup = OracleSetup::StakedWithPythPush;
+            bank.config.oracle_keys[1] = mint;
+            bank
+        };
+
+        assert!(stake_pool_is_empty(&cache, &staked(empty)));
+        assert!(!stake_pool_is_empty(&cache, &staked(held)));
+        // Not cached: priced as usual, and the program says what's missing.
+        assert!(!stake_pool_is_empty(&cache, &staked(Pubkey::new_unique())));
+        let mut plain = staked(empty);
+        plain.config.oracle_setup = OracleSetup::PythPushOracle;
+        assert!(!stake_pool_is_empty(&cache, &plain));
+    }
+
+    #[test]
+    fn an_lst_bank_is_unpriceable_only_while_its_spl_stake_pool_has_no_supply() {
+        let mut cache = Cache::new(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            std::sync::Arc::new(std::sync::Mutex::new(Clock::default())),
+            std::collections::HashSet::new(),
+        );
+        let pool_with = |supply: u64| {
+            let mut data = vec![0u8; 300];
+            data[POOL_TOKEN_SUPPLY].copy_from_slice(&supply.to_le_bytes());
+            Account {
+                data,
+                ..Account::default()
+            }
+        };
+        let (empty, held) = (Pubkey::new_unique(), Pubkey::new_unique());
+        cache.oracles.try_insert(empty, pool_with(0)).unwrap();
+        cache.oracles.try_insert(held, pool_with(5)).unwrap();
+        let lst = |setup: OracleSetup, index: usize, pool: Pubkey| {
+            let mut bank: Bank = bytemuck::Zeroable::zeroed();
+            bank.config.oracle_setup = setup;
+            bank.config.oracle_keys[index] = pool;
+            bank
+        };
+
+        assert!(stake_pool_is_empty(
+            &cache,
+            &lst(OracleSetup::PythLST, 1, empty)
+        ));
+        assert!(!stake_pool_is_empty(
+            &cache,
+            &lst(OracleSetup::PythLST, 1, held)
+        ));
+        assert!(stake_pool_is_empty(
+            &cache,
+            &lst(OracleSetup::KaminoLST, 2, empty)
+        ));
+        assert!(stake_pool_is_empty(
+            &cache,
+            &lst(OracleSetup::JuplendLST, 2, empty)
+        ));
+        // The pool is read from the key the setup uses.
+        assert!(!stake_pool_is_empty(
+            &cache,
+            &lst(OracleSetup::KaminoLST, 1, empty)
+        ));
     }
 }

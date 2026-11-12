@@ -57,9 +57,21 @@ enum Preflight {
     Skip,
 }
 
+/// A price push that couldn't be built, so the liquidation behind it never went out.
+#[derive(Debug)]
+struct PushFailure(String);
+
+impl std::fmt::Display for PushFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PushFailure {}
+
 /// What landing a liquidation as a Jito bundle needs, behind a price push or not.
 pub struct BundleLanding {
-    pub pusher: PythPusher,
+    pub pusher: Arc<PythPusher>,
     pub jito: JitoClient,
     pub tip_estimator: TipEstimator,
     /// Pays the tip.
@@ -185,12 +197,33 @@ pub fn pushable_feed(cache: &Cache, oracle: &Pubkey) -> Option<[u8; 32]> {
         .pyth_prices
         .onchain(oracle)
         .is_some_and(|onchain| update.price_message.publish_time > onchain);
-    (behind && price_feed_address(&feed_id) == *oracle).then_some(feed_id)
+    (behind && sponsored_feed_address(&feed_id) == *oracle).then_some(feed_id)
+}
+
+/// `price_feed_address`, derived once per feed: evaluation asks for it on every account near the
+/// threshold.
+fn sponsored_feed_address(feed_id: &[u8; 32]) -> Pubkey {
+    static ADDRESSES: std::sync::OnceLock<std::sync::RwLock<HashMap<[u8; 32], Pubkey>>> =
+        std::sync::OnceLock::new();
+    let addresses = ADDRESSES.get_or_init(Default::default);
+    if let Some(address) = addresses
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(feed_id)
+    {
+        return *address;
+    }
+    let address = price_feed_address(feed_id);
+    addresses
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(*feed_id, address);
+    address
 }
 
 /// The feeds of `oracles` still ahead of the chain, which a liquidation sized on their prices
 /// must push first.
-fn pending_feeds(cache: &Cache, oracles: &[Pubkey]) -> Vec<[u8; 32]> {
+pub fn pending_feeds(cache: &Cache, oracles: &[Pubkey]) -> Vec<[u8; 32]> {
     let mut feeds = Vec::new();
     for feed_id in oracles
         .iter()
@@ -289,6 +322,14 @@ impl Executor {
             // engine. Any other takes a bundle only when a request slot is free right now, and
             // otherwise goes over RPC at once instead of queueing behind the other workers.
             if must_push {
+                // A push that can't be built gives way to the smaller liquidation the chain's
+                // prices already allow, when there is one.
+                let unpushed = intent.without_push.as_deref();
+                if let Some(unpushed) = unpushed {
+                    if bundles.pusher.check(&pending).is_err() {
+                        return self.execute_without_push(strategy, bundles, unpushed);
+                    }
+                }
                 let slot = match bundles.jito.try_reserve() {
                     Some(slot) => slot,
                     None => {
@@ -298,7 +339,15 @@ impl Executor {
                         bundles.jito.reserve()
                     }
                 };
-                return self.execute_as_bundle(strategy, intent, liab_mint, &pending, slot);
+                let result = self.execute_as_bundle(strategy, intent, liab_mint, &pending, slot);
+                // The stream may have moved on since the check.
+                if let (Err(e), Some(unpushed)) = (&result, unpushed) {
+                    if e.downcast_ref::<PushFailure>().is_some() {
+                        self.clear_target_backoff(&liquidatee);
+                        return self.execute_without_push(strategy, bundles, unpushed);
+                    }
+                }
+                return result;
             }
             if let Some(slot) = bundles.jito.try_reserve() {
                 return self.execute_as_bundle(strategy, intent, liab_mint, &[], slot);
@@ -395,6 +444,27 @@ impl Executor {
                 self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
                 Err(e)
             }
+        }
+    }
+
+    /// `unpushed`, a liquidation the chain's prices allow: in a bundle when a request slot is free,
+    /// otherwise over RPC. Skipped while its liability mint is quarantined.
+    fn execute_without_push(
+        &self,
+        strategy: &dyn LiquidationStrategy,
+        bundles: &BundleLanding,
+        unpushed: &PreparedLiquidatableAccount,
+    ) -> Result<()> {
+        let liquidatee = unpushed.liquidatee_account.address;
+        let liab_mint = self.intent_liab_mint(unpushed)?;
+        if self.is_backed_off(&liab_mint)? {
+            debug!("Skipping {liquidatee} without a push: liab mint {liab_mint} is quarantined");
+            return Ok(());
+        }
+        info!("Liquidating {liquidatee} without a push, on the chain's prices: the push can't be built");
+        match bundles.jito.try_reserve() {
+            Some(slot) => self.execute_as_bundle(strategy, unpushed, liab_mint, &[], slot),
+            None => self.execute_over_rpc(strategy, unpushed, liab_mint, &[]),
         }
     }
 
@@ -547,9 +617,12 @@ impl Executor {
             match bundles.pusher.push_transactions(feeds) {
                 Ok(push) => Some(push),
                 Err(e) => {
-                    let e = anyhow!("can't push the {} Pyth feed(s) it needs: {e}", feeds.len());
-                    self.note_execution_failure(&liquidatee, &e.to_string());
-                    return Err(e);
+                    let e = PushFailure(format!(
+                        "can't push the {} Pyth feed(s) it needs: {e}",
+                        feeds.len()
+                    ));
+                    self.note_execution_failure(&liquidatee, &e.0);
+                    return Err(e.into());
                 }
             }
         };

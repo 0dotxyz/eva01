@@ -15,10 +15,11 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use log::warn;
+use log::{info, warn};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_message::{v0, Hash, VersionedMessage};
 use solana_pubkey::Pubkey;
@@ -40,9 +41,16 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
 ];
 const TIP_FLOOR_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_floor";
 
-/// The block engine admits one request per second per endpoint (`sendBundle` and the status
-/// methods alike); anything faster is rejected with `-32097`.
-const MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+/// The window the block engine's rate limit counts requests over (`sendBundle` and the status
+/// methods alike); a request over the limit is rejected with HTTP 429.
+const RATE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Requests per window without an auth uuid.
+const UNAUTHENTICATED_REQUESTS: usize = 1;
+
+/// Requests per window with an auth uuid. Ours admits about 37 a second; this leaves room for
+/// bursts the window doesn't count evenly.
+const AUTHENTICATED_REQUESTS: usize = 20;
 
 pub struct JitoClient {
     http: Client,
@@ -51,31 +59,47 @@ pub struct JitoClient {
     slot: Mutex<SlotState>,
 }
 
-/// The one request the block engine admits per [`MIN_REQUEST_INTERVAL`].
+/// The requests the block engine admits per [`RATE_WINDOW`]: a slot counts from its reservation,
+/// and once its request goes out, until the window has passed.
 struct SlotState {
-    /// When the last request went out.
-    last_request: Instant,
-    /// Whether a caller holds the slot, between reserving it and sending.
-    held: bool,
+    /// Requests admitted per window.
+    capacity: usize,
+    /// When the requests of the last window went out, oldest first.
+    sent: std::collections::VecDeque<Instant>,
+    /// Slots reserved and not yet used or given back.
+    held: usize,
 }
 
-/// How often a caller waiting for the slot looks again while another caller holds it.
+impl SlotState {
+    fn prune(&mut self, now: Instant) {
+        while self
+            .sent
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= RATE_WINDOW)
+        {
+            self.sent.pop_front();
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.held + self.sent.len() >= self.capacity
+    }
+}
+
+/// How often a caller waiting for a slot looks again while the others are all held.
 const HELD_SLOT_RECHECK: Duration = Duration::from_millis(20);
 
-/// A request slot, reserved until its request goes out or it is dropped. While it is held, nobody
-/// else gets one, so a caller that quotes a swap after reserving can't be overtaken into a second
-/// request within the interval; dropping it unused gives it back.
+/// A request slot, reserved until its request goes out or it is dropped. A held slot counts
+/// against the limit, so a caller that quotes a swap after reserving can't be overtaken into a
+/// request over it; dropping it unused gives it back.
 pub struct JitoSlot<'a> {
     jito: &'a JitoClient,
 }
 
 impl Drop for JitoSlot<'_> {
     fn drop(&mut self) {
-        self.jito
-            .slot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .held = false;
+        let mut state = self.jito.slot.lock().unwrap_or_else(|e| e.into_inner());
+        state.held = state.held.saturating_sub(1);
     }
 }
 
@@ -86,7 +110,8 @@ impl JitoSlot<'_> {
             .slot
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .last_request = Instant::now();
+            .sent
+            .push_back(Instant::now());
     }
 
     /// Submits a bundle in this slot. An `Err` is a request that may or may not have arrived.
@@ -102,13 +127,12 @@ impl JitoSlot<'_> {
             "params": [encoded, { "encoding": "base64" }],
         });
         self.mark_sent();
-        let resp: Value = self
-            .jito
-            .http
-            .post(self.jito.url())
-            .json(&body)
-            .send()?
-            .json()?;
+        let resp = self.jito.http.post(self.jito.url()).json(&body).send()?;
+        // Over the rate limit: refused before the auction, so it can't land.
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Ok(BundleSend::Rejected("rate limited (HTTP 429)".to_string()));
+        }
+        let resp: Value = resp.json()?;
         Ok(match parse_send_bundle_result(&resp) {
             Ok(id) => BundleSend::Accepted(id),
             Err(e) => BundleSend::Rejected(e.to_string()),
@@ -138,40 +162,62 @@ impl JitoSlot<'_> {
 
 impl JitoClient {
     pub fn new(endpoint: Option<String>, api_key: Option<String>) -> Self {
+        let capacity = if api_key.is_some() {
+            AUTHENTICATED_REQUESTS
+        } else {
+            UNAUTHENTICATED_REQUESTS
+        };
+        info!(
+            "Jito: {capacity} request(s) per second ({})",
+            if api_key.is_some() {
+                "authenticated"
+            } else {
+                "no auth uuid"
+            }
+        );
         Self {
             http: Client::new(),
             endpoint: endpoint.unwrap_or_else(|| DEFAULT_BUNDLE_ENDPOINT.to_string()),
             api_key,
             slot: Mutex::new(SlotState {
-                last_request: Instant::now() - MIN_REQUEST_INTERVAL,
-                held: false,
+                capacity,
+                sent: std::collections::VecDeque::with_capacity(capacity),
+                held: 0,
             }),
         }
     }
 
-    /// The request slot, if it is free now, without waiting: a liquidation that finds none goes
+    /// A request slot, if one is free now, without waiting: a liquidation that finds none goes
     /// out another way instead of queueing behind the other workers. The lock is held only to
-    /// read and flip the state, never across a wait.
+    /// read and update the state, never across a wait.
     pub fn try_reserve(&self) -> Option<JitoSlot<'_>> {
         let mut state = self.slot.lock().unwrap_or_else(|e| e.into_inner());
-        if state.held || state.last_request.elapsed() < MIN_REQUEST_INTERVAL {
+        state.prune(Instant::now());
+        if state.is_full() {
             return None;
         }
-        state.held = true;
+        state.held += 1;
         Some(JitoSlot { jito: self })
     }
 
-    /// Waits for the request slot and takes it, for a bundle that has no other way out. Sleeps
+    /// Waits for a request slot and takes it, for a bundle that has no other way out. Sleeps
     /// without the lock, so others' `try_reserve` never waits behind it.
     pub fn reserve(&self) -> JitoSlot<'_> {
         loop {
             let wait = {
-                let state = self.slot.lock().unwrap_or_else(|e| e.into_inner());
-                let since = state.last_request.elapsed();
-                if state.held {
-                    HELD_SLOT_RECHECK
+                let mut state = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+                let now = Instant::now();
+                state.prune(now);
+                if !state.is_full() {
+                    Duration::ZERO
                 } else {
-                    MIN_REQUEST_INTERVAL.saturating_sub(since)
+                    // Until the oldest request leaves the window, or sooner, in case a held slot
+                    // is given back.
+                    state.sent.front().map_or(HELD_SLOT_RECHECK, |at| {
+                        (*at + RATE_WINDOW)
+                            .saturating_duration_since(now)
+                            .min(HELD_SLOT_RECHECK)
+                    })
                 }
             };
             if wait.is_zero() {
@@ -324,11 +370,15 @@ impl TipEstimator {
         blockhash: Hash,
         lamports: u64,
     ) -> Result<VersionedTransaction> {
-        let tip_account = select_tip_account()?;
-        let ix = transfer(&signer.pubkey(), &tip_account, lamports);
+        let ix = tip_instruction(&signer.pubkey(), lamports)?;
         let msg = v0::Message::try_compile(&signer.pubkey(), &[ix], &[], blockhash)?;
         VersionedTransaction::try_new(VersionedMessage::V0(msg), &[signer]).map_err(Into::into)
     }
+}
+
+/// A transfer of `lamports` from `payer` to one of Jito's tip accounts.
+fn tip_instruction(payer: &Pubkey, lamports: u64) -> Result<Instruction> {
+    Ok(transfer(payer, &select_tip_account()?, lamports))
 }
 
 /// `share` of `profit_lamports`, at least `floor` and at most `cap` (the cap wins).
@@ -408,6 +458,23 @@ mod tests {
         assert!(
             jito.try_reserve().is_none(),
             "used: the next one is a second away"
+        );
+    }
+
+    #[test]
+    fn an_auth_uuid_admits_more_requests_per_window() {
+        let jito = JitoClient::new(None, Some("uuid".to_string()));
+        let slots: Vec<_> = (0..AUTHENTICATED_REQUESTS)
+            .map(|_| jito.try_reserve().expect("within the limit"))
+            .collect();
+        assert!(jito.try_reserve().is_none(), "every slot held");
+        for slot in &slots {
+            slot.mark_sent();
+        }
+        drop(slots);
+        assert!(
+            jito.try_reserve().is_none(),
+            "all used: none until the window passes"
         );
     }
 

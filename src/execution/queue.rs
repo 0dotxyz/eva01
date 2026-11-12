@@ -142,6 +142,7 @@ mod tests {
             liab_amount: I80F48::ONE,
             profit: I80F48::from_num(profit),
             push_oracles: Vec::new(),
+            without_push: None,
             sandwich_pair: None,
         }
     }
