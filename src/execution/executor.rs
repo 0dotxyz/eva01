@@ -328,25 +328,20 @@ impl Executor {
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
         landing: Landing,
-    ) -> Option<ExecutionPlan> {
+    ) -> std::result::Result<ExecutionPlan, String> {
         let liquidatee = intent.liquidatee_account.address;
-        match strategy.assemble_with_inventory(intent, landing) {
-            Ok(plan) if self.wallet_plan_suffices(&plan, intent) => Some(plan),
-            Ok(plan) => {
-                debug!(
-                    "The wallet funds only ${:.4} of {}'s ${:.4}; quoting a sandwich",
-                    plan.profit.to_num::<f64>(),
-                    liquidatee,
-                    intent.profit.to_num::<f64>()
-                );
-                // Dropped, releasing its claim while the sandwich is quoted.
-                None
-            }
-            Err(e) => {
-                debug!("No wallet-funded plan for {liquidatee}: {e}");
-                None
-            }
-        }
+        let short = match strategy.assemble_with_inventory(intent, landing) {
+            Ok(plan) if self.wallet_plan_suffices(&plan, intent) => return Ok(plan),
+            // Dropped, releasing its claim while the sandwich is quoted.
+            Ok(plan) => format!(
+                "the wallet funds only ${:.4} of the ${:.4} profit",
+                plan.profit.to_num::<f64>(),
+                intent.profit.to_num::<f64>()
+            ),
+            Err(e) => e.to_string(),
+        };
+        debug!("No wallet-funded plan for {liquidatee}: {short}");
+        Err(short)
     }
 
     /// While a liquidation behind a price push waits for a bundle slot: the wallet-funded plan over
@@ -357,7 +352,9 @@ impl Executor {
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
     ) -> Option<Result<()>> {
-        let plan = self.sufficient_wallet_plan(strategy, intent, Landing::Rpc)?;
+        let plan = self
+            .sufficient_wallet_plan(strategy, intent, Landing::Rpc)
+            .ok()?;
         if self.simulate(&plan.tx).is_err() {
             return None;
         }
@@ -377,9 +374,12 @@ impl Executor {
         pending: &[[u8; 32]],
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
-        if let Some(plan) = self.sufficient_wallet_plan(strategy, intent, Landing::Rpc) {
-            return self.land_plain_wallet_plan(strategy, intent, liab_mint, plan, pending);
-        }
+        let wallet_short = match self.sufficient_wallet_plan(strategy, intent, Landing::Rpc) {
+            Ok(plan) => {
+                return self.land_plain_wallet_plan(strategy, intent, liab_mint, plan, pending)
+            }
+            Err(short) => short,
+        };
 
         // A sandwich funds itself from the seized collateral and touches no wallet inventory.
         match strategy.assemble_sandwich(&intent.for_sandwich(), Landing::Rpc) {
@@ -394,7 +394,7 @@ impl Executor {
             Ok(Sandwich::Rejected) if !pending.is_empty() => {
                 self.execute_behind_push(strategy, intent, liab_mint, pending)
             }
-            Ok(_) => self.no_plan(&liquidatee, liab_mint),
+            Ok(_) => self.no_plan(&liquidatee, liab_mint, &wallet_short),
             Err(e) => {
                 self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
                 Err(e)
@@ -404,10 +404,8 @@ impl Executor {
 
     /// Neither plan: the wallet funds too little and no sandwich fits. Backed off like a failed
     /// assembly.
-    fn no_plan(&self, liquidatee: &Pubkey, liab_mint: Pubkey) -> Result<()> {
-        let e = anyhow!(
-            "no plan for {liquidatee}: the wallet funds too little of it and no sandwich fits"
-        );
+    fn no_plan(&self, liquidatee: &Pubkey, liab_mint: Pubkey, wallet_short: &str) -> Result<()> {
+        let e = anyhow!("no plan for {liquidatee}: {wallet_short}, and no sandwich fits");
         self.note_assemble_failure(liquidatee, liab_mint, &e)?;
         Err(e)
     }
@@ -505,11 +503,29 @@ impl Executor {
         result
     }
 
-    /// Simulates `tx` against the chain's current state.
+    /// Simulates `tx` against the chain's current state; a failure carries the program's last logs.
     fn simulate(&self, tx: &VersionedTransaction) -> Result<()> {
-        match self.rpc_client.simulate_transaction(tx)?.value.err {
+        let simulation = self.rpc_client.simulate_transaction(tx)?.value;
+        match simulation.err {
             None => Ok(()),
-            Some(err) => Err(anyhow!("simulation failed: {err:?}")),
+            Some(err) => {
+                let logs = simulation.logs.unwrap_or_default();
+                let tail = &logs[logs.len().saturating_sub(3)..];
+                Err(anyhow!("simulation failed: {err:?}; logs: {tail:?}"))
+            }
+        }
+    }
+
+    /// Why a bundle that didn't land didn't, as far as simulating its liquidation alone now tells
+    /// (after the fact, off the landing path).
+    fn why_not_landed(&self, bundle: &[VersionedTransaction], behind_push: bool) -> String {
+        if behind_push {
+            return "lost or dropped (behind a push, so not simulated alone)".to_string();
+        }
+        match bundle.last().map(|tx| self.simulate(tx)) {
+            Some(Ok(())) => "its liquidation passes simulation now, so it lost or expired".into(),
+            Some(Err(e)) => format!("its liquidation fails: {e}"),
+            None => "empty bundle".into(),
         }
     }
 
@@ -542,17 +558,20 @@ impl Executor {
             }
         };
 
-        if let Some(plan) = self.sufficient_wallet_plan(strategy, intent, Landing::Bundle) {
-            return self.land_bundle(
-                strategy,
-                bundles,
-                intent,
-                push.as_ref(),
-                plan,
-                "wallet-funded",
-                slot,
-            );
-        }
+        let wallet_short = match self.sufficient_wallet_plan(strategy, intent, Landing::Bundle) {
+            Ok(plan) => {
+                return self.land_bundle(
+                    strategy,
+                    bundles,
+                    intent,
+                    push.as_ref(),
+                    plan,
+                    "wallet-funded",
+                    slot,
+                )
+            }
+            Err(short) => short,
+        };
         match strategy.assemble_sandwich(&intent.for_sandwich(), Landing::Bundle) {
             Ok(Sandwich::Plan(plan)) => self.land_bundle(
                 strategy,
@@ -563,7 +582,7 @@ impl Executor {
                 "sandwich",
                 slot,
             ),
-            Ok(_) => self.no_plan(&liquidatee, liab_mint),
+            Ok(_) => self.no_plan(&liquidatee, liab_mint, &wallet_short),
             Err(e) => {
                 self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
                 Err(e)
@@ -605,7 +624,10 @@ impl Executor {
 
         let result = match self.send_bundle(bundles, &bundle, tip, slot) {
             Ok(true) => Ok(()),
-            Ok(false) => Err(anyhow!("the bundle for {liquidatee} didn't land")),
+            Ok(false) => Err(anyhow!(
+                "the bundle for {liquidatee} didn't land: {}",
+                self.why_not_landed(&bundle, push.is_some())
+            )),
             Err(e) => Err(e),
         };
         self.note_result(&liquidatee, &result);
@@ -706,7 +728,11 @@ impl Executor {
                     Some(Ok(())) => Ok(true),
                     Some(Err(reverted)) => Err(reverted),
                     None => {
-                        warn!("The bundle with {sig} expired without landing");
+                        if dead {
+                            warn!("The block engine gave up on the bundle with {sig}");
+                        } else {
+                            warn!("The bundle with {sig} expired without landing");
+                        }
                         Ok(false)
                     }
                 };
