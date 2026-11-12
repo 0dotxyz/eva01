@@ -38,6 +38,10 @@ use crate::utils::pyth_cranker::{
 /// The push transactions a bundle has room for: the liquidation and the tip take two.
 pub const MAX_PUSH_TXS: usize = MAX_BUNDLE_TXS - 2;
 
+/// The feeds one push carries within `MAX_PUSH_TXS`: posting and verifying the VAA fill the first
+/// two transactions, and the third holds two feed updates and the VAA's close.
+pub const MAX_PUSHED_FEEDS: usize = 2;
+
 pub struct PythPusher {
     cache: Arc<Cache>,
     wormhole_program_id: Pubkey,

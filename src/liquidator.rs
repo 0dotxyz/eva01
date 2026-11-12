@@ -4,19 +4,20 @@ use crate::{
     config::Eva01Config,
     execution::{
         activity::LiquidationActivity,
-        executor::{BundleLanding, Executor},
+        executor::{pushable_feed, BundleLanding, Executor},
         inventory::InventoryStrategy,
         queue::{ExecutionQueue, QueuedIntent},
         reservations::TokenReservations,
     },
     geyser::{AccountType, GeyserUpdate},
+    health_watch::{self, HealthWatch, Watch, WatchedPosition},
     rebalancer::Rebalancer,
     tag_policy::{Balances, Candidate, TagPolicy},
     utils::{
         self,
         jito::{JitoClient, TipEstimator},
         log_genuine_error,
-        pyth_push::PythPusher,
+        pyth_push::{PythPusher, MAX_PUSHED_FEEDS},
         rate_limiter::RateLimiter,
     },
     wrappers::{
@@ -33,7 +34,7 @@ use anyhow::{anyhow, Result};
 use crossbeam::channel::{bounded, Receiver, RecvTimeoutError};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use marginfi::{
     constants::{
         LIQUIDATION_BONUS_FEE_MINIMUM, LIQUIDATION_CLOSEOUT_DOLLAR_THRESHOLD,
@@ -77,6 +78,44 @@ const MAX_CONCURRENT_LIQUIDATIONS: usize = 8;
 
 /// How often the rebalancer checks whether a pass is due (see `LiquidationActivity`).
 const REBALANCE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Every borrower is evaluated at least this often, whatever the health watch says: a backstop
+/// for what it can't see, such as an integration bank's exchange rate.
+const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often the scan statistics are reported.
+const SCAN_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// What a batch of updates changed.
+#[derive(Default)]
+struct Changes {
+    /// Accounts to evaluate whatever their watch says: their own state changed, or their bank's
+    /// configuration did.
+    accounts: HashSet<Pubkey>,
+    /// Banks whose price or share value may have moved.
+    moved_banks: HashSet<Pubkey>,
+}
+
+/// Evaluation work since the last report.
+struct ScanStats {
+    since: Instant,
+    cycles: usize,
+    evaluated: usize,
+    skipped: usize,
+    slowest: Duration,
+}
+
+impl ScanStats {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            cycles: 0,
+            evaluated: 0,
+            skipped: 0,
+            slowest: Duration::ZERO,
+        }
+    }
+}
 
 /// Taken off the premium `end_liquidation` allows, so price moves between evaluation and landing
 /// cannot push the seizure over the cap.
@@ -134,6 +173,33 @@ fn choose_pairs(pairs: impl Iterator<Item = (I80F48, u8)>) -> Option<(usize, Opt
     Some((main, sandwich))
 }
 
+/// A cycle's results: the liquidations, the unhealthy accounts not worth liquidating, and each
+/// healthy account's watch.
+type Evaluations = (
+    Vec<PreparedLiquidatableAccount>,
+    Vec<UnhealthyAccount>,
+    Vec<(Pubkey, Option<Watch>)>,
+);
+
+/// What one share of `bank` on the given side is worth at its maintenance price, the unit a
+/// position's weighted value scales with; `None` when it can't be priced.
+fn unit_value(cache: &Cache, clock: &Clock, bank: &Pubkey, liability: bool) -> Option<f64> {
+    let bank_wrapper = cache.banks.try_get_bank(bank).ok()?;
+    let oracle = OracleWrapper::build(cache, clock, bank).ok()?;
+    let (side, share_value) = if liability {
+        (
+            BalanceSide::Liabilities,
+            bank_wrapper.bank.liability_share_value,
+        )
+    } else {
+        (BalanceSide::Assets, bank_wrapper.bank.asset_share_value)
+    };
+    let price = bank_wrapper
+        .price(&oracle, side, RequirementType::Maintenance)
+        .ok()?;
+    Some((price * I80F48::from(share_value)).to_num())
+}
+
 /// How often each unhealthy account we are not liquidating is reported.
 const SKIP_REPORT_INTERVAL: Duration = Duration::from_secs(1200);
 
@@ -156,6 +222,10 @@ pub struct Liquidator {
     liquidator_account: Arc<LiquidatorAccount>,
     tag_policy: TagPolicy,
     skip_reports: RateLimiter<Pubkey>,
+    /// Which borrowers updates can skip.
+    health_watch: HealthWatch,
+    last_full_scan: Instant,
+    scan_stats: ScanStats,
     geyser_rx: Receiver<GeyserUpdate>,
     stop_liquidator: Arc<AtomicBool>,
     cache: Arc<Cache>,
@@ -201,6 +271,16 @@ impl LiquidationAmounts {
     }
 }
 
+/// What the pair search finds for an account. Short-lived, so the sizing stays inline.
+#[allow(clippy::large_enum_variant)]
+enum PairSearch {
+    /// Healthy with this margin (`health_watch::margin`).
+    Healthy(f64),
+    /// Unhealthy, with no pair to size.
+    None,
+    Sized(Sizing),
+}
+
 /// The best bank pair for an unhealthy account and what it allows.
 struct Sizing {
     /// The most profitable pair.
@@ -211,12 +291,79 @@ struct Sizing {
     /// Kamino or JupLend bank and a lighter pair earns nearly as much (`is_better_pair`).
     sandwich: Option<(Pubkey, Pubkey, LiquidationAmounts)>,
     maintenance_health: I80F48,
-    /// The account is healthy on the Pyth prices the chain holds; only newer ones make it
-    /// liquidatable.
-    needs_price_push: bool,
+    /// The Pyth oracles to push first, whose newer prices the pairs are sized on.
+    push_oracles: Vec<Pubkey>,
 }
 
 /// A bank's maintenance price over its equity price on one side.
+/// Of the oracles each paired with the account's health once only it is pushed, the ones that lower
+/// it most below `on_chain`, as many as one push carries.
+fn strongest_pushes(
+    on_chain: I80F48,
+    singles: impl Iterator<Item = (I80F48, Pubkey)>,
+) -> Vec<Pubkey> {
+    let mut lowering: Vec<(I80F48, Pubkey)> = singles.filter(|(h, _)| *h < on_chain).collect();
+    lowering.sort_by_key(|(h, _)| *h);
+    lowering
+        .into_iter()
+        .take(MAX_PUSHED_FEEDS)
+        .map(|(_, oracle)| oracle)
+        .collect()
+}
+
+/// The bank and oracle accounts behind `banks_and_oracles` as eva prices them, or, with `pushed`, as
+/// the program reads them once those Pyth oracles are pushed: every other oracle eva prices ahead
+/// of the chain at the chain's price.
+fn program_accounts(
+    cache: &Cache,
+    banks_and_oracles: &[Pubkey],
+    pushed: Option<&[Pubkey]>,
+) -> Result<Vec<Account>> {
+    banks_and_oracles
+        .iter()
+        .map(|pk| {
+            if let Ok(wrapper) = cache.banks.try_get_bank(pk) {
+                return Ok(wrapper.account);
+            }
+            let cached = cache.oracles.try_get_account(pk)?;
+            Ok(match pushed {
+                Some(pushed) if !pushed.contains(pk) => cache
+                    .pyth_prices
+                    .onchain_if_behind(pk, &cached)
+                    .unwrap_or(cached),
+                _ => cached,
+            })
+        })
+        .collect()
+}
+
+/// An account's weighted assets and liabilities on `accounts`, the bank and oracle accounts behind
+/// `banks_and_oracles`.
+fn health_components(
+    account: &MarginfiAccountWrapper,
+    group: &MarginfiGroup,
+    clock: &Clock,
+    banks_and_oracles: &[Pubkey],
+    accounts: &mut [Account],
+    requirement: RequirementType,
+) -> Result<(I80F48, I80F48)> {
+    let remaining_ais: Vec<_> = accounts
+        .iter_mut()
+        .zip(banks_and_oracles.iter())
+        .map(|(account, pk)| (pk, account).into_account_info())
+        .collect();
+    get_health_components(
+        &account.account,
+        group,
+        &remaining_ais,
+        requirement,
+        &mut None,
+        HealthPriceMode::Client(clock.clone()),
+        &mut None,
+    )
+    .map_err(|e| anyhow!("{e:?}"))
+}
+
 fn maintenance_to_equity_price(
     bank: &BankWrapper,
     oracle: &OracleWrapper,
@@ -282,6 +429,8 @@ impl RepayBounds {
 
 #[allow(clippy::large_enum_variant)]
 enum Evaluation {
+    /// Healthy: the watch that lets updates skip it while it stays so.
+    Healthy(Pubkey, Option<Watch>),
     Liquidate(PreparedLiquidatableAccount),
     /// Unhealthy but not worth liquidating at the current premium.
     Unhealthy(UnhealthyAccount),
@@ -372,6 +521,9 @@ impl Liquidator {
             liquidator_account,
             tag_policy: TagPolicy::new(),
             skip_reports: RateLimiter::new(SKIP_REPORT_INTERVAL),
+            health_watch: HealthWatch::default(),
+            last_full_scan: Instant::now(),
+            scan_stats: ScanStats::new(),
             geyser_rx,
             stop_liquidator,
             cache,
@@ -391,7 +543,7 @@ impl Liquidator {
         // Updates only reach the cache through this loop, so everything Geyser and Hermes sent
         // since the cache was loaded (the startup rebalance alone takes seconds) is still queued.
         // Apply it first, or the initial scan prices every account on the load-time snapshot.
-        let mut backlog = HashSet::new();
+        let mut backlog = Changes::default();
         while let Ok(update) = self.geyser_rx.try_recv() {
             self.process_geyser_update(update, &mut backlog);
         }
@@ -405,10 +557,12 @@ impl Liquidator {
         {
             Ok(accounts) => {
                 info!(
-                    "Running the initial Liquidation scan (updates queued during startup applied; {} account(s) touched)...",
-                    backlog.len()
+                    "Running the initial Liquidation scan (updates queued during startup applied: {} account(s) and {} bank(s) touched)...",
+                    backlog.accounts.len(),
+                    backlog.moved_banks.len()
                 );
-                self.run_liquidation_cycle(accounts);
+                self.run_liquidation_cycle(accounts, false);
+                self.last_full_scan = Instant::now();
             }
             Err(error) => error!(
                 "Failed to collect accounts for the initial scan: {:?}",
@@ -419,10 +573,23 @@ impl Liquidator {
         info!("Staring the Liquidator loop.");
         while !self.stop_liquidator.load(Ordering::Relaxed) {
             debug!("Waiting for any data change...");
-            let accounts_to_check = self.receive_geyser_updates()?;
+            let changes = self.receive_geyser_updates()?;
+            let accounts_to_check = self.accounts_to_evaluate(changes);
             if !accounts_to_check.is_empty() {
-                self.run_liquidation_cycle(accounts_to_check);
+                self.run_liquidation_cycle(accounts_to_check, false);
             }
+            if self.last_full_scan.elapsed() >= FULL_SCAN_INTERVAL {
+                match self
+                    .cache
+                    .marginfi_accounts
+                    .try_get_accounts_with_liabilities()
+                {
+                    Ok(accounts) => self.run_liquidation_cycle(accounts, true),
+                    Err(e) => error!("Failed to collect accounts for the full scan: {:?}", e),
+                }
+                self.last_full_scan = Instant::now();
+            }
+            self.report_scan_stats();
         }
 
         // The workers exit once the queue stops; the rebalancer once the last worker is gone.
@@ -473,17 +640,115 @@ impl Liquidator {
         Ok(())
     }
 
-    fn run_liquidation_cycle(&mut self, accounts_to_check: Vec<Pubkey>) {
+    /// The accounts a batch of updates requires evaluating: those changed outright, and those in a
+    /// moved bank whose watch says the move may have reached their margin.
+    fn accounts_to_evaluate(&mut self, changes: Changes) -> Vec<Pubkey> {
+        let Changes {
+            mut accounts,
+            moved_banks,
+        } = changes;
+        if moved_banks.is_empty() {
+            return accounts.into_iter().collect();
+        }
+        let clock = match clock_manager::get_clock(&self.cache.clock) {
+            Ok(clock) => clock,
+            Err(e) => {
+                error!("Failed to read the clock for the health watch: {e}");
+                for bank in &moved_banks {
+                    let _ = self.add_accounts_for_bank(bank, &mut accounts);
+                }
+                return accounts.into_iter().collect();
+            }
+        };
+
+        // Each moved bank's unit values now, once per batch. A bank that can't be priced has all
+        // its accounts evaluated: the watch can't tell how far it moved.
+        let mut current = HashMap::new();
+        let mut priced = Vec::with_capacity(moved_banks.len());
+        for bank in moved_banks {
+            match (
+                unit_value(&self.cache, &clock, &bank, false),
+                unit_value(&self.cache, &clock, &bank, true),
+            ) {
+                (Some(asset), Some(liability)) => {
+                    current.insert((bank, false), asset);
+                    current.insert((bank, true), liability);
+                    priced.push(bank);
+                }
+                _ => {
+                    if let Err(e) = self.add_accounts_for_bank(&bank, &mut accounts) {
+                        error!("Failed to collect the accounts of the bank {bank}: {e}");
+                    }
+                }
+            }
+        }
+        for bank in priced {
+            let holders = match self
+                .cache
+                .marginfi_accounts
+                .try_get_accounts_for_bank_with_liabilities(&bank)
+            {
+                Ok(holders) => holders,
+                Err(e) => {
+                    error!("Failed to collect the accounts of the bank {bank}: {e}");
+                    continue;
+                }
+            };
+            for holder in holders {
+                if accounts.contains(&holder) {
+                    continue;
+                }
+                if self.health_watch.needs_evaluation(&holder, &current) {
+                    accounts.insert(holder);
+                } else {
+                    self.scan_stats.skipped += 1;
+                }
+            }
+        }
+        accounts.into_iter().collect()
+    }
+
+    /// Evaluates `accounts_to_check`. A full sweep (`full`) also audits the health watch: an
+    /// account it still watches hasn't needed evaluating since it was last healthy, so finding it
+    /// unhealthy now means the watch missed it.
+    fn run_liquidation_cycle(&mut self, accounts_to_check: Vec<Pubkey>, full: bool) {
         let started = Instant::now();
         match self.evaluator.check_accounts(&accounts_to_check) {
-            Ok((liquidations, unhealthy)) => {
+            Ok((liquidations, unhealthy, healthy)) => {
+                if full {
+                    let missed: Vec<Pubkey> = liquidations
+                        .iter()
+                        .map(|intent| intent.liquidatee_account.address)
+                        .chain(unhealthy.iter().map(|account| account.address))
+                        .filter(|address| self.health_watch.is_watched(address))
+                        .collect();
+                    if !missed.is_empty() {
+                        warn!(
+                            "The health watch missed {} unhealthy account(s): {:?}",
+                            missed.len(),
+                            missed
+                        );
+                    }
+                }
+                // Only a healthy account with room to spare is watched; any other is evaluated on
+                // every update of its banks.
+                for account in &accounts_to_check {
+                    self.health_watch.set(*account, None);
+                }
+                for (account, watch) in healthy {
+                    self.health_watch.set(account, watch);
+                }
                 let liquidatable = liquidations.len();
                 self.queue.offer(&accounts_to_check, liquidations);
                 self.handle_unhealthy(&accounts_to_check, &unhealthy);
-                info!(
+                let elapsed = started.elapsed();
+                self.scan_stats.cycles += 1;
+                self.scan_stats.evaluated += accounts_to_check.len();
+                self.scan_stats.slowest = self.scan_stats.slowest.max(elapsed);
+                debug!(
                     "Evaluated {} account(s) in {} ms: {} queued for liquidation, {} unhealthy but not worth liquidating.",
                     accounts_to_check.len(),
-                    started.elapsed().as_millis(),
+                    elapsed.as_millis(),
                     liquidatable,
                     unhealthy.len()
                 );
@@ -494,29 +759,46 @@ impl Liquidator {
         }
     }
 
-    fn receive_geyser_updates(&self) -> Result<Vec<Pubkey>> {
+    /// Reports the evaluation work done since the last report, once a minute.
+    fn report_scan_stats(&mut self) {
+        let stats = &self.scan_stats;
+        if stats.since.elapsed() < SCAN_REPORT_INTERVAL {
+            return;
+        }
+        info!(
+            "Scans in the last {} s: {} cycle(s), {} evaluation(s), {} skipped by the health watch ({} account(s) watched), slowest {} ms.",
+            stats.since.elapsed().as_secs(),
+            stats.cycles,
+            stats.evaluated,
+            stats.skipped,
+            self.health_watch.len(),
+            stats.slowest.as_millis()
+        );
+        self.scan_stats = ScanStats::new();
+    }
+
+    fn receive_geyser_updates(&self) -> Result<Changes> {
         let first_update = match self.geyser_rx.recv_timeout(Duration::from_secs(1)) {
             Ok(update) => update,
-            Err(RecvTimeoutError::Timeout) => return Ok(vec![]),
+            Err(RecvTimeoutError::Timeout) => return Ok(Changes::default()),
             Err(RecvTimeoutError::Disconnected) if self.stop_liquidator.load(Ordering::Relaxed) => {
-                return Ok(vec![])
+                return Ok(Changes::default())
             }
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(anyhow!("Geyser update channel disconnected"))
             }
         };
 
-        let mut accounts_to_check = HashSet::new();
-        self.process_geyser_update(first_update, &mut accounts_to_check);
+        let mut changes = Changes::default();
+        self.process_geyser_update(first_update, &mut changes);
         while let Ok(update) = self.geyser_rx.try_recv() {
-            self.process_geyser_update(update, &mut accounts_to_check);
+            self.process_geyser_update(update, &mut changes);
         }
-
-        Ok(accounts_to_check.into_iter().collect())
+        Ok(changes)
     }
 
-    fn process_geyser_update(&self, update: GeyserUpdate, account_addresses: &mut HashSet<Pubkey>) {
-        if let Err(error) = self.handle_geyser_update(update, account_addresses) {
+    fn process_geyser_update(&self, update: GeyserUpdate, changes: &mut Changes) {
+        if let Err(error) = self.handle_geyser_update(update, changes) {
             log_genuine_error("Failed to process Geyser update", error);
         }
     }
@@ -543,11 +825,7 @@ impl Liquidator {
         }
     }
 
-    fn handle_geyser_update(
-        &self,
-        update: GeyserUpdate,
-        account_addresses: &mut HashSet<Pubkey>,
-    ) -> Result<()> {
+    fn handle_geyser_update(&self, update: GeyserUpdate, changes: &mut Changes) -> Result<()> {
         let GeyserUpdate {
             account_type,
             address,
@@ -569,9 +847,7 @@ impl Liquidator {
                     return Ok(());
                 }
 
-                for bank in banks {
-                    self.add_accounts_for_bank(&bank, account_addresses)?;
-                }
+                changes.moved_banks.extend(banks);
             }
             AccountType::Marginfi => {
                 let mut data = account.data.as_slice();
@@ -585,18 +861,27 @@ impl Liquidator {
                 // evaluating it is wasted work. It rejoins the queue the moment it borrows (that
                 // update will report liabilities).
                 if has_liabilities {
-                    account_addresses.insert(address);
+                    changes.accounts.insert(address);
                 }
             }
             AccountType::Bank => {
                 let bank = utils::decode_bank(&account.data)?;
-                let is_new = self.cache.banks.try_get_bank(&address).is_err();
+                let previous = self.cache.banks.try_get_bank(&address).ok();
+                let reconfigured = previous.as_ref().is_none_or(|previous| {
+                    previous.bank.config != bank.config || previous.bank.emode != bank.emode
+                });
                 self.cache.banks.try_insert(address, bank, account)?;
-                if is_new {
+                if previous.is_none() {
                     self.liquidator_account.cover_bank_in_background(&address);
                 }
 
-                self.add_accounts_for_bank(&address, account_addresses)?;
+                // Only the share values move on most updates, which the health watch measures; a
+                // new weight, limit or oracle can change any holder's health.
+                if reconfigured {
+                    self.add_accounts_for_bank(&address, &mut changes.accounts)?;
+                } else {
+                    changes.moved_banks.insert(address);
+                }
             }
             AccountType::Token => {
                 self.cache
@@ -727,10 +1012,13 @@ fn attempt_liquidation(
                 fresh.profit.to_num::<f64>(),
                 intent.profit.to_num::<f64>(),
                 queued_at.elapsed().as_millis(),
-                if fresh.needs_price_push {
-                    "; healthy on the chain's prices, so behind a price push"
+                if fresh.push_oracles.is_empty() {
+                    String::new()
                 } else {
-                    ""
+                    format!(
+                        "; healthy on the chain's prices, so behind a push of {} feed(s)",
+                        fresh.push_oracles.len()
+                    )
                 }
             );
             if let Some(pair) = &fresh.sandwich_pair {
@@ -797,10 +1085,31 @@ fn run_rebalancer(
 }
 
 impl Evaluator {
-    fn check_accounts(
+    /// A healthy account's watch: its margin and its positions' unit values now. `None` when a
+    /// unit value can't be priced, so every update of its banks evaluates it.
+    fn watch_for(
         &self,
-        account_addresses: &[Pubkey],
-    ) -> Result<(Vec<PreparedLiquidatableAccount>, Vec<UnhealthyAccount>)> {
+        account: &MarginfiAccountWrapper,
+        clock: &Clock,
+        margin: f64,
+    ) -> Option<Watch> {
+        let (deposits, liabilities) = account.get_deposits_and_liabilities_shares();
+        let positions = deposits
+            .iter()
+            .map(|(_, bank)| (*bank, false))
+            .chain(liabilities.iter().map(|(_, bank)| (*bank, true)))
+            .map(|(bank, liability)| {
+                Some(WatchedPosition {
+                    bank,
+                    liability,
+                    unit_value: unit_value(&self.cache, clock, &bank, liability)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Watch::new(margin, positions)
+    }
+
+    fn check_accounts(&self, account_addresses: &[Pubkey]) -> Result<Evaluations> {
         let clock = clock_manager::get_clock(&self.cache.clock)?;
 
         // Evaluation is CPU-bound (oracle parsing + health math) and independent per account, so a
@@ -826,13 +1135,15 @@ impl Evaluator {
 
         let mut liquidations = Vec::new();
         let mut unhealthy = Vec::new();
+        let mut healthy = Vec::new();
         for evaluation in evaluations {
             match evaluation {
+                Evaluation::Healthy(address, watch) => healthy.push((address, watch)),
                 Evaluation::Liquidate(acc) => liquidations.push(acc),
                 Evaluation::Unhealthy(acc) => unhealthy.push(acc),
             }
         }
-        Ok((liquidations, unhealthy))
+        Ok((liquidations, unhealthy, healthy))
     }
 
     /// Sizes the liquidation of `address` on the current cache state; `None` when it is no longer
@@ -887,25 +1198,30 @@ impl Evaluator {
         )?;
 
         // Calculated max liquidatable amount is the defining factor for liquidation.
-        let Some(Sizing {
-            asset_bank: asset_bank_pk,
-            liab_bank: liab_bank_pk,
-            amounts: liquidation_amounts,
-            sandwich,
-            maintenance_health,
-            needs_price_push,
-        }) = self.compute_max_liquidatable_amounts_with_banks(
+        let sizing = match self.compute_max_liquidatable_amounts_with_banks(
             &self.cache,
-            clock,
+            clock.clone(),
             account,
             &self.cache.marginfi_group,
             observation_accounts.observation_accounts.as_slice(),
             &asset_banks,
             &liab_banks,
-        )?
-        else {
-            return Ok(None);
+        )? {
+            PairSearch::Sized(sizing) => sizing,
+            PairSearch::Healthy(margin) => {
+                let watch = self.watch_for(account, &clock, margin);
+                return Ok(Some(Evaluation::Healthy(account.address, watch)));
+            }
+            PairSearch::None => return Ok(None),
         };
+        let Sizing {
+            asset_bank: asset_bank_pk,
+            liab_bank: liab_bank_pk,
+            amounts: liquidation_amounts,
+            sandwich,
+            maintenance_health,
+            push_oracles,
+        } = sizing;
 
         if !liquidation_amounts.is_liquidatable() {
             return Ok(Some(Evaluation::Unhealthy(UnhealthyAccount {
@@ -966,7 +1282,7 @@ impl Evaluator {
             asset_amount: slippage_adjusted_asset_amount,
             liab_amount: slippage_adjusted_liab_amount,
             profit,
-            needs_price_push,
+            push_oracles,
             sandwich_pair,
         })))
     }
@@ -1028,6 +1344,11 @@ impl Evaluator {
         }
     }
 
+    /// Sizes the account's pairs on the prices the program will read. A liquidation that's
+    /// liquidatable only on Pyth prices the chain doesn't hold yet goes behind a push of the few
+    /// feeds that lower its health the most, and is sized on them with every other feed at the
+    /// chain's price.
+    #[allow(clippy::too_many_arguments)]
     fn compute_max_liquidatable_amounts_with_banks(
         &self,
         cache: &Cache,
@@ -1037,19 +1358,128 @@ impl Evaluator {
         banks_and_oracles: &[Pubkey],
         asset_banks: &[Pubkey],
         liab_banks: &[Pubkey],
-    ) -> Result<Option<Sizing>> {
-        let mut accounts: Vec<_> = vec![];
+    ) -> Result<PairSearch> {
+        let size = |accounts| {
+            self.size_on_accounts(
+                cache,
+                clock.clone(),
+                account,
+                group,
+                banks_and_oracles,
+                accounts,
+                asset_banks,
+                liab_banks,
+            )
+        };
+        let search = size(program_accounts(cache, banks_and_oracles, None)?)?;
+        let PairSearch::Sized(sizing) = search else {
+            return Ok(search);
+        };
+        let behind: Vec<Pubkey> = banks_and_oracles
+            .iter()
+            .filter(|pk| pushable_feed(cache, pk).is_some())
+            .copied()
+            .collect();
+        if !sizing.amounts.is_liquidatable() || behind.is_empty() {
+            return Ok(PairSearch::Sized(sizing));
+        }
+
+        let pushed = match self.choose_pushes(
+            cache,
+            &clock,
+            account,
+            group,
+            banks_and_oracles,
+            &behind,
+        ) {
+            Ok(Some(pushed)) => pushed,
+            Ok(None) => {
+                debug!(
+                    "Account {}: liquidatable only on more Pyth prices than one bundle pushes",
+                    account.address
+                );
+                return Ok(PairSearch::None);
+            }
+            // The chain's price is unusable as it stands (too old for the program, say): only
+            // pushing every feed can make this liquidation pass.
+            Err(e) => {
+                debug!(
+                    "Account {}: can't price it on the chain's Pyth prices ({e}); pushing every feed",
+                    account.address
+                );
+                return Ok(PairSearch::Sized(Sizing {
+                    push_oracles: behind,
+                    ..sizing
+                }));
+            }
+        };
+        match size(program_accounts(cache, banks_and_oracles, Some(&pushed))?)? {
+            PairSearch::Sized(sizing) => Ok(PairSearch::Sized(Sizing {
+                push_oracles: pushed,
+                ..sizing
+            })),
+            // Healthy on the prices the program will read.
+            _ => Ok(PairSearch::None),
+        }
+    }
+
+    /// The Pyth oracles to push for the program to find the account unhealthy: none when the
+    /// chain's prices already do, otherwise the ones whose newer price lowers its health the most,
+    /// as many as one push carries. `None` when those aren't enough; an error when the chain's
+    /// prices can't price the account.
+    fn choose_pushes(
+        &self,
+        cache: &Cache,
+        clock: &Clock,
+        account: &MarginfiAccountWrapper,
+        group: &MarginfiGroup,
+        banks_and_oracles: &[Pubkey],
+        behind: &[Pubkey],
+    ) -> Result<Option<Vec<Pubkey>>> {
+        let health = |pushed: &[Pubkey]| -> Result<I80F48> {
+            let mut accounts = program_accounts(cache, banks_and_oracles, Some(pushed))?;
+            let (assets, liabilities) = health_components(
+                account,
+                group,
+                clock,
+                banks_and_oracles,
+                &mut accounts,
+                RequirementType::Maintenance,
+            )?;
+            Ok(assets - liabilities)
+        };
+        let on_chain = health(&[])?;
+        if on_chain < I80F48::ZERO {
+            return Ok(Some(Vec::new()));
+        }
+        let singles = behind
+            .iter()
+            .filter_map(|oracle| health(&[*oracle]).ok().map(|h| (h, *oracle)));
+        let pushed = strongest_pushes(on_chain, singles);
+        if pushed.is_empty() || health(&pushed)? >= I80F48::ZERO {
+            return Ok(None);
+        }
+        Ok(Some(pushed))
+    }
+
+    /// Sizes every pair on `accounts`, the bank and oracle accounts behind `banks_and_oracles`.
+    #[allow(clippy::too_many_arguments)]
+    fn size_on_accounts(
+        &self,
+        cache: &Cache,
+        clock: Clock,
+        account: &MarginfiAccountWrapper,
+        group: &MarginfiGroup,
+        banks_and_oracles: &[Pubkey],
+        mut accounts: Vec<Account>,
+        asset_banks: &[Pubkey],
+        liab_banks: &[Pubkey],
+    ) -> Result<PairSearch> {
         let mut bank_to_emode_config = HashMap::<Pubkey, EmodeConfig>::new();
-        for pk in banks_and_oracles.iter() {
-            let bank_account = cache.banks.try_get_bank(pk);
-            let account = match bank_account {
-                Ok(wrapper) => {
-                    bank_to_emode_config.insert(*pk, wrapper.bank.emode.emode_config);
-                    wrapper.account
-                }
-                Err(_) => cache.oracles.try_get_account(pk)?,
-            };
-            accounts.push(account);
+        for pk in banks_and_oracles {
+            if let Ok(wrapper) = cache.banks.try_get_bank(pk) {
+                bank_to_emode_config.insert(*pk, wrapper.bank.emode.emode_config);
+            }
         }
 
         let remaining_ais: Vec<_> = accounts
@@ -1087,32 +1517,11 @@ impl Evaluator {
             account.address, maintenance_health, total_weighted_assets, total_weighted_liabilities
         );
         if maintenance_health >= I80F48::ZERO {
-            debug!(
-                "Account {} is healthy: maintenance health ${:.6}",
-                account.address,
-                maintenance_health.to_num::<f64>()
-            );
-            return Ok(None);
+            return Ok(PairSearch::Healthy(health_watch::margin(
+                total_weighted_assets.to_num(),
+                total_weighted_liabilities.to_num(),
+            )));
         }
-        let needs_price_push = match self.maintenance_health_on_chain_prices(
-            cache,
-            &clock,
-            account,
-            group,
-            banks_and_oracles,
-        ) {
-            Ok(health) => health.is_some_and(|health| health >= I80F48::ZERO),
-            // The chain's price is unusable as it stands (too old for the program, say): only a
-            // pushed one can make this liquidation pass.
-            Err(e) => {
-                debug!(
-                    "Account {}: can't price it on the chain's Pyth prices ({e}); a push is needed",
-                    account.address
-                );
-                true
-            }
-        };
-
         let (total_assets_equity, total_liabs_equity) = get_health_components(
             &account.account,
             group,
@@ -1172,7 +1581,7 @@ impl Evaluator {
                 .iter()
                 .map(|(_, _, amounts, weight)| (amounts.liquidator_profit, *weight)),
         ) else {
-            return Ok(None);
+            return Ok(PairSearch::None);
         };
         let (asset_bank, liab_bank, amounts, _) = candidates[main];
         let sandwich = sandwich.map(|index| {
@@ -1180,7 +1589,7 @@ impl Evaluator {
             (asset_bank, liab_bank, amounts)
         });
         // Tagging helps every pair, so it is worth it when any pair would profit from it.
-        Ok(Some(Sizing {
+        Ok(PairSearch::Sized(Sizing {
             asset_bank,
             liab_bank,
             amounts: LiquidationAmounts {
@@ -1189,58 +1598,8 @@ impl Evaluator {
             },
             sandwich,
             maintenance_health,
-            needs_price_push,
+            push_oracles: Vec::new(),
         }))
-    }
-
-    /// The account's maintenance health on the Pyth prices the chain holds, where eva prices any
-    /// of its feeds ahead of them; `None` when every price it reads is the chain's already. This is
-    /// what the program would compute without a push, so it tells a liquidation that needs one
-    /// apart before anything is built.
-    fn maintenance_health_on_chain_prices(
-        &self,
-        cache: &Cache,
-        clock: &Clock,
-        account: &MarginfiAccountWrapper,
-        group: &MarginfiGroup,
-        banks_and_oracles: &[Pubkey],
-    ) -> Result<Option<I80F48>> {
-        let mut behind = false;
-        let mut accounts = Vec::with_capacity(banks_and_oracles.len());
-        for pk in banks_and_oracles {
-            let account = match cache.banks.try_get_bank(pk) {
-                Ok(wrapper) => wrapper.account,
-                Err(_) => {
-                    let cached = cache.oracles.try_get_account(pk)?;
-                    match cache.pyth_prices.onchain_if_behind(pk, &cached) {
-                        Some(onchain) => {
-                            behind = true;
-                            onchain
-                        }
-                        None => cached,
-                    }
-                }
-            };
-            accounts.push(account);
-        }
-        if !behind {
-            return Ok(None);
-        }
-        let remaining_ais: Vec<_> = accounts
-            .iter_mut()
-            .zip(banks_and_oracles.iter())
-            .map(|(account, pk)| (pk, account).into_account_info())
-            .collect();
-        let (assets, liabilities) = get_health_components(
-            &account.account,
-            group,
-            &remaining_ais,
-            RequirementType::Maintenance,
-            &mut None,
-            HealthPriceMode::Client(clock.clone()),
-            &mut None,
-        )?;
-        Ok(Some(assets - liabilities))
     }
 
     /// How much seizing `asset_bank_wrapper` for `liab_bank_wrapper` may repay and earn, as
@@ -1574,5 +1933,76 @@ mod pair_preference_tests {
         assert_eq!(seize_weight(ASSET_TAG_KAMINO), 1);
         assert_eq!(seize_weight(ASSET_TAG_JUPLEND), 1);
         assert_eq!(seize_weight(0), 0);
+    }
+}
+
+#[cfg(test)]
+mod push_choice_tests {
+    use super::*;
+    use crate::cache::pyth_prices::test_price_update_account;
+    use crate::utils::pyth_cranker::price_feed_address;
+    use std::sync::Mutex;
+
+    #[test]
+    fn the_feeds_that_lower_health_most_are_pushed() {
+        let (sol, eth, usdc, jup) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        // Healthy by $5 on the chain's prices: SOL's newer price takes $40 off, ETH's $10, JUP's
+        // $1, and USDC's adds $1.
+        let singles = [
+            (I80F48!(-5), eth),
+            (I80F48!(6), usdc),
+            (I80F48!(-35), sol),
+            (I80F48!(4), jup),
+        ];
+        assert_eq!(
+            strongest_pushes(I80F48!(5), singles.into_iter()),
+            vec![sol, eth]
+        );
+        // A feed that moved in the account's favour is never pushed, even with room to spare.
+        assert_eq!(
+            strongest_pushes(I80F48!(5), [(I80F48!(6), usdc)].into_iter()),
+            Vec::<Pubkey>::new()
+        );
+    }
+
+    #[test]
+    fn unpushed_feeds_are_read_at_the_chains_price() {
+        let mut cache = Cache::new(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Arc::new(Mutex::new(Clock::default())),
+            HashSet::new(),
+        );
+        let mut add = |feed: [u8; 32]| {
+            let address = price_feed_address(&feed);
+            cache
+                .oracles
+                .try_insert(address, test_price_update_account(feed, 110, 2))
+                .unwrap();
+            cache
+                .pyth_prices
+                .record_onchain(address, &test_price_update_account(feed, 100, 1));
+            address
+        };
+        let (sol, eth) = (add([1; 32]), add([2; 32]));
+        let price = |account: &Account| {
+            crate::cache::pyth_prices::price_update(account)
+                .unwrap()
+                .price_message
+                .price
+        };
+        let oracles = [sol, eth];
+
+        let ours = program_accounts(&cache, &oracles, None).unwrap();
+        assert_eq!(ours.iter().map(price).collect::<Vec<_>>(), vec![2, 2]);
+        let chain = program_accounts(&cache, &oracles, Some(&[])).unwrap();
+        assert_eq!(chain.iter().map(price).collect::<Vec<_>>(), vec![1, 1]);
+        let sol_pushed = program_accounts(&cache, &oracles, Some(&[sol])).unwrap();
+        assert_eq!(sol_pushed.iter().map(price).collect::<Vec<_>>(), vec![2, 1]);
     }
 }
