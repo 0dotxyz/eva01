@@ -99,21 +99,36 @@ struct Changes {
 /// Evaluation work since the last report.
 struct ScanStats {
     since: Instant,
-    cycles: usize,
     evaluated: usize,
     skipped: usize,
-    slowest: Duration,
+    /// How long each cycle on a change took, apart from the full sweeps.
+    cycle_times: Vec<Duration>,
+    sweeps: usize,
+    slowest_sweep: Duration,
 }
 
 impl ScanStats {
     fn new() -> Self {
         Self {
             since: Instant::now(),
-            cycles: 0,
             evaluated: 0,
             skipped: 0,
-            slowest: Duration::ZERO,
+            cycle_times: Vec::new(),
+            sweeps: 0,
+            slowest_sweep: Duration::ZERO,
         }
+    }
+
+    /// The median, 90th percentile and slowest of the cycles on a change, in ms.
+    fn cycle_percentiles(&self) -> (u128, u128, u128) {
+        let mut times = self.cycle_times.clone();
+        times.sort();
+        let at = |q: f64| {
+            times
+                .get(((times.len() as f64 - 1.0) * q).round() as usize)
+                .map_or(0, Duration::as_millis)
+        };
+        (at(0.5), at(0.9), at(1.0))
     }
 }
 
@@ -124,6 +139,10 @@ const PREMIUM_SAFETY_MARGIN: I80F48 = I80F48!(0.005);
 /// Liquidations are sized to this share of the most the program allows, leaving room for price
 /// moves between evaluation and landing; profit is judged on the same share.
 const LIQUIDATION_SIZE_HAIRCUT: I80F48 = I80F48!(0.90);
+
+/// Below this margin on eva's prices, an account is also priced on the chain's, which can lag
+/// eva's by about a price update and still allow a liquidation eva's prices don't.
+const CHAIN_CHECK_MARGIN: f64 = 0.02;
 
 /// A liquidation the chain's prices already allow goes behind a push only when the push lets it
 /// earn this much more: a push takes a bundle slot and can lose to the chain catching up.
@@ -202,6 +221,41 @@ fn unit_value(cache: &Cache, clock: &Clock, bank: &Pubkey, liability: bool) -> O
         .price(&oracle, side, RequirementType::Maintenance)
         .ok()?;
     Some((price * I80F48::from(share_value)).to_num())
+}
+
+/// Unit values computed once per evaluation cycle: every account in it shares the same banks.
+struct UnitValues<'a> {
+    cache: &'a Cache,
+    clock: &'a Clock,
+    memo: std::sync::RwLock<HashMap<(Pubkey, bool), Option<f64>>>,
+}
+
+impl<'a> UnitValues<'a> {
+    fn new(cache: &'a Cache, clock: &'a Clock) -> Self {
+        Self {
+            cache,
+            clock,
+            memo: Default::default(),
+        }
+    }
+
+    fn get(&self, bank: &Pubkey, liability: bool) -> Option<f64> {
+        let key = (*bank, liability);
+        if let Some(value) = self
+            .memo
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return *value;
+        }
+        let value = unit_value(self.cache, self.clock, bank, liability);
+        self.memo
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, value);
+        value
+    }
 }
 
 /// How often each unhealthy account we are not liquidating is reported.
@@ -300,6 +354,8 @@ struct Sizing {
     maintenance_health: I80F48,
     /// The Pyth oracles to push first, whose newer prices the pairs are sized on.
     push_oracles: Vec<Pubkey>,
+    /// The liquidation the chain's prices already allow, when a push lets this one earn more.
+    without_push: Option<Box<Sizing>>,
 }
 
 /// A bank's maintenance price over its equity price on one side.
@@ -755,9 +811,14 @@ impl Liquidator {
                 self.queue.offer(&accounts_to_check, liquidations);
                 self.handle_unhealthy(&accounts_to_check, &unhealthy);
                 let elapsed = started.elapsed();
-                self.scan_stats.cycles += 1;
-                self.scan_stats.evaluated += accounts_to_check.len();
-                self.scan_stats.slowest = self.scan_stats.slowest.max(elapsed);
+                let stats = &mut self.scan_stats;
+                stats.evaluated += accounts_to_check.len();
+                if full {
+                    stats.sweeps += 1;
+                    stats.slowest_sweep = stats.slowest_sweep.max(elapsed);
+                } else {
+                    stats.cycle_times.push(elapsed);
+                }
                 debug!(
                     "Evaluated {} account(s) in {} ms: {} queued for liquidation, {} unhealthy but not worth liquidating.",
                     accounts_to_check.len(),
@@ -778,14 +839,19 @@ impl Liquidator {
         if stats.since.elapsed() < SCAN_REPORT_INTERVAL {
             return;
         }
+        let (median, p90, slowest) = stats.cycle_percentiles();
         info!(
-            "Scans in the last {} s: {} cycle(s), {} evaluation(s), {} skipped by the health watch ({} account(s) watched), slowest {} ms.",
+            "Scans in the last {} s: {} cycle(s) on a change taking {} ms median, {} ms p90, {} ms at most; {} full sweep(s), the slowest {} ms; {} evaluation(s), {} skipped by the health watch ({} account(s) watched).",
             stats.since.elapsed().as_secs(),
-            stats.cycles,
+            stats.cycle_times.len(),
+            median,
+            p90,
+            slowest,
+            stats.sweeps,
+            stats.slowest_sweep.as_millis(),
             stats.evaluated,
             stats.skipped,
-            self.health_watch.len(),
-            stats.slowest.as_millis()
+            self.health_watch.len()
         );
         self.scan_stats = ScanStats::new();
     }
@@ -1029,8 +1095,12 @@ fn attempt_liquidation(
                     String::new()
                 } else {
                     format!(
-                        "; healthy on the chain's prices, so behind a push of {} feed(s)",
-                        fresh.push_oracles.len()
+                        "; behind a push of {} feed(s){}",
+                        fresh.push_oracles.len(),
+                        fresh.without_push.as_ref().map_or(String::new(), |unpushed| format!(
+                            ", or ${:.4} without it",
+                            unpushed.profit.to_num::<f64>()
+                        ))
                     )
                 }
             );
@@ -1103,7 +1173,7 @@ impl Evaluator {
     fn watch_for(
         &self,
         account: &MarginfiAccountWrapper,
-        clock: &Clock,
+        unit_values: &UnitValues,
         margin: f64,
     ) -> Option<Watch> {
         let (deposits, liabilities) = account.get_deposits_and_liabilities_shares();
@@ -1115,7 +1185,7 @@ impl Evaluator {
                 Some(WatchedPosition {
                     bank,
                     liability,
-                    unit_value: unit_value(&self.cache, clock, &bank, liability)?,
+                    unit_value: unit_values.get(&bank, liability)?,
                 })
             })
             .collect::<Option<Vec<_>>>()?;
@@ -1124,6 +1194,7 @@ impl Evaluator {
 
     fn check_accounts(&self, account_addresses: &[Pubkey]) -> Result<Evaluations> {
         let clock = clock_manager::get_clock(&self.cache.clock)?;
+        let unit_values = UnitValues::new(&self.cache, &clock);
 
         // Evaluation is CPU-bound (oracle parsing + health math) and independent per account, so a
         // full scan of every borrower parallelises cleanly across cores.
@@ -1136,7 +1207,7 @@ impl Evaluator {
                     .try_get_account(account_address)
                     .ok()?;
 
-                match self.process_account(&account, clock.clone()) {
+                match self.process_account(&account, clock.clone(), &unit_values) {
                     Ok(acc_opt) => acc_opt,
                     Err(err) => {
                         debug!("Failed to process account {:?}: {:?}", account.address, err);
@@ -1164,16 +1235,20 @@ impl Evaluator {
     fn re_evaluate(&self, address: &Pubkey) -> Result<Option<PreparedLiquidatableAccount>> {
         let account = self.cache.marginfi_accounts.try_get_account(address)?;
         let clock = clock_manager::get_clock(&self.cache.clock)?;
-        Ok(match self.process_account(&account, clock)? {
-            Some(Evaluation::Liquidate(intent)) => Some(intent),
-            _ => None,
-        })
+        let unit_values = UnitValues::new(&self.cache, &clock);
+        Ok(
+            match self.process_account(&account, clock.clone(), &unit_values)? {
+                Some(Evaluation::Liquidate(intent)) => Some(intent),
+                _ => None,
+            },
+        )
     }
 
     fn process_account(
         &self,
         account: &MarginfiAccountWrapper,
         clock: Clock,
+        unit_values: &UnitValues,
     ) -> Result<Option<Evaluation>> {
         let (deposit_shares, liab_shares) = account.get_deposits_and_liabilities_shares();
         if deposit_shares.is_empty() || liab_shares.is_empty() {
@@ -1232,11 +1307,21 @@ impl Evaluator {
         )? {
             PairSearch::Sized(sizing) => sizing,
             PairSearch::Healthy(margin) => {
-                let watch = self.watch_for(account, &clock, margin);
+                let watch = self.watch_for(account, unit_values, margin);
                 return Ok(Some(Evaluation::Healthy(account.address, watch)));
             }
             PairSearch::None => return Ok(None),
         };
+        self.prepare(account, observation_accounts, sizing)
+    }
+
+    /// The liquidation `sizing` allows, or the unhealthy account it leaves when none is worth it.
+    fn prepare(
+        &self,
+        account: &MarginfiAccountWrapper,
+        observation_accounts: ObservationAccounts,
+        sizing: Sizing,
+    ) -> Result<Option<Evaluation>> {
         let Sizing {
             asset_bank: asset_bank_pk,
             liab_bank: liab_bank_pk,
@@ -1244,6 +1329,7 @@ impl Evaluator {
             sandwich,
             maintenance_health,
             push_oracles,
+            without_push,
         } = sizing;
 
         if !liquidation_amounts.is_liquidatable() {
@@ -1267,6 +1353,10 @@ impl Evaluator {
             .max_profit
             .is_some_and(|max| profit > I80F48::from_num(max))
         {
+            // The smaller liquidation the chain already allows may still be within the cap.
+            if let Some(unpushed) = without_push {
+                return self.prepare(account, observation_accounts, *unpushed);
+            }
             debug!(
                 "Account {}: ${:.4} profit is above this instance's ${:?} cap; left to another instance",
                 account.address,
@@ -1297,6 +1387,14 @@ impl Evaluator {
                 profit: amounts.liquidator_profit * LIQUIDATION_SIZE_HAIRCUT,
             });
 
+        let without_push = match without_push {
+            Some(sizing) => match self.prepare(account, observation_accounts.clone(), *sizing)? {
+                Some(Evaluation::Liquidate(intent)) => Some(Box::new(intent)),
+                _ => None,
+            },
+            None => None,
+        };
+
         Ok(Some(Evaluation::Liquidate(PreparedLiquidatableAccount {
             liquidatee_account: account.clone(),
             observation_accounts,
@@ -1306,6 +1404,7 @@ impl Evaluator {
             liab_amount: slippage_adjusted_liab_amount,
             profit,
             push_oracles,
+            without_push,
             sandwich_pair,
         })))
     }
@@ -1382,30 +1481,48 @@ impl Evaluator {
         asset_banks: &[Pubkey],
         liab_banks: &[Pubkey],
     ) -> Result<PairSearch> {
-        let size = |accounts| {
+        let size = |pushed: Option<&[Pubkey]>| {
             self.size_on_accounts(
                 cache,
                 clock.clone(),
                 account,
                 group,
                 banks_and_oracles,
-                accounts,
+                pushed,
                 asset_banks,
                 liab_banks,
             )
         };
-        let search = size(program_accounts(cache, banks_and_oracles, None)?)?;
-        let PairSearch::Sized(sizing) = search else {
-            return Ok(search);
+        let search = size(None)?;
+        let near_threshold = match &search {
+            PairSearch::Healthy(margin) => *margin < CHAIN_CHECK_MARGIN,
+            PairSearch::Sized(_) => true,
+            PairSearch::None => false,
         };
+        if !near_threshold {
+            return Ok(search);
+        }
         let behind: Vec<Pubkey> = banks_and_oracles
             .iter()
             .filter(|pk| pushable_feed(cache, pk).is_some())
             .copied()
             .collect();
-        if !sizing.amounts.is_liquidatable() || behind.is_empty() {
-            return Ok(PairSearch::Sized(sizing));
+        if behind.is_empty() {
+            return Ok(search);
         }
+        let sizing = match search {
+            PairSearch::Sized(sizing) if sizing.amounts.is_liquidatable() => sizing,
+            // Not liquidatable on eva's prices, but the chain may still hold older ones the
+            // account fails on: a price that recovered on Hermes before the chain caught up.
+            search => {
+                return Ok(match size(Some(&[])) {
+                    Ok(PairSearch::Sized(on_chain)) if on_chain.amounts.is_liquidatable() => {
+                        PairSearch::Sized(on_chain)
+                    }
+                    _ => search,
+                })
+            }
+        };
 
         let health = |pushed: &[Pubkey]| -> Result<I80F48> {
             let mut accounts = program_accounts(cache, banks_and_oracles, Some(pushed))?;
@@ -1424,20 +1541,33 @@ impl Evaluator {
             // The chain's price is unusable as it stands (too old for the program, say): only
             // pushing every feed can make this liquidation pass.
             Err(e) => {
+                let pushable = self
+                    .pusher
+                    .as_ref()
+                    .is_some_and(|pusher| pusher.check(&pending_feeds(cache, &behind)).is_ok());
                 debug!(
-                    "Account {}: can't price it on the chain's Pyth prices ({e}); pushing every feed",
-                    account.address
+                    "Account {}: can't price it on the chain's Pyth prices ({e}); {}",
+                    account.address,
+                    if pushable {
+                        "pushing every feed"
+                    } else {
+                        "one bundle can't push every feed"
+                    }
                 );
-                return Ok(PairSearch::Sized(Sizing {
-                    push_oracles: behind,
-                    ..sizing
-                }));
+                return Ok(if pushable {
+                    PairSearch::Sized(Sizing {
+                        push_oracles: behind,
+                        ..sizing
+                    })
+                } else {
+                    PairSearch::None
+                });
             }
         };
 
         // On the chain's prices as they stand, when those already find the account unhealthy.
         let unpushed = if on_chain < I80F48::ZERO {
-            match size(program_accounts(cache, banks_and_oracles, Some(&[]))?)? {
+            match size(Some(&[])).unwrap_or(PairSearch::None) {
                 PairSearch::Sized(sizing) => Some(sizing),
                 _ => None,
             }
@@ -1450,7 +1580,7 @@ impl Evaluator {
         let pushed = if pushed.is_empty() {
             None
         } else {
-            match size(program_accounts(cache, banks_and_oracles, Some(&pushed))?)? {
+            match size(Some(&pushed)).unwrap_or(PairSearch::None) {
                 PairSearch::Sized(sizing) => Some(Sizing {
                     push_oracles: pushed,
                     ..sizing
@@ -1467,10 +1597,14 @@ impl Evaluator {
             }
         };
         Ok(match (unpushed, pushed) {
+            // Kept, to take at once when no bundle can carry the push right away.
             (Some(unpushed), Some(pushed))
                 if earned(&pushed) > earned(&unpushed) * PUSH_PROFIT_GAIN =>
             {
-                PairSearch::Sized(pushed)
+                PairSearch::Sized(Sizing {
+                    without_push: Some(Box::new(unpushed)),
+                    ..pushed
+                })
             }
             (Some(unpushed), _) => PairSearch::Sized(unpushed),
             (None, Some(pushed)) => PairSearch::Sized(pushed),
@@ -1517,10 +1651,11 @@ impl Evaluator {
         account: &MarginfiAccountWrapper,
         group: &MarginfiGroup,
         banks_and_oracles: &[Pubkey],
-        mut accounts: Vec<Account>,
+        pushed: Option<&[Pubkey]>,
         asset_banks: &[Pubkey],
         liab_banks: &[Pubkey],
     ) -> Result<PairSearch> {
+        let mut accounts = program_accounts(cache, banks_and_oracles, pushed)?;
         let mut bank_to_emode_config = HashMap::<Pubkey, EmodeConfig>::new();
         for pk in banks_and_oracles {
             if let Ok(wrapper) = cache.banks.try_get_bank(pk) {
@@ -1606,6 +1741,7 @@ impl Evaluator {
                             maintenance_health,
                             total_assets_equity,
                             total_liabs_equity,
+                            pushed,
                         )
                     });
                 let amounts = match amounts {
@@ -1645,6 +1781,7 @@ impl Evaluator {
             sandwich,
             maintenance_health,
             push_oracles: Vec::new(),
+            without_push: None,
         }))
     }
 
@@ -1662,13 +1799,15 @@ impl Evaluator {
         maintenance_health: I80F48,
         total_assets_equity: I80F48,
         total_liabs_equity: I80F48,
+        pushed: Option<&[Pubkey]>,
     ) -> Result<LiquidationAmounts> {
         let in_bad_debt = total_assets_equity < total_liabs_equity;
+        // Valued and converted on the prices the program reads, like the health above.
         let asset_oracle_wrapper =
-            OracleWrapper::build(&self.cache, &clock, &asset_bank_wrapper.address)?;
+            OracleWrapper::build_on(&self.cache, &clock, &asset_bank_wrapper.address, pushed)?;
 
         let liab_oracle_wrapper =
-            OracleWrapper::build(&self.cache, &clock, &liab_bank_wrapper.address)?;
+            OracleWrapper::build_on(&self.cache, &clock, &liab_bank_wrapper.address, pushed)?;
 
         let asset_weight_maint: I80F48 = asset_bank_wrapper
             .bank

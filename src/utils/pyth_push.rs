@@ -30,23 +30,20 @@ use std::sync::Arc;
 use crate::cache::Cache;
 use crate::config::Eva01Config;
 use crate::transaction_limits::{MAX_BUNDLE_TXS, MAX_COMPUTE_UNIT_LIMIT, MAX_V0_TX_SIZE};
-use crate::utils::jito::tip_instruction;
 use crate::utils::pyth_cranker::{
     close_encoded_vaa_ix, guardian_set_index, init_encoded_vaa_ix, price_feed_address,
     update_price_feed_ix, verify_encoded_vaa_ix, write_encoded_vaa_ix, VAA_HEADER_SIZE,
     VAA_SPLIT_INDEX,
 };
 
-/// The push transactions a bundle has room for when the tip is a transaction of its own: the
-/// liquidation and the tip take two.
+/// The push transactions a bundle has room for: the liquidation and the tip take two. The tip
+/// stays the bundle's last transaction, after the liquidation: in a push transaction it would pay
+/// for a push that lands without the liquidation if the bundle were split.
 const MAX_PUSH_TXS: usize = MAX_BUNDLE_TXS - 2;
 
-/// The push transactions a bundle has room for when the last of them carries the tip.
-const MAX_PUSH_TXS_WITH_TIP: usize = MAX_BUNDLE_TXS - 1;
-
 /// The most feeds a liquidation is sized on pushing. Posting and verifying the VAA take two
-/// transactions and each further one holds about two updates, so a bundle carries about four;
-/// how many fit is checked by building the push (`PythPusher::check`).
+/// transactions and each further one holds about two updates; how many fit is measured
+/// (`PythPusher::check`).
 pub const MAX_PUSHED_FEEDS: usize = 4;
 
 pub struct PythPusher {
@@ -62,8 +59,6 @@ pub struct PythPusher {
 /// always closed by the last.
 pub struct PricePush {
     pub txs: Vec<VersionedTransaction>,
-    /// The last transaction carries the bundle's tip: a tip transaction of its own didn't fit.
-    pub carries_tip: bool,
 }
 
 impl PythPusher {
@@ -83,14 +78,11 @@ impl PythPusher {
     }
 
     /// The transactions that post the latest Hermes prices of `feed_ids` ahead of a liquidation.
-    /// The bundle's tip of `tip_lamports` stays a transaction of its own, the bundle's last, when
-    /// the push leaves room for it; otherwise the push's last transaction pays it.
-    pub fn push_transactions(&self, feed_ids: &[[u8; 32]], tip_lamports: u64) -> Result<PricePush> {
-        let tip = tip_instruction(&self.payer.pubkey(), tip_lamports)?;
-        let (layout, encoded_vaa) = self.layout(feed_ids, &tip)?;
+    pub fn push_transactions(&self, feed_ids: &[[u8; 32]]) -> Result<PricePush> {
+        let (chunks, encoded_vaa) = self.layout(feed_ids)?;
         let blockhash = self.cache.blockhash.get(&self.rpc_client)?;
-        let mut txs = Vec::with_capacity(layout.chunks.len());
-        for (i, chunk) in layout.chunks.iter().enumerate() {
+        let mut txs = Vec::with_capacity(chunks.len());
+        for (i, chunk) in chunks.iter().enumerate() {
             // The first transaction creates the VAA account, which signs for itself.
             let signers: &[&Keypair] = if i == 0 {
                 &[&self.payer, &encoded_vaa]
@@ -100,59 +92,41 @@ impl PythPusher {
             txs.push(self.sign(chunk, signers, blockhash)?);
         }
         debug!(
-            "PythPusher: {} transaction(s) push {} feed(s){}",
+            "PythPusher: {} transaction(s) push {} feed(s)",
             txs.len(),
-            feed_ids.len(),
-            if layout.carries_tip {
-                ", the last carrying the tip"
-            } else {
-                ""
-            }
+            feed_ids.len()
         );
-        Ok(PricePush {
-            txs,
-            carries_tip: layout.carries_tip,
-        })
+        Ok(PricePush { txs })
     }
 
     /// Whether a push of `feed_ids` fits a bundle on the updates streamed so far. Nothing is
     /// signed or fetched: only the transactions' sizes are measured.
     pub fn check(&self, feed_ids: &[[u8; 32]]) -> Result<()> {
-        // A tip's size doesn't depend on its amount.
-        let tip = tip_instruction(&self.payer.pubkey(), 0)?;
-        self.layout(feed_ids, &tip).map(|_| ())
+        if feed_ids.is_empty() {
+            return Ok(());
+        }
+        self.layout(feed_ids).map(|_| ())
     }
 
-    /// The push's instructions split into the transactions that fit a bundle: without the tip
-    /// when there's room for a tip transaction of its own, otherwise with it in the last one.
-    fn layout(&self, feed_ids: &[[u8; 32]], tip: &Instruction) -> Result<(Layout, Keypair)> {
+    /// The push's instructions split into the transactions that fit a bundle, and the VAA
+    /// account's keypair, which signs the first.
+    fn layout(&self, feed_ids: &[[u8; 32]]) -> Result<(Vec<Vec<Instruction>>, Keypair)> {
         let encoded_vaa = Keypair::new();
-        let (post, mut rest) = self.instructions(feed_ids, &encoded_vaa.pubkey())?;
-        let mut chunks = vec![post.clone()];
-        chunks.extend(self.pack(&rest)?);
-        if chunks.len() <= MAX_PUSH_TXS {
-            let layout = Layout {
-                chunks,
-                carries_tip: false,
-            };
-            return Ok((layout, encoded_vaa));
+        let (post, rest) = self.instructions(feed_ids, &encoded_vaa.pubkey())?;
+        if !self.fits(&post)? {
+            return Err(anyhow!("posting the VAA doesn't fit a transaction"));
         }
-        rest.push(tip.clone());
         let mut chunks = vec![post];
         chunks.extend(self.pack(&rest)?);
-        if chunks.len() > MAX_PUSH_TXS_WITH_TIP {
+        if chunks.len() > MAX_PUSH_TXS {
             return Err(anyhow!(
                 "pushing {} feeds takes {} transactions (max {})",
                 feed_ids.len(),
                 chunks.len(),
-                MAX_PUSH_TXS_WITH_TIP
+                MAX_PUSH_TXS
             ));
         }
-        let layout = Layout {
-            chunks,
-            carries_tip: true,
-        };
-        Ok((layout, encoded_vaa))
+        Ok((chunks, encoded_vaa))
     }
 
     /// The push's instructions: the first transaction's, which create the VAA account at
@@ -295,12 +269,6 @@ impl PythPusher {
             signers,
         )?)
     }
-}
-
-/// A push's instructions per transaction.
-struct Layout {
-    chunks: Vec<Vec<Instruction>>,
-    carries_tip: bool,
 }
 
 #[cfg(test)]

@@ -37,7 +37,7 @@ use crate::cache::{pyth_prices::price_update, Cache};
 use crate::utils::{
     jito::{BundleSend, InflightStatus, JitoClient, JitoSlot, TipEstimator},
     pyth_cranker::price_feed_address,
-    pyth_push::PythPusher,
+    pyth_push::{PricePush, PythPusher},
 };
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 use solana_keypair::Keypair;
@@ -56,6 +56,18 @@ enum Preflight {
     Run,
     Skip,
 }
+
+/// A price push that couldn't be built, so the liquidation behind it never went out.
+#[derive(Debug)]
+struct PushFailure(String);
+
+impl std::fmt::Display for PushFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PushFailure {}
 
 /// What landing a liquidation as a Jito bundle needs, behind a price push or not.
 pub struct BundleLanding {
@@ -185,7 +197,28 @@ pub fn pushable_feed(cache: &Cache, oracle: &Pubkey) -> Option<[u8; 32]> {
         .pyth_prices
         .onchain(oracle)
         .is_some_and(|onchain| update.price_message.publish_time > onchain);
-    (behind && price_feed_address(&feed_id) == *oracle).then_some(feed_id)
+    (behind && sponsored_feed_address(&feed_id) == *oracle).then_some(feed_id)
+}
+
+/// `price_feed_address`, derived once per feed: evaluation asks for it on every account near the
+/// threshold.
+fn sponsored_feed_address(feed_id: &[u8; 32]) -> Pubkey {
+    static ADDRESSES: std::sync::OnceLock<std::sync::RwLock<HashMap<[u8; 32], Pubkey>>> =
+        std::sync::OnceLock::new();
+    let addresses = ADDRESSES.get_or_init(Default::default);
+    if let Some(address) = addresses
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(feed_id)
+    {
+        return *address;
+    }
+    let address = price_feed_address(feed_id);
+    addresses
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(*feed_id, address);
+    address
 }
 
 /// The feeds of `oracles` still ahead of the chain, which a liquidation sized on their prices
@@ -289,6 +322,14 @@ impl Executor {
             // engine. Any other takes a bundle only when a request slot is free right now, and
             // otherwise goes over RPC at once instead of queueing behind the other workers.
             if must_push {
+                // A push that can't be built gives way to the smaller liquidation the chain's
+                // prices already allow, when there is one.
+                let unpushed = intent.without_push.as_deref();
+                if let Some(unpushed) = unpushed {
+                    if bundles.pusher.check(&pending).is_err() {
+                        return self.execute_without_push(strategy, bundles, unpushed);
+                    }
+                }
                 let slot = match bundles.jito.try_reserve() {
                     Some(slot) => slot,
                     None => {
@@ -298,7 +339,15 @@ impl Executor {
                         bundles.jito.reserve()
                     }
                 };
-                return self.execute_as_bundle(strategy, intent, liab_mint, &pending, slot);
+                let result = self.execute_as_bundle(strategy, intent, liab_mint, &pending, slot);
+                // The stream may have moved on since the check.
+                if let (Err(e), Some(unpushed)) = (&result, unpushed) {
+                    if e.downcast_ref::<PushFailure>().is_some() {
+                        self.clear_target_backoff(&liquidatee);
+                        return self.execute_without_push(strategy, bundles, unpushed);
+                    }
+                }
+                return result;
             }
             if let Some(slot) = bundles.jito.try_reserve() {
                 return self.execute_as_bundle(strategy, intent, liab_mint, &[], slot);
@@ -395,6 +444,27 @@ impl Executor {
                 self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
                 Err(e)
             }
+        }
+    }
+
+    /// `unpushed`, a liquidation the chain's prices allow: in a bundle when a request slot is free,
+    /// otherwise over RPC. Skipped while its liability mint is quarantined.
+    fn execute_without_push(
+        &self,
+        strategy: &dyn LiquidationStrategy,
+        bundles: &BundleLanding,
+        unpushed: &PreparedLiquidatableAccount,
+    ) -> Result<()> {
+        let liquidatee = unpushed.liquidatee_account.address;
+        let liab_mint = self.intent_liab_mint(unpushed)?;
+        if self.is_backed_off(&liab_mint)? {
+            debug!("Skipping {liquidatee} without a push: liab mint {liab_mint} is quarantined");
+            return Ok(());
+        }
+        info!("Liquidating {liquidatee} without a push, on the chain's prices: the push can't be built");
+        match bundles.jito.try_reserve() {
+            Some(slot) => self.execute_as_bundle(strategy, unpushed, liab_mint, &[], slot),
+            None => self.execute_over_rpc(strategy, unpushed, liab_mint, &[]),
         }
     }
 
@@ -540,13 +610,22 @@ impl Executor {
             .bundles
             .as_ref()
             .ok_or_else(|| anyhow!("bundles are off"))?;
-        // The push is checked first: without it there is nothing to bundle, and no quote is
-        // spent. It's built once the plan's profit sets the tip, which it may carry.
-        if !feeds.is_empty() {
-            if let Err(e) = bundles.pusher.check(feeds) {
-                return Err(self.push_failure(&liquidatee, feeds, e));
+        // The push first: without it there is nothing to bundle, and no quote is spent.
+        let push = if feeds.is_empty() {
+            None
+        } else {
+            match bundles.pusher.push_transactions(feeds) {
+                Ok(push) => Some(push),
+                Err(e) => {
+                    let e = PushFailure(format!(
+                        "can't push the {} Pyth feed(s) it needs: {e}",
+                        feeds.len()
+                    ));
+                    self.note_execution_failure(&liquidatee, &e.0);
+                    return Err(e.into());
+                }
             }
-        }
+        };
 
         let wallet_short = match self.sufficient_wallet_plan(strategy, intent, Landing::Bundle) {
             Ok(plan) => {
@@ -554,7 +633,7 @@ impl Executor {
                     strategy,
                     bundles,
                     intent,
-                    feeds,
+                    push.as_ref(),
                     plan,
                     "wallet-funded",
                     slot,
@@ -563,9 +642,15 @@ impl Executor {
             Err(short) => short,
         };
         match strategy.assemble_sandwich(&intent.for_sandwich(), Landing::Bundle) {
-            Ok(Sandwich::Plan(plan)) => {
-                self.land_bundle(strategy, bundles, intent, feeds, plan, "sandwich", slot)
-            }
+            Ok(Sandwich::Plan(plan)) => self.land_bundle(
+                strategy,
+                bundles,
+                intent,
+                push.as_ref(),
+                plan,
+                "sandwich",
+                slot,
+            ),
             Ok(_) => self.no_plan(&liquidatee, liab_mint, &wallet_short),
             Err(e) => {
                 self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
@@ -574,27 +659,13 @@ impl Executor {
         }
     }
 
-    /// A push of `feeds` that can't be built, noted as an execution failure.
-    fn push_failure(
-        &self,
-        liquidatee: &Pubkey,
-        feeds: &[[u8; 32]],
-        e: anyhow::Error,
-    ) -> anyhow::Error {
-        let e = anyhow!("can't push the {} Pyth feed(s) it needs: {e}", feeds.len());
-        self.note_execution_failure(liquidatee, &e.to_string());
-        e
-    }
-
     /// Sends `[push..] [liquidation] [tip]`, the tip a share of the plan's profit, and settles it.
-    /// A push too long to leave room for the tip transaction carries the tip in its last one.
-    #[allow(clippy::too_many_arguments)]
     fn land_bundle(
         &self,
         strategy: &dyn LiquidationStrategy,
         bundles: &BundleLanding,
         intent: &PreparedLiquidatableAccount,
-        feeds: &[[u8; 32]],
+        push: Option<&PricePush>,
         plan: ExecutionPlan,
         kind: &str,
         slot: JitoSlot<'_>,
@@ -606,22 +677,6 @@ impl Executor {
             0
         });
         let tip = bundles.tip_estimator.tip_for(profit_lamports);
-        // A feed the chain caught up on while the plan was built needs no push any more.
-        let feeds = if feeds.is_empty() {
-            Vec::new()
-        } else {
-            pending_feeds(&self.cache, &intent.push_oracles)
-        };
-        let feeds = feeds.as_slice();
-        let push = if feeds.is_empty() {
-            None
-        } else {
-            match bundles.pusher.push_transactions(feeds, tip) {
-                Ok(push) => Some(push),
-                Err(e) => return Err(self.push_failure(&liquidatee, feeds, e)),
-            }
-        };
-        let push = push.as_ref();
         let mut bundle = push.map(|push| push.txs.clone()).unwrap_or_default();
         bundle.push(tx);
         info!(
@@ -631,18 +686,12 @@ impl Executor {
             profit.to_num::<f64>(),
             tip,
             push.map_or(String::new(), |push| format!(
-                ", behind a {}-tx price push{}",
-                push.txs.len(),
-                if push.carries_tip {
-                    " carrying the tip"
-                } else {
-                    ""
-                }
+                ", behind a {}-tx price push",
+                push.txs.len()
             ))
         );
 
-        let tip_tx = !push.is_some_and(|push| push.carries_tip);
-        let result = match self.send_bundle(bundles, &bundle, tip_tx.then_some(tip), slot) {
+        let result = match self.send_bundle(bundles, &bundle, tip, slot) {
             Ok(true) => Ok(()),
             Ok(false) => Err(anyhow!(
                 "the bundle for {liquidatee} didn't land: {}",
@@ -659,13 +708,13 @@ impl Executor {
         result
     }
 
-    /// Sends `bundle`, with a transaction tipping `tip` appended when given. Returns whether its
-    /// liquidation, the last transaction of `bundle`, landed.
+    /// Sends `bundle` with a tip transaction appended. Returns whether its liquidation, the last
+    /// transaction, landed.
     fn send_bundle(
         &self,
         bundles: &BundleLanding,
         bundle: &[VersionedTransaction],
-        tip: Option<u64>,
+        tip: u64,
         slot: JitoSlot<'_>,
     ) -> Result<bool> {
         let liquidation = bundle.last().ok_or_else(|| anyhow!("empty bundle"))?;
@@ -676,13 +725,11 @@ impl Executor {
         // The tip goes out with the liquidation's blockhash, so it expires with it.
         let blockhash = *liquidation.message.recent_blockhash();
         let mut txs = bundle.to_vec();
-        if let Some(tip) = tip {
-            txs.push(bundles.tip_estimator.build_tip_transaction(
-                &bundles.signer,
-                blockhash,
-                tip,
-            )?);
-        }
+        txs.push(
+            bundles
+                .tip_estimator
+                .build_tip_transaction(&bundles.signer, blockhash, tip)?,
+        );
         match slot.send_bundle(&txs) {
             Ok(BundleSend::Accepted(id)) => {
                 debug!("Bundle {id} sent; watching its liquidation {liquidation_sig}");
