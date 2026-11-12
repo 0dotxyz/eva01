@@ -129,6 +129,7 @@ mod tests {
 
     fn intent(address: Pubkey, profit: i32) -> PreparedLiquidatableAccount {
         PreparedLiquidatableAccount {
+            attempt_id: 0,
             liquidatee_account: MarginfiAccountWrapper::new(address, bytemuck::Zeroable::zeroed()),
             observation_accounts: ObservationAccounts {
                 observation_accounts: vec![],
@@ -141,6 +142,8 @@ mod tests {
             asset_amount: I80F48::ONE,
             liab_amount: I80F48::ONE,
             profit: I80F48::from_num(profit),
+            estimated_repay_usd: profit as f64,
+            binding_cap: "test",
             push_oracles: Vec::new(),
             without_push: None,
             sandwich_pair: None,

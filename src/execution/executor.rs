@@ -25,7 +25,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_message::Hash;
@@ -287,6 +287,66 @@ impl Executor {
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
     ) -> Result<()> {
+        if !intent.push_oracles.is_empty() {
+            let oracle_state: Vec<String> = intent
+                .push_oracles
+                .iter()
+                .map(|oracle| {
+                    match self
+                        .cache
+                        .oracles
+                        .try_get_account(oracle)
+                        .ok()
+                        .and_then(|account| price_update(&account))
+                    {
+                        Some(update) => {
+                            let message = update.price_message;
+                            format!(
+                                "{}:cached_time={},chain_time={:?},price={}e{}",
+                                oracle,
+                                message.publish_time,
+                                self.cache.pyth_prices.onchain(oracle),
+                                message.price,
+                                message.exponent
+                            )
+                        }
+                        None => format!(
+                            "{}:cached=unavailable,chain_time={:?}",
+                            oracle,
+                            self.cache.pyth_prices.onchain(oracle)
+                        ),
+                    }
+                })
+                .collect();
+            info!(
+                "LIQUIDATION_ORACLE_STATE attempt_id={} account={} feeds={:?}",
+                intent.attempt_id, intent.liquidatee_account.address, oracle_state
+            );
+        }
+        let started = Instant::now();
+        let result = self.try_execute_inner(strategy, intent);
+        match &result {
+            Ok(()) => info!(
+                "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=success elapsed_ms={}",
+                intent.attempt_id,
+                intent.liquidatee_account.address,
+                started.elapsed().as_millis()
+            ),
+            Err(_) => error!(
+                "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=failure elapsed_ms={}",
+                intent.attempt_id,
+                intent.liquidatee_account.address,
+                started.elapsed().as_millis()
+            ),
+        }
+        result
+    }
+
+    fn try_execute_inner(
+        &self,
+        strategy: &dyn LiquidationStrategy,
+        intent: &PreparedLiquidatableAccount,
+    ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
 
         // Skip targets we recently failed to assemble, *before* incurring an attempt or a Jupiter
@@ -405,7 +465,7 @@ impl Executor {
         }
         let liquidatee = intent.liquidatee_account.address;
         info!("{liquidatee} passes on the chain's prices already; liquidating it over RPC");
-        Some(self.land_wallet_plan(&liquidatee, plan, Preflight::Skip))
+        Some(self.land_wallet_plan(&liquidatee, intent.attempt_id, plan, Preflight::Skip))
     }
 
     /// Single transactions over RPC, each simulated: the wallet-funded plan when it earns enough,
@@ -431,6 +491,12 @@ impl Executor {
             Ok(Sandwich::Plan(ExecutionPlan { tx, .. })) => {
                 // Simulated while it was built: no second check on the way out.
                 // It claims no wallet tokens, so nothing waits for the balances to be re-read.
+                info!(
+                    "LIQUIDATION_RPC_SUBMIT attempt_id={} account={} signature={:?}",
+                    intent.attempt_id,
+                    liquidatee,
+                    tx.signatures.first().map(ToString::to_string)
+                );
                 let result = self.send_over_rpc(&tx, "Sandwich", Preflight::Skip);
                 self.note_result(&liquidatee, &result);
                 result
@@ -489,7 +555,7 @@ impl Executor {
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
         if pending.is_empty() {
-            return self.land_wallet_plan(&liquidatee, plan, Preflight::Run);
+            return self.land_wallet_plan(&liquidatee, intent.attempt_id, plan, Preflight::Run);
         }
         if let Err(e) = self.simulate(&plan.tx) {
             debug!(
@@ -500,7 +566,7 @@ impl Executor {
             drop(plan);
             return self.execute_behind_push(strategy, intent, liab_mint, pending);
         }
-        self.land_wallet_plan(&liquidatee, plan, Preflight::Skip)
+        self.land_wallet_plan(&liquidatee, intent.attempt_id, plan, Preflight::Skip)
     }
 
     /// A bundle behind a push of `feeds`, once the block engine admits it.
@@ -558,10 +624,17 @@ impl Executor {
     fn land_wallet_plan(
         &self,
         liquidatee: &Pubkey,
+        attempt_id: u64,
         plan: ExecutionPlan,
         preflight: Preflight,
     ) -> Result<()> {
         let ExecutionPlan { tx, claim, .. } = plan;
+        info!(
+            "LIQUIDATION_RPC_SUBMIT attempt_id={} account={} signature={:?}",
+            attempt_id,
+            liquidatee,
+            tx.signatures.first().map(ToString::to_string)
+        );
         let result = self.send_over_rpc(&tx, "Wallet-funded", preflight);
         self.note_result(liquidatee, &result);
         self.refresh_wallet_balances();
@@ -576,8 +649,7 @@ impl Executor {
             None => Ok(()),
             Some(err) => {
                 let logs = simulation.logs.unwrap_or_default();
-                let tail = &logs[logs.len().saturating_sub(3)..];
-                Err(anyhow!("simulation failed: {err:?}; logs: {tail:?}"))
+                Err(anyhow!("simulation failed: {err:?}; full_logs: {logs:#?}"))
             }
         }
     }
@@ -626,6 +698,18 @@ impl Executor {
                 }
             }
         };
+        if !feeds.is_empty() {
+            info!(
+                "LIQUIDATION_PRICE_PUSH attempt_id={} account={} feed_ids={:?} push_tx_count={}",
+                intent.attempt_id,
+                liquidatee,
+                feeds
+                    .iter()
+                    .map(|feed| bs58::encode(feed).into_string())
+                    .collect::<Vec<_>>(),
+                push.as_ref().map_or(0, |push| push.txs.len())
+            );
+        }
 
         let wallet_short = match self.sufficient_wallet_plan(strategy, intent, Landing::Bundle) {
             Ok(plan) => {
@@ -678,20 +762,23 @@ impl Executor {
         });
         let tip = bundles.tip_estimator.tip_for(profit_lamports);
         let mut bundle = push.map(|push| push.txs.clone()).unwrap_or_default();
+        let push_signatures: Vec<String> = bundle
+            .iter()
+            .filter_map(|tx| tx.signatures.first().map(ToString::to_string))
+            .collect();
         bundle.push(tx);
         info!(
-            "Liquidating {} in a bundle: {} plan for ${:.4}, tip {} lamports{}",
+            "LIQUIDATION_BUNDLE attempt_id={} account={} plan={} estimated_profit_usd={:.6} tip_lamports={} push_tx_count={} push_signatures={:?}",
+            intent.attempt_id,
             liquidatee,
             kind,
             profit.to_num::<f64>(),
             tip,
-            push.map_or(String::new(), |push| format!(
-                ", behind a {}-tx price push",
-                push.txs.len()
-            ))
+            push.map_or(0, |push| push.txs.len()),
+            push_signatures
         );
 
-        let result = match self.send_bundle(bundles, &bundle, tip, slot) {
+        let result = match self.send_bundle(intent.attempt_id, bundles, &bundle, tip, slot) {
             Ok(true) => Ok(()),
             Ok(false) => Err(anyhow!(
                 "the bundle for {liquidatee} didn't land: {}",
@@ -712,6 +799,7 @@ impl Executor {
     /// transaction, landed.
     fn send_bundle(
         &self,
+        attempt_id: u64,
         bundles: &BundleLanding,
         bundle: &[VersionedTransaction],
         tip: u64,
@@ -732,7 +820,8 @@ impl Executor {
         );
         match slot.send_bundle(&txs) {
             Ok(BundleSend::Accepted(id)) => {
-                debug!("Bundle {id} sent; watching its liquidation {liquidation_sig}");
+                info!("LIQUIDATION_BUNDLE_ACCEPTED attempt_id={} bundle_id={} liquidation_signature={} push_tx_count={}",
+                    attempt_id, id, liquidation_sig, bundle.len().saturating_sub(1));
                 self.landed_before_expiry(
                     &liquidation_sig,
                     &blockhash,
@@ -740,14 +829,18 @@ impl Executor {
                 )
             }
             Ok(BundleSend::Rejected(reason)) => {
-                warn!("The block engine rejected the bundle: {reason}");
+                warn!(
+                    "LIQUIDATION_BUNDLE_REJECTED attempt_id={} liquidation_signature={} reason={}",
+                    attempt_id, liquidation_sig, reason
+                );
                 Ok(false)
             }
             // The request may still have reached the block engine, which gave no id to ask about:
             // only the blockhash's expiry settles it.
             Err(e) => {
                 warn!(
-                    "Sending the bundle failed ({e}); watching its liquidation {liquidation_sig}"
+                    "LIQUIDATION_BUNDLE_SEND_ERROR attempt_id={} liquidation_signature={} error={}",
+                    attempt_id, liquidation_sig, e
                 );
                 self.landed_before_expiry(&liquidation_sig, &blockhash, None)
             }

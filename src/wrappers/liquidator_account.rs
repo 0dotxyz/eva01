@@ -89,6 +89,8 @@ pub struct LiquidationPair {
 
 #[derive(Clone)]
 pub struct PreparedLiquidatableAccount {
+    /// Correlates sizing, queueing, execution, and terminal outcome logs for this evaluation.
+    pub attempt_id: u64,
     pub liquidatee_account: MarginfiAccountWrapper,
     pub observation_accounts: ObservationAccounts,
     pub asset_bank: Pubkey,
@@ -96,6 +98,8 @@ pub struct PreparedLiquidatableAccount {
     pub asset_amount: I80F48,
     pub liab_amount: I80F48,
     pub profit: I80F48,
+    pub estimated_repay_usd: f64,
+    pub binding_cap: &'static str,
     /// The Pyth oracles whose newer price (from Hermes) the liquidation is sized on, so it goes
     /// behind a push of them; empty when the chain's prices suffice.
     pub push_oracles: Vec<Pubkey>,
@@ -397,6 +401,7 @@ impl LiquidatorAccount {
             MarginfiAccountWrapper::new(Pubkey::new_unique(), bytemuck::Zeroable::zeroed());
         let liquidatee_address = liquidatee.address;
         let intent = PreparedLiquidatableAccount {
+            attempt_id: 0,
             liquidatee_account: liquidatee,
             observation_accounts: ObservationAccounts::for_banks(&self.cache, vec![*bank])?,
             asset_bank: *bank,
@@ -404,6 +409,8 @@ impl LiquidatorAccount {
             asset_amount: I80F48::ONE,
             liab_amount: I80F48::ONE,
             profit: I80F48::ZERO,
+            estimated_repay_usd: 0.0,
+            binding_cap: "test",
             push_oracles: Vec::new(),
             without_push: None,
             sandwich_pair: None,
@@ -507,18 +514,17 @@ impl LiquidatorAccount {
         Ok(self.rpc_client.send_transaction(&tx)?)
     }
 
-    /// Simulates `tx`. On failure returns the program error with the last log lines.
+    /// Simulates `tx`. On failure returns the program error with the full simulation logs.
     pub fn simulate_tx(&self, tx: &VersionedTransaction) -> Result<()> {
         let result = self.rpc_client.simulate_transaction(tx)?.value;
         match result.err {
             None => Ok(()),
             Some(err) => {
                 let logs = result.logs.unwrap_or_default();
-                let tail = logs.len().saturating_sub(5);
                 Err(anyhow!(
-                    "simulation failed: {:?}; logs: {:?}",
+                    "simulation failed: {:?}; full_logs: {:#?}",
                     err,
-                    &logs[tail..]
+                    logs
                 ))
             }
         }

@@ -66,7 +66,10 @@ use std::{
     cmp::min,
     collections::{HashMap, HashSet},
     panic::{self, AssertUnwindSafe},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicU64},
+        Arc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -75,6 +78,7 @@ use std::{
 /// letting a burst of liquidatable accounts (e.g. a price crash) be worked in parallel rather
 /// than one-at-a-time.
 const MAX_CONCURRENT_LIQUIDATIONS: usize = 8;
+static NEXT_LIQUIDATION_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// How often the rebalancer checks whether a pass is due (see `LiquidationActivity`).
 const REBALANCE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
@@ -313,6 +317,16 @@ struct LiquidationAmounts {
     liquidator_profit: I80F48,
     /// Unhealthy, untagged, solvent and not e-mode boosted: tagging would let the premium grow.
     taggable: bool,
+    caps: RepayCapBreakdown,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RepayCapBreakdown {
+    debt_usd: f64,
+    collateral_usd: f64,
+    equity_usd: Option<f64>,
+    health_usd: Option<f64>,
+    binding: &'static str,
 }
 
 impl LiquidationAmounts {
@@ -324,6 +338,7 @@ impl LiquidationAmounts {
             premium: I80F48::ZERO,
             liquidator_profit: I80F48::ZERO,
             taggable: false,
+            caps: RepayCapBreakdown::default(),
         }
     }
 
@@ -468,6 +483,37 @@ struct RepayBounds {
 }
 
 impl RepayBounds {
+    fn breakdown(&self, premium: I80F48) -> RepayCapBreakdown {
+        let one_plus_premium = I80F48::ONE + premium;
+        let debt = self.liab_value;
+        let collateral = self.asset_value / one_plus_premium;
+        let equity = (self.equity >= I80F48::ZERO && premium > I80F48::ZERO)
+            .then_some(self.equity / premium);
+        let health_gain = self.liab_weight_maint * self.liab_price_ratio
+            - self.asset_weight_maint * one_plus_premium * self.asset_price_ratio;
+        let health = (self.above_closeout && health_gain > I80F48::ZERO)
+            .then_some(-self.maintenance_health / health_gain);
+        let mut binding = ("debt", debt);
+        for (name, cap) in [
+            ("collateral", Some(collateral)),
+            ("equity", equity),
+            ("health", health),
+        ] {
+            if let Some(cap) = cap {
+                if cap < binding.1 {
+                    binding = (name, cap);
+                }
+            }
+        }
+        RepayCapBreakdown {
+            debt_usd: debt.to_num::<f64>(),
+            collateral_usd: collateral.to_num::<f64>(),
+            equity_usd: equity.map(|v| v.to_num::<f64>()),
+            health_usd: health.map(|v| v.to_num::<f64>()),
+            binding: binding.0,
+        }
+    }
+
     /// Largest repayment (USD) `end_liquidation` accepts when seizing `repaid * (1 + premium)`:
     /// * the seizure fits the collateral and the repayment fits the debt;
     /// * an account that started solvent must stay solvent, i.e. the premium taken cannot exceed
@@ -500,6 +546,7 @@ enum Evaluation {
 }
 
 struct UnhealthyAccount {
+    attempt_id: u64,
     address: Pubkey,
     observation_accounts: ObservationAccounts,
     /// Tagging would let the premium grow enough to make the liquidation worth it.
@@ -511,6 +558,7 @@ struct UnhealthyAccount {
     max_repay: I80F48,
     profit: I80F48,
     premium: I80F48,
+    caps: RepayCapBreakdown,
     balances: Balances,
 }
 
@@ -1025,16 +1073,21 @@ impl Liquidator {
 
     fn report_skipped(&self, account: &UnhealthyAccount) {
         info!(
-            "Not liquidating the unhealthy account {} (maintenance health ${:.4}): seizing {} for {} \
-             may repay at most ${:.4} for ${:.4} profit at a {:.2}% premium, below the ${} minimum \
-             (tagged_at {}, taggable {})",
+            "LIQUIDATION_SIZING attempt_id={} outcome=below_min_profit account={} asset_bank={} liab_bank={} maintenance_health_usd={:.6} max_repay_usd={:.6} planned_repay_usd={:.6} estimated_profit_usd={:.6} premium_pct={:.4} binding_cap={} cap_debt_usd={:.4} cap_collateral_usd={:.4} cap_equity_usd={:?} cap_health_usd={:?} min_profit_usd={:.4} tagged_at={} taggable={}",
+            account.attempt_id,
             account.address,
-            account.maintenance_health.to_num::<f64>(),
             account.asset_bank,
             account.liab_bank,
+            account.maintenance_health.to_num::<f64>(),
             account.max_repay.to_num::<f64>(),
+            (account.max_repay * LIQUIDATION_SIZE_HAIRCUT).to_num::<f64>(),
             account.profit.to_num::<f64>(),
             account.premium.to_num::<f64>() * 100.0,
+            account.caps.binding,
+            account.caps.debt_usd,
+            account.caps.collateral_usd,
+            account.caps.equity_usd,
+            account.caps.health_usd,
             self.evaluator.min_profit,
             account.tagged_at,
             account.taggable
@@ -1078,32 +1131,14 @@ fn attempt_liquidation(
     match evaluator.re_evaluate(&liquidatee) {
         Ok(Some(fresh)) if executor.is_on_hold(&fresh).unwrap_or(false) => {
             debug!(
-                "Skipping {}: it or its liability mint is backed off after a recent failure",
-                liquidatee
+                "Skipping attempt_id={} account={}: it or its liability mint is backed off after a recent failure",
+                fresh.attempt_id, liquidatee
             );
         }
         Ok(Some(fresh)) => {
-            info!(
-                "Liquidating {}: seizing {} for {} (est. profit ${:.4}, ${:.4} when queued {} ms ago){}",
-                liquidatee,
-                fresh.asset_bank,
-                fresh.liab_bank,
-                fresh.profit.to_num::<f64>(),
-                intent.profit.to_num::<f64>(),
-                queued_at.elapsed().as_millis(),
-                if fresh.push_oracles.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "; behind a push of {} feed(s){}",
-                        fresh.push_oracles.len(),
-                        fresh.without_push.as_ref().map_or(String::new(), |unpushed| format!(
-                            ", or ${:.4} without it",
-                            unpushed.profit.to_num::<f64>()
-                        ))
-                    )
-                }
-            );
+            info!("LIQUIDATION_QUEUE attempt_id={} account={} queue_delay_ms={} asset_bank={} liab_bank={} estimated_repay_usd={:.4} estimated_profit_usd={:.4} binding_cap={} push_feed_count={}",
+                fresh.attempt_id, liquidatee, queued_at.elapsed().as_millis(), fresh.asset_bank,
+                fresh.liab_bank, fresh.estimated_repay_usd, fresh.profit.to_num::<f64>(), fresh.binding_cap, fresh.push_oracles.len());
             if let Some(pair) = &fresh.sandwich_pair {
                 debug!(
                     "{}: a sandwich would seize {} for {} instead (est. profit ${:.4})",
@@ -1117,19 +1152,18 @@ fn attempt_liquidation(
             match executor.try_execute(strategy, &fresh) {
                 Ok(()) => attempt.succeeded(),
                 Err(e) => error!(
-                    "Failed to execute liquidation for {:?}: {:?}",
-                    liquidatee, e
+                    "LIQUIDATION_EXECUTION_FAILURE attempt_id={} account={} error={:#}",
+                    fresh.attempt_id, liquidatee, e
                 ),
             }
         }
         Ok(None) => info!(
-            "Dropping the liquidation of {}: no longer worth it on the current state ({} ms after it was queued)",
-            liquidatee,
-            queued_at.elapsed().as_millis()
+            "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=no_longer_liquidatable elapsed_since_queue_ms={}",
+            intent.attempt_id, liquidatee, queued_at.elapsed().as_millis()
         ),
         Err(e) => error!(
-            "Failed to re-evaluate {} before liquidating it: {:?}",
-            liquidatee, e
+            "LIQUIDATION_REEVALUATION_FAILURE attempt_id={} account={} error={:#}",
+            intent.attempt_id, liquidatee, e
         ),
     }
 }
@@ -1332,8 +1366,11 @@ impl Evaluator {
             without_push,
         } = sizing;
 
+        let attempt_id = NEXT_LIQUIDATION_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed);
+
         if !liquidation_amounts.is_liquidatable() {
             return Ok(Some(Evaluation::Unhealthy(UnhealthyAccount {
+                attempt_id,
                 address: account.address,
                 observation_accounts,
                 taggable: liquidation_amounts.taggable,
@@ -1344,6 +1381,7 @@ impl Evaluator {
                 max_repay: liquidation_amounts.max_repay,
                 profit: liquidation_amounts.liquidator_profit * LIQUIDATION_SIZE_HAIRCUT,
                 premium: liquidation_amounts.premium,
+                caps: liquidation_amounts.caps,
                 balances: account.get_deposits_and_liabilities_shares(),
             })));
         }
@@ -1396,6 +1434,7 @@ impl Evaluator {
         };
 
         Ok(Some(Evaluation::Liquidate(PreparedLiquidatableAccount {
+            attempt_id,
             liquidatee_account: account.clone(),
             observation_accounts,
             asset_bank: asset_bank_pk,
@@ -1403,6 +1442,9 @@ impl Evaluator {
             asset_amount: slippage_adjusted_asset_amount,
             liab_amount: slippage_adjusted_liab_amount,
             profit,
+            estimated_repay_usd: (liquidation_amounts.max_repay * LIQUIDATION_SIZE_HAIRCUT)
+                .to_num::<f64>(),
+            binding_cap: liquidation_amounts.caps.binding,
             push_oracles,
             without_push,
             sandwich_pair,
@@ -1866,6 +1908,7 @@ impl Evaluator {
             above_closeout: total_assets_equity >= LIQUIDATION_CLOSEOUT_DOLLAR_THRESHOLD,
         };
         let max_repay = bounds.max_repay(premium_taken);
+        let caps = bounds.breakdown(premium_taken);
         let one_plus_premium = I80F48::ONE + premium_taken;
         let liquidator_profit = max_repay * premium_taken;
         // Tag only when the premium a tag can grow to would make the liquidation worth it.
@@ -1889,6 +1932,7 @@ impl Evaluator {
                 premium: premium_taken,
                 liquidator_profit,
                 taggable,
+                caps,
                 ..LiquidationAmounts::none()
             });
         }
@@ -1925,6 +1969,7 @@ impl Evaluator {
             premium: premium_taken,
             liquidator_profit,
             taggable,
+            caps,
         })
     }
 
