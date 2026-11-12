@@ -4,7 +4,7 @@ use crate::{
     config::Eva01Config,
     execution::{
         activity::LiquidationActivity,
-        executor::{BundleLanding, Executor},
+        executor::{pushable_feed, BundleLanding, Executor},
         inventory::InventoryStrategy,
         queue::{ExecutionQueue, QueuedIntent},
         reservations::TokenReservations,
@@ -17,7 +17,7 @@ use crate::{
         self,
         jito::{JitoClient, TipEstimator},
         log_genuine_error,
-        pyth_push::PythPusher,
+        pyth_push::{PythPusher, MAX_PUSHED_FEEDS},
         rate_limiter::RateLimiter,
     },
     wrappers::{
@@ -291,12 +291,79 @@ struct Sizing {
     /// Kamino or JupLend bank and a lighter pair earns nearly as much (`is_better_pair`).
     sandwich: Option<(Pubkey, Pubkey, LiquidationAmounts)>,
     maintenance_health: I80F48,
-    /// The account is healthy on the Pyth prices the chain holds; only newer ones make it
-    /// liquidatable.
-    needs_price_push: bool,
+    /// The Pyth oracles to push first, whose newer prices the pairs are sized on.
+    push_oracles: Vec<Pubkey>,
 }
 
 /// A bank's maintenance price over its equity price on one side.
+/// Of the oracles each paired with the account's health once only it is pushed, the ones that lower
+/// it most below `on_chain`, as many as one push carries.
+fn strongest_pushes(
+    on_chain: I80F48,
+    singles: impl Iterator<Item = (I80F48, Pubkey)>,
+) -> Vec<Pubkey> {
+    let mut lowering: Vec<(I80F48, Pubkey)> = singles.filter(|(h, _)| *h < on_chain).collect();
+    lowering.sort_by_key(|(h, _)| *h);
+    lowering
+        .into_iter()
+        .take(MAX_PUSHED_FEEDS)
+        .map(|(_, oracle)| oracle)
+        .collect()
+}
+
+/// The bank and oracle accounts behind `banks_and_oracles` as eva prices them, or, with `pushed`, as
+/// the program reads them once those Pyth oracles are pushed: every other oracle eva prices ahead
+/// of the chain at the chain's price.
+fn program_accounts(
+    cache: &Cache,
+    banks_and_oracles: &[Pubkey],
+    pushed: Option<&[Pubkey]>,
+) -> Result<Vec<Account>> {
+    banks_and_oracles
+        .iter()
+        .map(|pk| {
+            if let Ok(wrapper) = cache.banks.try_get_bank(pk) {
+                return Ok(wrapper.account);
+            }
+            let cached = cache.oracles.try_get_account(pk)?;
+            Ok(match pushed {
+                Some(pushed) if !pushed.contains(pk) => cache
+                    .pyth_prices
+                    .onchain_if_behind(pk, &cached)
+                    .unwrap_or(cached),
+                _ => cached,
+            })
+        })
+        .collect()
+}
+
+/// An account's weighted assets and liabilities on `accounts`, the bank and oracle accounts behind
+/// `banks_and_oracles`.
+fn health_components(
+    account: &MarginfiAccountWrapper,
+    group: &MarginfiGroup,
+    clock: &Clock,
+    banks_and_oracles: &[Pubkey],
+    accounts: &mut [Account],
+    requirement: RequirementType,
+) -> Result<(I80F48, I80F48)> {
+    let remaining_ais: Vec<_> = accounts
+        .iter_mut()
+        .zip(banks_and_oracles.iter())
+        .map(|(account, pk)| (pk, account).into_account_info())
+        .collect();
+    get_health_components(
+        &account.account,
+        group,
+        &remaining_ais,
+        requirement,
+        &mut None,
+        HealthPriceMode::Client(clock.clone()),
+        &mut None,
+    )
+    .map_err(|e| anyhow!("{e:?}"))
+}
+
 fn maintenance_to_equity_price(
     bank: &BankWrapper,
     oracle: &OracleWrapper,
@@ -945,10 +1012,13 @@ fn attempt_liquidation(
                 fresh.profit.to_num::<f64>(),
                 intent.profit.to_num::<f64>(),
                 queued_at.elapsed().as_millis(),
-                if fresh.needs_price_push {
-                    "; healthy on the chain's prices, so behind a price push"
+                if fresh.push_oracles.is_empty() {
+                    String::new()
                 } else {
-                    ""
+                    format!(
+                        "; healthy on the chain's prices, so behind a push of {} feed(s)",
+                        fresh.push_oracles.len()
+                    )
                 }
             );
             if let Some(pair) = &fresh.sandwich_pair {
@@ -1150,7 +1220,7 @@ impl Evaluator {
             amounts: liquidation_amounts,
             sandwich,
             maintenance_health,
-            needs_price_push,
+            push_oracles,
         } = sizing;
 
         if !liquidation_amounts.is_liquidatable() {
@@ -1212,7 +1282,7 @@ impl Evaluator {
             asset_amount: slippage_adjusted_asset_amount,
             liab_amount: slippage_adjusted_liab_amount,
             profit,
-            needs_price_push,
+            push_oracles,
             sandwich_pair,
         })))
     }
@@ -1274,6 +1344,11 @@ impl Evaluator {
         }
     }
 
+    /// Sizes the account's pairs on the prices the program will read. A liquidation that's
+    /// liquidatable only on Pyth prices the chain doesn't hold yet goes behind a push of the few
+    /// feeds that lower its health the most, and is sized on them with every other feed at the
+    /// chain's price.
+    #[allow(clippy::too_many_arguments)]
     fn compute_max_liquidatable_amounts_with_banks(
         &self,
         cache: &Cache,
@@ -1284,18 +1359,127 @@ impl Evaluator {
         asset_banks: &[Pubkey],
         liab_banks: &[Pubkey],
     ) -> Result<PairSearch> {
-        let mut accounts: Vec<_> = vec![];
+        let size = |accounts| {
+            self.size_on_accounts(
+                cache,
+                clock.clone(),
+                account,
+                group,
+                banks_and_oracles,
+                accounts,
+                asset_banks,
+                liab_banks,
+            )
+        };
+        let search = size(program_accounts(cache, banks_and_oracles, None)?)?;
+        let PairSearch::Sized(sizing) = search else {
+            return Ok(search);
+        };
+        let behind: Vec<Pubkey> = banks_and_oracles
+            .iter()
+            .filter(|pk| pushable_feed(cache, pk).is_some())
+            .copied()
+            .collect();
+        if !sizing.amounts.is_liquidatable() || behind.is_empty() {
+            return Ok(PairSearch::Sized(sizing));
+        }
+
+        let pushed = match self.choose_pushes(
+            cache,
+            &clock,
+            account,
+            group,
+            banks_and_oracles,
+            &behind,
+        ) {
+            Ok(Some(pushed)) => pushed,
+            Ok(None) => {
+                debug!(
+                    "Account {}: liquidatable only on more Pyth prices than one bundle pushes",
+                    account.address
+                );
+                return Ok(PairSearch::None);
+            }
+            // The chain's price is unusable as it stands (too old for the program, say): only
+            // pushing every feed can make this liquidation pass.
+            Err(e) => {
+                debug!(
+                    "Account {}: can't price it on the chain's Pyth prices ({e}); pushing every feed",
+                    account.address
+                );
+                return Ok(PairSearch::Sized(Sizing {
+                    push_oracles: behind,
+                    ..sizing
+                }));
+            }
+        };
+        match size(program_accounts(cache, banks_and_oracles, Some(&pushed))?)? {
+            PairSearch::Sized(sizing) => Ok(PairSearch::Sized(Sizing {
+                push_oracles: pushed,
+                ..sizing
+            })),
+            // Healthy on the prices the program will read.
+            _ => Ok(PairSearch::None),
+        }
+    }
+
+    /// The Pyth oracles to push for the program to find the account unhealthy: none when the
+    /// chain's prices already do, otherwise the ones whose newer price lowers its health the most,
+    /// as many as one push carries. `None` when those aren't enough; an error when the chain's
+    /// prices can't price the account.
+    fn choose_pushes(
+        &self,
+        cache: &Cache,
+        clock: &Clock,
+        account: &MarginfiAccountWrapper,
+        group: &MarginfiGroup,
+        banks_and_oracles: &[Pubkey],
+        behind: &[Pubkey],
+    ) -> Result<Option<Vec<Pubkey>>> {
+        let health = |pushed: &[Pubkey]| -> Result<I80F48> {
+            let mut accounts = program_accounts(cache, banks_and_oracles, Some(pushed))?;
+            let (assets, liabilities) = health_components(
+                account,
+                group,
+                clock,
+                banks_and_oracles,
+                &mut accounts,
+                RequirementType::Maintenance,
+            )?;
+            Ok(assets - liabilities)
+        };
+        let on_chain = health(&[])?;
+        if on_chain < I80F48::ZERO {
+            return Ok(Some(Vec::new()));
+        }
+        let singles = behind
+            .iter()
+            .filter_map(|oracle| health(&[*oracle]).ok().map(|h| (h, *oracle)));
+        let pushed = strongest_pushes(on_chain, singles);
+        if pushed.is_empty() || health(&pushed)? >= I80F48::ZERO {
+            return Ok(None);
+        }
+        Ok(Some(pushed))
+    }
+
+    /// Sizes every pair on `accounts`, the bank and oracle accounts behind `banks_and_oracles`.
+    #[allow(clippy::too_many_arguments)]
+    fn size_on_accounts(
+        &self,
+        cache: &Cache,
+        clock: Clock,
+        account: &MarginfiAccountWrapper,
+        group: &MarginfiGroup,
+        banks_and_oracles: &[Pubkey],
+        mut accounts: Vec<Account>,
+        asset_banks: &[Pubkey],
+        liab_banks: &[Pubkey],
+    ) -> Result<PairSearch> {
         let mut bank_to_emode_config = HashMap::<Pubkey, EmodeConfig>::new();
-        for pk in banks_and_oracles.iter() {
-            let bank_account = cache.banks.try_get_bank(pk);
-            let account = match bank_account {
-                Ok(wrapper) => {
-                    bank_to_emode_config.insert(*pk, wrapper.bank.emode.emode_config);
-                    wrapper.account
-                }
-                Err(_) => cache.oracles.try_get_account(pk)?,
-            };
-            accounts.push(account);
+        for pk in banks_and_oracles {
+            if let Ok(wrapper) = cache.banks.try_get_bank(pk) {
+                bank_to_emode_config.insert(*pk, wrapper.bank.emode.emode_config);
+            }
         }
 
         let remaining_ais: Vec<_> = accounts
@@ -1338,25 +1522,6 @@ impl Evaluator {
                 total_weighted_liabilities.to_num(),
             )));
         }
-        let needs_price_push = match self.maintenance_health_on_chain_prices(
-            cache,
-            &clock,
-            account,
-            group,
-            banks_and_oracles,
-        ) {
-            Ok(health) => health.is_some_and(|health| health >= I80F48::ZERO),
-            // The chain's price is unusable as it stands (too old for the program, say): only a
-            // pushed one can make this liquidation pass.
-            Err(e) => {
-                debug!(
-                    "Account {}: can't price it on the chain's Pyth prices ({e}); a push is needed",
-                    account.address
-                );
-                true
-            }
-        };
-
         let (total_assets_equity, total_liabs_equity) = get_health_components(
             &account.account,
             group,
@@ -1433,58 +1598,8 @@ impl Evaluator {
             },
             sandwich,
             maintenance_health,
-            needs_price_push,
+            push_oracles: Vec::new(),
         }))
-    }
-
-    /// The account's maintenance health on the Pyth prices the chain holds, where eva prices any
-    /// of its feeds ahead of them; `None` when every price it reads is the chain's already. This is
-    /// what the program would compute without a push, so it tells a liquidation that needs one
-    /// apart before anything is built.
-    fn maintenance_health_on_chain_prices(
-        &self,
-        cache: &Cache,
-        clock: &Clock,
-        account: &MarginfiAccountWrapper,
-        group: &MarginfiGroup,
-        banks_and_oracles: &[Pubkey],
-    ) -> Result<Option<I80F48>> {
-        let mut behind = false;
-        let mut accounts = Vec::with_capacity(banks_and_oracles.len());
-        for pk in banks_and_oracles {
-            let account = match cache.banks.try_get_bank(pk) {
-                Ok(wrapper) => wrapper.account,
-                Err(_) => {
-                    let cached = cache.oracles.try_get_account(pk)?;
-                    match cache.pyth_prices.onchain_if_behind(pk, &cached) {
-                        Some(onchain) => {
-                            behind = true;
-                            onchain
-                        }
-                        None => cached,
-                    }
-                }
-            };
-            accounts.push(account);
-        }
-        if !behind {
-            return Ok(None);
-        }
-        let remaining_ais: Vec<_> = accounts
-            .iter_mut()
-            .zip(banks_and_oracles.iter())
-            .map(|(account, pk)| (pk, account).into_account_info())
-            .collect();
-        let (assets, liabilities) = get_health_components(
-            &account.account,
-            group,
-            &remaining_ais,
-            RequirementType::Maintenance,
-            &mut None,
-            HealthPriceMode::Client(clock.clone()),
-            &mut None,
-        )?;
-        Ok(Some(assets - liabilities))
     }
 
     /// How much seizing `asset_bank_wrapper` for `liab_bank_wrapper` may repay and earn, as
@@ -1818,5 +1933,76 @@ mod pair_preference_tests {
         assert_eq!(seize_weight(ASSET_TAG_KAMINO), 1);
         assert_eq!(seize_weight(ASSET_TAG_JUPLEND), 1);
         assert_eq!(seize_weight(0), 0);
+    }
+}
+
+#[cfg(test)]
+mod push_choice_tests {
+    use super::*;
+    use crate::cache::pyth_prices::test_price_update_account;
+    use crate::utils::pyth_cranker::price_feed_address;
+    use std::sync::Mutex;
+
+    #[test]
+    fn the_feeds_that_lower_health_most_are_pushed() {
+        let (sol, eth, usdc, jup) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        // Healthy by $5 on the chain's prices: SOL's newer price takes $40 off, ETH's $10, JUP's
+        // $1, and USDC's adds $1.
+        let singles = [
+            (I80F48!(-5), eth),
+            (I80F48!(6), usdc),
+            (I80F48!(-35), sol),
+            (I80F48!(4), jup),
+        ];
+        assert_eq!(
+            strongest_pushes(I80F48!(5), singles.into_iter()),
+            vec![sol, eth]
+        );
+        // A feed that moved in the account's favour is never pushed, even with room to spare.
+        assert_eq!(
+            strongest_pushes(I80F48!(5), [(I80F48!(6), usdc)].into_iter()),
+            Vec::<Pubkey>::new()
+        );
+    }
+
+    #[test]
+    fn unpushed_feeds_are_read_at_the_chains_price() {
+        let mut cache = Cache::new(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Arc::new(Mutex::new(Clock::default())),
+            HashSet::new(),
+        );
+        let mut add = |feed: [u8; 32]| {
+            let address = price_feed_address(&feed);
+            cache
+                .oracles
+                .try_insert(address, test_price_update_account(feed, 110, 2))
+                .unwrap();
+            cache
+                .pyth_prices
+                .record_onchain(address, &test_price_update_account(feed, 100, 1));
+            address
+        };
+        let (sol, eth) = (add([1; 32]), add([2; 32]));
+        let price = |account: &Account| {
+            crate::cache::pyth_prices::price_update(account)
+                .unwrap()
+                .price_message
+                .price
+        };
+        let oracles = [sol, eth];
+
+        let ours = program_accounts(&cache, &oracles, None).unwrap();
+        assert_eq!(ours.iter().map(price).collect::<Vec<_>>(), vec![2, 2]);
+        let chain = program_accounts(&cache, &oracles, Some(&[])).unwrap();
+        assert_eq!(chain.iter().map(price).collect::<Vec<_>>(), vec![1, 1]);
+        let sol_pushed = program_accounts(&cache, &oracles, Some(&[sol])).unwrap();
+        assert_eq!(sol_pushed.iter().map(price).collect::<Vec<_>>(), vec![2, 1]);
     }
 }

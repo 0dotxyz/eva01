@@ -176,28 +176,27 @@ fn bump_target_backoff(
     );
 }
 
-/// The Pyth feeds among `oracles` whose cached price is newer than the chain's, which a liquidation
-/// sized on them must push first. Every feed an account's health reads counts, since the program
-/// re-checks health on all of them. Only sponsored feeds count: nobody else can push to the
-/// others, and eva never prices them from Hermes.
+/// The feed of `oracle` when eva prices it ahead of the chain and can push it: only sponsored
+/// feeds, since nobody else can push to the others and eva never prices them from Hermes.
+pub fn pushable_feed(cache: &Cache, oracle: &Pubkey) -> Option<[u8; 32]> {
+    let update = price_update(&cache.oracles.try_get_account(oracle).ok()?)?;
+    let feed_id = update.price_message.feed_id;
+    let behind = cache
+        .pyth_prices
+        .onchain(oracle)
+        .is_some_and(|onchain| update.price_message.publish_time > onchain);
+    (behind && price_feed_address(&feed_id) == *oracle).then_some(feed_id)
+}
+
+/// The feeds of `oracles` still ahead of the chain, which a liquidation sized on their prices
+/// must push first.
 fn pending_feeds(cache: &Cache, oracles: &[Pubkey]) -> Vec<[u8; 32]> {
     let mut feeds = Vec::new();
-    for oracle in oracles {
-        let Some(update) = cache
-            .oracles
-            .try_get_account(oracle)
-            .ok()
-            .as_ref()
-            .and_then(price_update)
-        else {
-            continue;
-        };
-        let feed_id = update.price_message.feed_id;
-        let behind = cache
-            .pyth_prices
-            .onchain(oracle)
-            .is_some_and(|onchain| update.price_message.publish_time > onchain);
-        if behind && price_feed_address(&feed_id) == *oracle && !feeds.contains(&feed_id) {
+    for feed_id in oracles
+        .iter()
+        .filter_map(|oracle| pushable_feed(cache, oracle))
+    {
+        if !feeds.contains(&feed_id) {
             feeds.push(feed_id);
         }
     }
@@ -239,10 +238,7 @@ impl Executor {
     }
 
     fn pending_pushes(&self, intent: &PreparedLiquidatableAccount) -> Vec<[u8; 32]> {
-        pending_feeds(
-            &self.cache,
-            &intent.observation_accounts.observation_accounts,
-        )
+        pending_feeds(&self.cache, &intent.push_oracles)
     }
 
     /// Whether `try_execute` would skip `intent` for now: its liability mint has no swap route, or
@@ -279,14 +275,14 @@ impl Executor {
             return Ok(());
         }
 
-        // eva may price on Hermes prices the chain doesn't hold yet. The evaluation priced the
-        // account on the chain's prices too, and `needs_price_push` says whether they are enough.
+        // The evaluation sized the liquidation on the prices the chain holds after pushing
+        // `push_oracles`; those still ahead of the chain go out first.
         let pending = if self.bundles.is_some() {
             self.pending_pushes(intent)
         } else {
             Vec::new()
         };
-        let must_push = intent.needs_price_push && !pending.is_empty();
+        let must_push = !pending.is_empty();
 
         if let Some(bundles) = &self.bundles {
             // A push never goes out alone, so a liquidation behind one waits for the block

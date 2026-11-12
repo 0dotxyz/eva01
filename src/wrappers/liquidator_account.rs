@@ -96,9 +96,9 @@ pub struct PreparedLiquidatableAccount {
     pub asset_amount: I80F48,
     pub liab_amount: I80F48,
     pub profit: I80F48,
-    /// The account is liquidatable only on Pyth prices the chain doesn't hold yet (from
-    /// Hermes), so the liquidation must go behind a push of them.
-    pub needs_price_push: bool,
+    /// The Pyth oracles whose newer price (from Hermes) the liquidation is sized on, so it goes
+    /// behind a push of them; empty when the chain's prices suffice.
+    pub push_oracles: Vec<Pubkey>,
     /// The pair for an in-tx swap, when it differs from the most profitable one above: that one
     /// seizes from a Kamino or JupLend bank, whose withdrawal leaves less room for the route, and a
     /// native pair earns nearly as much (`is_better_pair`).
@@ -401,7 +401,7 @@ impl LiquidatorAccount {
             asset_amount: I80F48::ONE,
             liab_amount: I80F48::ONE,
             profit: I80F48::ZERO,
-            needs_price_push: false,
+            push_oracles: Vec::new(),
             sandwich_pair: None,
         };
         let (ixs, _, record) = self.liquidation_ixs(&intent, I80F48::ONE, I80F48::ONE, None)?;
