@@ -113,6 +113,15 @@ pub struct PreparedLiquidatableAccount {
 }
 
 impl PreparedLiquidatableAccount {
+    /// This liquidation, and the smaller one kept beside it, logged under `attempt_id`.
+    pub fn for_attempt(mut self, attempt_id: u64) -> Self {
+        self.attempt_id = attempt_id;
+        if let Some(unpushed) = self.without_push.as_mut() {
+            unpushed.attempt_id = attempt_id;
+        }
+        self
+    }
+
     /// This liquidation on `sandwich_pair`, when there is one.
     pub fn for_sandwich(&self) -> std::borrow::Cow<'_, Self> {
         match &self.sandwich_pair {

@@ -174,18 +174,25 @@ fn is_better_pair(profit: I80F48, weight: u8, best_profit: I80F48, best_weight: 
     }
 }
 
-/// Of pairs earning `profit` and seizing at `weight`, in order: the most profitable (the lighter on
-/// a tie), and, when it is heavy, the pair an in-tx swap should take instead if that differs (a
-/// lighter one unless the heavier earns more than [`PAIR_PROFIT_TIE_MARGIN`] more). Indexes into
-/// the pairs; `None` when there are none.
-fn choose_pairs(pairs: impl Iterator<Item = (I80F48, u8)>) -> Option<(usize, Option<usize>)> {
+/// Of pairs earning `profit`, seizing at `weight`, and whose debt the wallet holds enough of to
+/// repay (`repayable`), in order: the pair for a repay from the wallet, and, when that one is
+/// heavy, the pair an in-tx swap should take instead if that differs (a lighter one unless the
+/// heavier earns more than [`PAIR_PROFIT_TIE_MARGIN`] more). The first is the most profitable,
+/// counting a repayable pair's profit [`PAIR_PROFIT_TIE_MARGIN`] higher, since it needs no quote
+/// and no route (the lighter on a tie). Indexes into the pairs; `None` when there are none.
+fn choose_pairs(pairs: impl Iterator<Item = (I80F48, u8, bool)>) -> Option<(usize, Option<usize>)> {
     let mut main: Option<(usize, I80F48, u8)> = None;
     let mut sandwich: Option<(usize, I80F48, u8)> = None;
-    for (index, (profit, weight)) in pairs.enumerate() {
-        if main.is_none_or(|(_, best_profit, best_weight)| {
-            profit > best_profit || (profit == best_profit && weight < best_weight)
+    for (index, (profit, weight, repayable)) in pairs.enumerate() {
+        let preferred = if repayable {
+            profit * (I80F48::ONE + PAIR_PROFIT_TIE_MARGIN)
+        } else {
+            profit
+        };
+        if main.is_none_or(|(_, best, best_weight)| {
+            preferred > best || (preferred == best && weight < best_weight)
         }) {
-            main = Some((index, profit, weight));
+            main = Some((index, preferred, weight));
         }
         if sandwich.is_none_or(|(_, best_profit, best_weight)| {
             is_better_pair(profit, weight, best_profit, best_weight)
@@ -198,6 +205,25 @@ fn choose_pairs(pairs: impl Iterator<Item = (I80F48, u8)>) -> Option<(usize, Opt
         .map(|(index, _, _)| index)
         .filter(|index| main_weight > 0 && *index != main);
     Some((main, sandwich))
+}
+
+/// Where an SPL token account's `amount: u64` sits, after its mint and owner.
+const TOKEN_AMOUNT: std::ops::Range<usize> = 64..72;
+
+/// Whether the wallet holds at least `amount` (native units) of `liab_bank`'s mint, as last read.
+/// Claims by liquidations in flight aren't counted: the executor checks them when it plans.
+fn wallet_covers(cache: &Cache, liab_bank: &Pubkey, amount: I80F48) -> bool {
+    let Ok(bank) = cache.banks.try_get_bank(liab_bank) else {
+        return false;
+    };
+    cache
+        .tokens
+        .try_get_token_for_mint(&bank.bank.mint)
+        .and_then(|token| cache.tokens.try_get_account(&token))
+        .ok()
+        .and_then(|token| token.data.get(TOKEN_AMOUNT)?.try_into().ok())
+        .map(u64::from_le_bytes)
+        .is_some_and(|held| I80F48::from_num(held) >= amount)
 }
 
 /// A cycle's results: the liquidations, the unhealthy accounts not worth liquidating, and each
@@ -1128,7 +1154,11 @@ fn attempt_liquidation(
     // taken a chunk of the account or prices may have moved, so it is re-sized on the current
     // state and dropped if it is no longer worth it, instead of sending a transaction the program
     // would reject.
-    match evaluator.re_evaluate(&liquidatee) {
+    // One id for the whole attempt: the re-evaluation sizes it afresh but it is the same attempt.
+    let fresh = evaluator
+        .re_evaluate(&liquidatee)
+        .map(|fresh| fresh.map(|fresh| fresh.for_attempt(intent.attempt_id)));
+    match fresh {
         Ok(Some(fresh)) if executor.is_on_hold(&fresh).unwrap_or(false) => {
             debug!(
                 "Skipping attempt_id={} account={}: it or its liability mint is backed off after a recent failure",
@@ -1800,11 +1830,16 @@ impl Evaluator {
                 candidates.push((*asset_bank, *liab_bank, amounts, weight));
             }
         }
-        let Some((main, sandwich)) = choose_pairs(
-            candidates
-                .iter()
-                .map(|(_, _, amounts, weight)| (amounts.liquidator_profit, *weight)),
-        ) else {
+        let Some((main, sandwich)) =
+            choose_pairs(candidates.iter().map(|(_, liab_bank, amounts, weight)| {
+                let repayable = wallet_covers(
+                    cache,
+                    liab_bank,
+                    amounts.max_liquidatable_liab_amount * LIQUIDATION_SIZE_HAIRCUT,
+                );
+                (amounts.liquidator_profit, *weight, repayable)
+            }))
+        else {
             return Ok(PairSearch::None);
         };
         let (asset_bank, liab_bank, amounts, _) = candidates[main];
@@ -2144,8 +2179,9 @@ mod pair_preference_tests {
 
     #[test]
     fn a_heavy_most_profitable_pair_gets_a_native_one_for_the_sandwich() {
-        let pairs =
-            |list: &[(f64, u8)]| choose_pairs(list.iter().map(|(p, w)| (I80F48::from_num(*p), *w)));
+        let pairs = |list: &[(f64, u8)]| {
+            choose_pairs(list.iter().map(|(p, w)| (I80F48::from_num(*p), *w, false)))
+        };
         // A Kamino pair earning 1.2 against a native one earning 1: the wallet repay takes the
         // Kamino one, the sandwich the native one (within the 30% margin).
         assert_eq!(pairs(&[(1.0, 0), (1.2, 1)]), Some((1, Some(0))));
@@ -2156,6 +2192,19 @@ mod pair_preference_tests {
         // Only heavy pairs: the sandwich has nothing lighter.
         assert_eq!(pairs(&[(1.0, 1), (1.1, 1)]), Some((1, None)));
         assert_eq!(pairs(&[]), None);
+    }
+
+    #[test]
+    fn a_pair_the_wallet_can_repay_wins_within_the_margin() {
+        let pairs = |list: &[(f64, u8, bool)]| {
+            choose_pairs(list.iter().map(|(p, w, r)| (I80F48::from_num(*p), *w, *r)))
+        };
+        // The same seizure against two stable debts: the one the wallet holds wins.
+        assert_eq!(pairs(&[(1.0, 0, false), (1.0, 0, true)]), Some((1, None)));
+        assert_eq!(pairs(&[(1.0, 0, true), (1.0, 0, false)]), Some((0, None)));
+        // It still loses to a pair earning more than 30% more.
+        assert_eq!(pairs(&[(1.0, 0, true), (1.31, 0, false)]), Some((1, None)));
+        assert_eq!(pairs(&[(1.0, 0, true), (1.25, 0, false)]), Some((0, None)));
     }
 
     #[test]

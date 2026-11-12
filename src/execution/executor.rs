@@ -323,6 +323,24 @@ impl Executor {
                 intent.attempt_id, intent.liquidatee_account.address, oracle_state
             );
         }
+        // Skip targets we recently failed to assemble, *before* incurring an attempt or a Jupiter
+        // quote: a liab mint with no swap route is quarantined; a target that hit a transient
+        // error (rate limit, etc.) is backed off. Both expire so recovering targets retry.
+        let liab_mint = self.intent_liab_mint(intent)?;
+        let skipped = if self.is_backed_off(&liab_mint)? {
+            Some("liab_mint_quarantined")
+        } else if self.is_backed_off(&intent.liquidatee_account.address)? {
+            Some("backed_off")
+        } else {
+            None
+        };
+        if let Some(reason) = skipped {
+            info!(
+                "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=skipped reason={} liab_mint={}",
+                intent.attempt_id, intent.liquidatee_account.address, reason, liab_mint
+            );
+            return Ok(());
+        }
         let started = Instant::now();
         let result = self.try_execute_inner(strategy, intent);
         match &result {
@@ -348,25 +366,7 @@ impl Executor {
         intent: &PreparedLiquidatableAccount,
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
-
-        // Skip targets we recently failed to assemble, *before* incurring an attempt or a Jupiter
-        // quote: a liab mint with no swap route is quarantined; a target that hit a transient
-        // error (rate limit, etc.) is backed off. Both expire so recovering targets retry.
         let liab_mint = self.intent_liab_mint(intent)?;
-        if self.is_backed_off(&liab_mint)? {
-            debug!(
-                "Skipping {}: liab mint {} has no swap route (quarantined)",
-                liquidatee, liab_mint
-            );
-            return Ok(());
-        }
-        if self.is_backed_off(&liquidatee)? {
-            debug!(
-                "Skipping {}: backing off after a recent execution failure",
-                liquidatee
-            );
-            return Ok(());
-        }
 
         // The evaluation sized the liquidation on the prices the chain holds after pushing
         // `push_oracles`; those still ahead of the chain go out first.
