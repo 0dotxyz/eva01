@@ -38,12 +38,9 @@ use log::{debug, error, info, warn};
 use marginfi::{
     constants::{
         LIQUIDATION_BONUS_FEE_MINIMUM, LIQUIDATION_CLOSEOUT_DOLLAR_THRESHOLD,
-        LIQUIDATION_TAG_MAX_PREMIUM,
+        LIQUIDATION_TAG_DELAY_SECS, LIQUIDATION_TAG_FULL_PREMIUM_SECS,
     },
-    state::{
-        bank::BankImpl, liquidation_record::tag_adjusted_premium,
-        marginfi_account::get_health_components,
-    },
+    state::{bank::BankImpl, marginfi_account::get_health_components},
 };
 use marginfi_type_crate::{
     constants::{ASSET_TAG_JUPLEND, ASSET_TAG_KAMINO, BANKRUPT_THRESHOLD},
@@ -84,8 +81,54 @@ static NEXT_LIQUIDATION_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 const REBALANCE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Every borrower is evaluated at least this often, whatever the health watch says: a backstop
-/// for what it can't see, such as an integration bank's exchange rate.
+/// for what it can't see, such as an integration bank's exchange rate. The sweep is spread over
+/// the interval in slices, a few milliseconds each, so it never holds up the cycle on a change.
 const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The full sweep, a slice at a time: every borrower once per [`FULL_SCAN_INTERVAL`], the share
+/// of the pass that time has made due on each call.
+#[derive(Default)]
+struct Sweep {
+    pass: Vec<Pubkey>,
+    next: usize,
+    /// Accounts due but not taken yet, as a fraction of one.
+    owed: f64,
+    last: Option<Instant>,
+    /// When the borrowers were last collected, so an empty or failed collection is retried once
+    /// an interval, not on every loop.
+    collected: Option<Instant>,
+}
+
+impl Sweep {
+    /// The accounts due by `now`; a new pass, from `borrowers`, once the last one is done.
+    fn next_slice(&mut self, now: Instant, borrowers: impl FnOnce() -> Vec<Pubkey>) -> Vec<Pubkey> {
+        if self.next >= self.pass.len() {
+            let recently = self
+                .collected
+                .is_some_and(|at| now.saturating_duration_since(at) < FULL_SCAN_INTERVAL);
+            if self.pass.is_empty() && recently {
+                self.last = Some(now);
+                return Vec::new();
+            }
+            self.pass = borrowers();
+            self.next = 0;
+            self.collected = Some(now);
+        }
+        let elapsed = self
+            .last
+            .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
+        self.last = Some(now);
+        self.owed +=
+            self.pass.len() as f64 * elapsed.as_secs_f64() / FULL_SCAN_INTERVAL.as_secs_f64();
+        let left = self.pass.len() - self.next;
+        let take = (self.owed.floor() as usize).min(left);
+        // A stall longer than the interval owes no more than the rest of this pass.
+        self.owed = (self.owed - take as f64).min((left - take) as f64);
+        let slice = self.pass[self.next..self.next + take].to_vec();
+        self.next += take;
+        slice
+    }
+}
 
 /// How often the scan statistics are reported.
 const SCAN_REPORT_INTERVAL: Duration = Duration::from_secs(60);
@@ -105,7 +148,7 @@ struct ScanStats {
     since: Instant,
     evaluated: usize,
     skipped: usize,
-    /// How long each cycle on a change took, apart from the full sweeps.
+    /// How long each cycle on a change took, apart from the sweep's slices.
     cycle_times: Vec<Duration>,
     sweeps: usize,
     slowest_sweep: Duration,
@@ -144,6 +187,35 @@ const PREMIUM_SAFETY_MARGIN: I80F48 = I80F48!(0.005);
 /// moves between evaluation and landing; profit is judged on the same share.
 const LIQUIDATION_SIZE_HAIRCUT: I80F48 = I80F48!(0.90);
 
+/// Equity under this share of liabilities is close enough to bad debt that the program may judge
+/// the account insolvent on its prices: no tag premium is counted on.
+const NEAR_BAD_DEBT: I80F48 = I80F48!(1.01);
+
+/// Room left under `end_liquidation`'s rule that health may fall by no more than the premium
+/// extracted, per dollar repaid.
+const HEALTH_FALL_MARGIN: I80F48 = I80F48!(0.002);
+
+/// The premium a tag grows to. marginfi lowered it from 100% to 25% after the version eva builds
+/// against; the lower one is safe on either program, since seizing less than the cap allows always
+/// passes it.
+const TAG_MAX_PREMIUM: I80F48 = I80F48!(0.25);
+
+/// The premium `end_liquidation` allows on an account tagged at `tagged_at`, as the program
+/// computes it (`liquidation_record::tag_adjusted_premium`), with [`TAG_MAX_PREMIUM`].
+fn tag_premium(base_premium: I80F48, tagged_at: i64, now: i64) -> I80F48 {
+    if tagged_at == 0 || base_premium >= TAG_MAX_PREMIUM {
+        return base_premium;
+    }
+    let elapsed = now.saturating_sub(tagged_at);
+    if elapsed <= LIQUIDATION_TAG_DELAY_SECS {
+        return base_premium;
+    }
+    let growth_secs = elapsed.min(LIQUIDATION_TAG_FULL_PREMIUM_SECS) - LIQUIDATION_TAG_DELAY_SECS;
+    let growth_window = LIQUIDATION_TAG_FULL_PREMIUM_SECS - LIQUIDATION_TAG_DELAY_SECS;
+    let progress = I80F48::from_num(growth_secs) / I80F48::from_num(growth_window);
+    base_premium + (TAG_MAX_PREMIUM - base_premium) * progress
+}
+
 /// Below this margin on eva's prices, an account is also priced on the chain's, which can lag
 /// eva's by about a price update and still allow a liquidation eva's prices don't.
 const CHAIN_CHECK_MARGIN: f64 = 0.02;
@@ -181,7 +253,8 @@ fn is_better_pair(profit: I80F48, weight: u8, best_profit: I80F48, best_weight: 
 /// counting a repayable pair's profit [`PAIR_PROFIT_TIE_MARGIN`] higher, since it needs no quote
 /// and no route (the lighter on a tie). Indexes into the pairs; `None` when there are none.
 fn choose_pairs(pairs: impl Iterator<Item = (I80F48, u8, bool)>) -> Option<(usize, Option<usize>)> {
-    let mut main: Option<(usize, I80F48, u8)> = None;
+    // (index, the profit compared, raw profit, weight)
+    let mut main: Option<(usize, I80F48, I80F48, u8)> = None;
     let mut sandwich: Option<(usize, I80F48, u8)> = None;
     for (index, (profit, weight, repayable)) in pairs.enumerate() {
         let preferred = if repayable {
@@ -189,10 +262,10 @@ fn choose_pairs(pairs: impl Iterator<Item = (I80F48, u8, bool)>) -> Option<(usiz
         } else {
             profit
         };
-        if main.is_none_or(|(_, best, best_weight)| {
+        if main.is_none_or(|(_, best, _, best_weight)| {
             preferred > best || (preferred == best && weight < best_weight)
         }) {
-            main = Some((index, preferred, weight));
+            main = Some((index, preferred, profit, weight));
         }
         if sandwich.is_none_or(|(_, best_profit, best_weight)| {
             is_better_pair(profit, weight, best_profit, best_weight)
@@ -200,10 +273,14 @@ fn choose_pairs(pairs: impl Iterator<Item = (I80F48, u8, bool)>) -> Option<(usiz
             sandwich = Some((index, profit, weight));
         }
     }
-    let (main, _, main_weight) = main?;
+    let (main, _, main_profit, main_weight) = main?;
+    // Chosen on profit and weight alone, whatever the wallet holds; only when it beats the main
+    // pair for an in-tx swap.
     let sandwich = sandwich
-        .map(|(index, _, _)| index)
-        .filter(|index| main_weight > 0 && *index != main);
+        .filter(|(index, profit, weight)| {
+            *index != main && is_better_pair(*profit, *weight, main_profit, main_weight)
+        })
+        .map(|(index, _, _)| index);
     Some((main, sandwich))
 }
 
@@ -223,7 +300,7 @@ fn wallet_covers(cache: &Cache, liab_bank: &Pubkey, amount: I80F48) -> bool {
         .ok()
         .and_then(|token| token.data.get(TOKEN_AMOUNT)?.try_into().ok())
         .map(u64::from_le_bytes)
-        .is_some_and(|held| I80F48::from_num(held) >= amount)
+        .is_some_and(|held| amount > I80F48::ZERO && I80F48::from_num(held) >= amount)
 }
 
 /// A cycle's results: the liquidations, the unhealthy accounts not worth liquidating, and each
@@ -312,7 +389,7 @@ pub struct Liquidator {
     skip_reports: RateLimiter<Pubkey>,
     /// Which borrowers updates can skip.
     health_watch: HealthWatch,
-    last_full_scan: Instant,
+    sweep: Sweep,
     scan_stats: ScanStats,
     geyser_rx: Receiver<GeyserUpdate>,
     stop_liquidator: Arc<AtomicBool>,
@@ -520,6 +597,15 @@ impl RepayBounds {
         let health = (self.above_closeout && health_gain > I80F48::ZERO)
             .then_some(-self.maintenance_health / health_gain);
         let mut binding = ("debt", debt);
+        if self.health_falls_too_far(premium, health_gain) {
+            return RepayCapBreakdown {
+                debt_usd: debt.to_num::<f64>(),
+                collateral_usd: collateral.to_num::<f64>(),
+                equity_usd: equity.map(|v| v.to_num::<f64>()),
+                health_usd: health.map(|v| v.to_num::<f64>()),
+                binding: "health_fall",
+            };
+        }
         for (name, cap) in [
             ("collateral", Some(collateral)),
             ("equity", equity),
@@ -558,7 +644,18 @@ impl RepayBounds {
         if self.above_closeout && health_gain_per_repaid > I80F48::ZERO {
             max_repay = min(max_repay, -self.maintenance_health / health_gain_per_repaid);
         }
+        // `end_liquidation` lets health fall by no more than what was extracted, the premium. A
+        // seizure that lowers health by more per dollar repaid fails at any size.
+        if self.health_falls_too_far(premium, health_gain_per_repaid) {
+            return I80F48::ZERO;
+        }
         I80F48::max(I80F48::ZERO, max_repay)
+    }
+
+    /// Whether each dollar repaid lowers maintenance health by more than the premium it extracts,
+    /// with [`HEALTH_FALL_MARGIN`] to spare for price drift until the program measures it.
+    fn health_falls_too_far(&self, premium: I80F48, health_gain_per_repaid: I80F48) -> bool {
+        -health_gain_per_repaid > premium - HEALTH_FALL_MARGIN
     }
 }
 
@@ -628,6 +725,7 @@ impl Liquidator {
                     config.bundle_tip_profit_share,
                 ),
                 signer: Keypair::try_from(config.wallet_keypair.as_slice())?,
+                refresh_ahead: config.refresh_ahead_enabled,
             })
         } else {
             None
@@ -665,7 +763,7 @@ impl Liquidator {
             tag_policy: TagPolicy::new(),
             skip_reports: RateLimiter::new(SKIP_REPORT_INTERVAL),
             health_watch: HealthWatch::default(),
-            last_full_scan: Instant::now(),
+            sweep: Sweep::default(),
             scan_stats: ScanStats::new(),
             geyser_rx,
             stop_liquidator,
@@ -705,7 +803,6 @@ impl Liquidator {
                     backlog.moved_banks.len()
                 );
                 self.run_liquidation_cycle(accounts, false);
-                self.last_full_scan = Instant::now();
             }
             Err(error) => error!(
                 "Failed to collect accounts for the initial scan: {:?}",
@@ -721,16 +818,15 @@ impl Liquidator {
             if !accounts_to_check.is_empty() {
                 self.run_liquidation_cycle(accounts_to_check, false);
             }
-            if self.last_full_scan.elapsed() >= FULL_SCAN_INTERVAL {
-                match self
-                    .cache
+            let slice = self.sweep.next_slice(Instant::now(), || {
+                self.cache
                     .marginfi_accounts
                     .try_get_accounts_with_liabilities()
-                {
-                    Ok(accounts) => self.run_liquidation_cycle(accounts, true),
-                    Err(e) => error!("Failed to collect accounts for the full scan: {:?}", e),
-                }
-                self.last_full_scan = Instant::now();
+                    .inspect_err(|e| error!("Failed to collect accounts for the sweep: {:?}", e))
+                    .unwrap_or_default()
+            });
+            if !slice.is_empty() {
+                self.run_liquidation_cycle(slice, true);
             }
             self.report_scan_stats();
         }
@@ -915,7 +1011,7 @@ impl Liquidator {
         }
         let (median, p90, slowest) = stats.cycle_percentiles();
         info!(
-            "Scans in the last {} s: {} cycle(s) on a change taking {} ms median, {} ms p90, {} ms at most; {} full sweep(s), the slowest {} ms; {} evaluation(s), {} skipped by the health watch ({} account(s) watched).",
+            "Scans in the last {} s: {} cycle(s) on a change taking {} ms median, {} ms p90, {} ms at most; {} sweep slice(s), the slowest {} ms; {} evaluation(s), {} skipped by the health watch ({} account(s) watched).",
             stats.since.elapsed().as_secs(),
             stats.cycle_times.len(),
             median,
@@ -1160,24 +1256,27 @@ fn attempt_liquidation(
         .map(|fresh| fresh.map(|fresh| fresh.for_attempt(intent.attempt_id)));
     match fresh {
         Ok(Some(fresh)) if executor.is_on_hold(&fresh).unwrap_or(false) => {
-            debug!(
-                "Skipping attempt_id={} account={}: it or its liability mint is backed off after a recent failure",
+            info!(
+                "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=skipped reason=on_hold",
                 fresh.attempt_id, liquidatee
             );
         }
         Ok(Some(fresh)) => {
-            info!("LIQUIDATION_QUEUE attempt_id={} account={} queue_delay_ms={} asset_bank={} liab_bank={} estimated_repay_usd={:.4} estimated_profit_usd={:.4} binding_cap={} push_feed_count={}",
+            // The sandwich takes its own pair when the main one seizes from Kamino or JupLend.
+            let sandwich = fresh.sandwich_pair.as_ref().map_or_else(
+                || "same".to_string(),
+                |pair| {
+                    format!(
+                        "{}->{} profit_usd={:.4}",
+                        pair.asset_bank,
+                        pair.liab_bank,
+                        pair.profit.to_num::<f64>()
+                    )
+                },
+            );
+            info!("LIQUIDATION_QUEUE attempt_id={} account={} queue_delay_ms={} asset_bank={} liab_bank={} estimated_repay_usd={:.4} estimated_profit_usd={:.4} binding_cap={} push_feed_count={} sandwich_pair={}",
                 fresh.attempt_id, liquidatee, queued_at.elapsed().as_millis(), fresh.asset_bank,
-                fresh.liab_bank, fresh.estimated_repay_usd, fresh.profit.to_num::<f64>(), fresh.binding_cap, fresh.push_oracles.len());
-            if let Some(pair) = &fresh.sandwich_pair {
-                debug!(
-                    "{}: a sandwich would seize {} for {} instead (est. profit ${:.4})",
-                    liquidatee,
-                    pair.asset_bank,
-                    pair.liab_bank,
-                    pair.profit.to_num::<f64>()
-                );
-            }
+                fresh.liab_bank, fresh.estimated_repay_usd, fresh.profit.to_num::<f64>(), fresh.binding_cap, fresh.push_oracles.len(), sandwich);
             let mut attempt = activity.attempt(liquidatee);
             match executor.try_execute(strategy, &fresh) {
                 Ok(()) => attempt.succeeded(),
@@ -1832,11 +1931,14 @@ impl Evaluator {
         }
         let Some((main, sandwich)) =
             choose_pairs(candidates.iter().map(|(_, liab_bank, amounts, weight)| {
-                let repayable = wallet_covers(
-                    cache,
-                    liab_bank,
-                    amounts.max_liquidatable_liab_amount * LIQUIDATION_SIZE_HAIRCUT,
-                );
+                // Only a pair worth liquidating can be preferred: one below the minimum is sized at
+                // nothing, which any wallet "covers".
+                let repayable = amounts.is_liquidatable()
+                    && wallet_covers(
+                        cache,
+                        liab_bank,
+                        amounts.max_liquidatable_liab_amount * LIQUIDATION_SIZE_HAIRCUT,
+                    );
                 (amounts.liquidator_profit, *weight, repayable)
             }))
         else {
@@ -1898,11 +2000,14 @@ impl Evaluator {
         let emode_boosted = account.account.health_cache.is_emode_boosted()
             || asset_weight_maint > own_asset_weight_maint;
         let tagged_at = account.account.liquidation_tagged_at;
-        let base_premium = I80F48::max(cache.liquidation_max_fee, LIQUIDATION_BONUS_FEE_MINIMUM);
-        let premium = if emode_boosted || in_bad_debt {
+        let base_premium = I80F48::max(cache.liquidation_max_fee(), LIQUIDATION_BONUS_FEE_MINIMUM);
+        // The program drops the tag's premium for an account in bad debt, judged on the prices it
+        // caches at the start: near that line the two can disagree, so the base premium is safe.
+        let near_bad_debt = total_assets_equity < total_liabs_equity * NEAR_BAD_DEBT;
+        let premium = if emode_boosted || in_bad_debt || near_bad_debt {
             base_premium
         } else {
-            tag_adjusted_premium(base_premium, tagged_at, clock.unix_timestamp)
+            tag_premium(base_premium, tagged_at, clock.unix_timestamp)
         };
         let premium_taken = I80F48::max(I80F48::ZERO, premium - PREMIUM_SAFETY_MARGIN);
 
@@ -1947,10 +2052,12 @@ impl Evaluator {
         let one_plus_premium = I80F48::ONE + premium_taken;
         let liquidator_profit = max_repay * premium_taken;
         // Tag only when the premium a tag can grow to would make the liquidation worth it.
-        let taggable = tagged_at == 0 && !in_bad_debt && !emode_boosted && {
-            let max_premium = LIQUIDATION_TAG_MAX_PREMIUM - PREMIUM_SAFETY_MARGIN;
-            bounds.max_repay(max_premium) * max_premium * LIQUIDATION_SIZE_HAIRCUT > self.min_profit
-        };
+        let taggable =
+            tagged_at == 0 && !in_bad_debt && !emode_boosted && base_premium < TAG_MAX_PREMIUM && {
+                let max_premium = TAG_MAX_PREMIUM - PREMIUM_SAFETY_MARGIN;
+                bounds.max_repay(max_premium) * max_premium * LIQUIDATION_SIZE_HAIRCUT
+                    > self.min_profit
+            };
 
         if liquidator_profit * LIQUIDATION_SIZE_HAIRCUT <= self.min_profit {
             debug!(
@@ -2070,6 +2177,22 @@ impl Evaluator {
 #[cfg(test)]
 mod repay_bounds_tests {
     use super::*;
+
+    #[test]
+    fn a_seizure_that_lowers_health_more_than_the_premium_is_not_sized() {
+        // A boosted pair: collateral weight 0.97, its price 3.5% richer in maintenance terms.
+        let mut bounds = example();
+        bounds.asset_weight_maint = I80F48!(0.97);
+        bounds.asset_price_ratio = I80F48!(1.035);
+        let premium = I80F48!(0.05);
+        // Each dollar repaid moves health by 1 - 0.97 × 1.05 × 1.035 = -0.054, more than 0.05.
+        assert_eq!(bounds.max_repay(premium), I80F48::ZERO);
+        assert_eq!(bounds.breakdown(premium).binding, "health_fall");
+        // With the prices level, health falls by 1 - 0.97 × 1.05 = 0.0185 a dollar, less than the
+        // premium extracts, and the usual caps apply.
+        bounds.asset_price_ratio = I80F48::ONE;
+        assert!(bounds.max_repay(premium) > I80F48::ZERO);
+    }
 
     /// The 0.1.12 patch notes' example: $100 SOL at maintenance weight 0.8, $85 USDC debt.
     fn example() -> RepayBounds {
@@ -2204,7 +2327,11 @@ mod pair_preference_tests {
         assert_eq!(pairs(&[(1.0, 0, true), (1.0, 0, false)]), Some((0, None)));
         // It still loses to a pair earning more than 30% more.
         assert_eq!(pairs(&[(1.0, 0, true), (1.31, 0, false)]), Some((1, None)));
-        assert_eq!(pairs(&[(1.0, 0, true), (1.25, 0, false)]), Some((0, None)));
+        // Within the margin it wins the wallet repay; the sandwich keeps the more profitable one.
+        assert_eq!(
+            pairs(&[(1.0, 0, true), (1.25, 0, false)]),
+            Some((0, Some(1)))
+        );
     }
 
     #[test]
@@ -2212,6 +2339,68 @@ mod pair_preference_tests {
         assert_eq!(seize_weight(ASSET_TAG_KAMINO), 1);
         assert_eq!(seize_weight(ASSET_TAG_JUPLEND), 1);
         assert_eq!(seize_weight(0), 0);
+    }
+}
+
+#[cfg(test)]
+mod tag_premium_tests {
+    use super::*;
+
+    #[test]
+    fn a_tag_grows_the_premium_to_a_quarter_over_a_week() {
+        let base = I80F48!(0.06);
+        let tagged = 1_000_000;
+        assert_eq!(tag_premium(base, 0, tagged + 1), base, "untagged");
+        assert_eq!(
+            tag_premium(base, tagged, tagged + 3600),
+            base,
+            "within the delay"
+        );
+        let full = tag_premium(base, tagged, tagged + LIQUIDATION_TAG_FULL_PREMIUM_SECS);
+        assert_eq!(full, TAG_MAX_PREMIUM);
+        let later = tag_premium(base, tagged, tagged + 2 * LIQUIDATION_TAG_FULL_PREMIUM_SECS);
+        assert_eq!(later, TAG_MAX_PREMIUM, "never past the cap");
+        let half = tag_premium(
+            base,
+            tagged,
+            tagged
+                + LIQUIDATION_TAG_DELAY_SECS
+                + (LIQUIDATION_TAG_FULL_PREMIUM_SECS - LIQUIDATION_TAG_DELAY_SECS) / 2,
+        );
+        assert!((half - I80F48!(0.155)).abs() < I80F48!(0.0001));
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    #[test]
+    fn every_borrower_is_swept_once_per_interval_in_slices() {
+        // The interval in 60 steps: each step makes a sixtieth of the pass due.
+        let step = FULL_SCAN_INTERVAL / 60;
+        let borrowers: Vec<Pubkey> = (0..600).map(|_| Pubkey::new_unique()).collect();
+        let mut sweep = Sweep::default();
+        let start = Instant::now();
+        assert!(
+            sweep.next_slice(start, || borrowers.clone()).is_empty(),
+            "nothing due yet"
+        );
+
+        let slice = sweep.next_slice(start + step, || unreachable!());
+        assert_eq!(slice, borrowers[..10]);
+
+        // The rest of the interval sweeps the rest, and no account twice.
+        let mut swept = slice;
+        for n in 2..=60 {
+            swept.extend(sweep.next_slice(start + step * n, || unreachable!()));
+        }
+        assert_eq!(swept, borrowers);
+
+        // Then a new pass starts.
+        let next: Vec<Pubkey> = (0..60).map(|_| Pubkey::new_unique()).collect();
+        let slice = sweep.next_slice(start + step * 61, || next.clone());
+        assert_eq!(slice, next[..1]);
     }
 }
 

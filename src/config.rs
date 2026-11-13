@@ -48,6 +48,9 @@ pub struct Eva01Config {
     /// Land liquidations as Jito bundles, and price them on Hermes prices pushed on chain in the
     /// same bundle when the chain's aren't enough (`PRICE_PUSH_ENABLED`, on unless "false").
     pub price_push_enabled: bool,
+    /// In a bundle, the Kamino and JupLend refreshes go in a transaction ahead of the liquidation
+    /// rather than in it (`REFRESH_AHEAD_ENABLED`, on unless "false").
+    pub refresh_ahead_enabled: bool,
     /// Jito block-engine `sendBundle` endpoint; `None` uses the client's built-in default.
     pub jito_block_engine_url: Option<String>,
     /// Hard cap on the Jito tip per bundle (lamports).
@@ -150,6 +153,8 @@ impl Eva01Config {
             std::env::var("PYTH_CRANKER_ENABLED").is_ok_and(|value| value == "true");
 
         let price_push_enabled = std::env::var("PRICE_PUSH_ENABLED").map_or(true, |v| v != "false");
+        let refresh_ahead_enabled =
+            std::env::var("REFRESH_AHEAD_ENABLED").map_or(true, |v| v != "false");
         let jito_block_engine_url = std::env::var("JITO_BLOCK_ENGINE_URL").ok();
         let jito_tip_max_lamports: u64 = std::env::var("JITO_TIP_MAX_LAMPORTS")
             .unwrap_or_else(|_| "5000000".to_string())
@@ -157,7 +162,9 @@ impl Eva01Config {
             .expect("Invalid JITO_TIP_MAX_LAMPORTS number");
         let bundle_tip_profit_share = share_from_env("BUNDLE_TIP_PROFIT_SHARE", 0.08);
         let wallet_min_profit_share = share_from_env("LIQUIDATION_WALLET_MIN_PROFIT_SHARE", 0.1);
-        let bundle_api_key = std::env::var("JITO_API_KEY").ok();
+        let bundle_api_key = std::env::var("JITO_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty());
 
         Ok(Eva01Config {
             rpc_url,
@@ -186,6 +193,7 @@ impl Eva01Config {
             dflow_api_key,
             jupiter_api_key,
             price_push_enabled,
+            refresh_ahead_enabled,
             jito_block_engine_url,
             jito_tip_max_lamports,
             bundle_tip_profit_share,

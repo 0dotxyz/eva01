@@ -8,8 +8,9 @@
 //! 2. otherwise the sandwich (`[liquidate]` with the seized collateral sold in-tx), which touches
 //!    no wallet inventory.
 //!
-//! It goes as a Jito bundle, `[push..] [liquidate] [tip]`, unsimulated, whenever the block engine
-//! has a request slot free right now, and as a single simulated transaction over RPC otherwise.
+//! With bundles on it always goes as a Jito bundle, `[push..] [refresh] [liquidate] [tip]`,
+//! unsimulated, waiting for a request slot when all are held; with bundles off, as a single
+//! transaction over RPC.
 //! The push, when the chain's Pyth prices aren't enough (decided at evaluation), is never sent
 //! outside its bundle: on its own it would hand the prices to whoever liquidates next. A bundle
 //! that doesn't land is retried on a later cycle.
@@ -25,7 +26,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_message::Hash;
@@ -34,6 +35,7 @@ use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 
 use crate::cache::{pyth_prices::price_update, Cache};
+use crate::transaction_limits::MAX_BUNDLE_TXS;
 use crate::utils::{
     jito::{BundleSend, InflightStatus, JitoClient, JitoSlot, TipEstimator},
     pyth_cranker::price_feed_address,
@@ -76,6 +78,8 @@ pub struct BundleLanding {
     pub tip_estimator: TipEstimator,
     /// Pays the tip.
     pub signer: Keypair,
+    /// Whether the Kamino and JupLend refreshes may go ahead of the liquidation.
+    pub refresh_ahead: bool,
 }
 
 /// A transaction sent over RPC is re-sent this often until it confirms or its blockhash expires:
@@ -92,100 +96,30 @@ const SEND_MAX_WAIT: Duration = Duration::from_secs(90);
 const SETTLE_ATTEMPTS: usize = 10;
 const SETTLE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Re-check a liability mint that has no swap route only after this long (routes can appear).
-const NO_ROUTE_QUARANTINE_TTL: Duration = Duration::from_secs(3600);
+/// Counts bundles built, to make each one's push, refresh and tip transactions unique.
+static NEXT_SEND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Base delays for the per-target exponential backoff: skip the target for
-/// `BASE * 2^(failures-1)`, capped at `TARGET_BACKOFF_MAX`.
-///
-/// Assemble failures are typically rate limits (a Jupiter `429`), which need a real pause;
-/// an execution failure can just be a lost race, so it starts short and escalates.
-const ASSEMBLE_BACKOFF_BASE: Duration = Duration::from_secs(30);
-const EXECUTION_BACKOFF_BASE: Duration = Duration::from_secs(5);
-const TARGET_BACKOFF_MAX: Duration = Duration::from_secs(900);
+/// How long an account is left alone after an attempt found no plan: no wallet repay and no
+/// sandwich (no route, no room, or a swap venue's error). Short and fixed, since a route or the
+/// wallet can change at any moment and a retry costs one quote.
+const NO_PLAN_HOLD: Duration = Duration::from_secs(20);
 
-/// A target rejected twice in a row by `end_liquidation`'s premium cap (6090) is left alone this
-/// long. Once is a price move; twice is usually a dust repay whose rounding the cap can never
-/// accept, and every retry spends a DEX quote.
-const PREMIUM_CAP_BACKOFF: Duration = Duration::from_secs(1200);
+/// How long an account is left alone after `end_liquidation` rejected the seizure as above the
+/// premium cap (6090): the prices moved or the sizing doesn't match the program's.
+const PREMIUM_CAP_HOLD: Duration = Duration::from_secs(60);
+
+/// Bundles in a row for one account that don't land before it is held for [`NO_PLAN_HOLD`].
+const MISSES_BEFORE_HOLD: u32 = 3;
+
+/// Misses further apart than this aren't "in a row".
+const MISS_WINDOW: Duration = Duration::from_secs(60);
+
+/// How long an account is left alone after its transaction over RPC (bundles off) failed.
+const RPC_FAILURE_HOLD: Duration = Duration::from_secs(5);
 
 /// Whether a failure is `end_liquidation` rejecting the seizure as above the premium cap.
 fn is_premium_cap_failure(message: &str) -> bool {
     message.contains("0x17ca") || message.contains("LiquidationPremiumTooHigh")
-}
-
-/// Per-target backoff state after a transient (non-route) assemble failure.
-struct TargetBackoff {
-    /// Consecutive assemble failures (drives the exponential cooldown).
-    failures: u32,
-    /// The last failure was the premium cap.
-    premium_cap: bool,
-    /// Don't re-attempt the target before this time.
-    retry_after: Instant,
-}
-
-enum BackoffState {
-    /// Liability mint has no swap route until this instant.
-    Mint(Instant),
-    /// Liquidatee target hit transient assemble failures.
-    Target(TargetBackoff),
-}
-
-impl BackoffState {
-    fn retry_after(&self) -> Instant {
-        match self {
-            Self::Mint(retry_after) => *retry_after,
-            Self::Target(backoff) => backoff.retry_after,
-        }
-    }
-}
-
-/// Exponential backoff: `base * 2^(failures-1)`, capped at `TARGET_BACKOFF_MAX`.
-fn target_backoff_delay(base: Duration, failures: u32) -> Duration {
-    let shift = failures.saturating_sub(1).min(16);
-    let secs = base
-        .as_secs()
-        .saturating_mul(1u64 << shift)
-        .min(TARGET_BACKOFF_MAX.as_secs());
-    Duration::from_secs(secs)
-}
-
-/// Bump `target`'s consecutive-failure count and push out its retry time. A second premium-cap
-/// failure in a row backs the target off for [`PREMIUM_CAP_BACKOFF`].
-fn bump_target_backoff(
-    backoffs: &mut HashMap<Pubkey, BackoffState>,
-    target: &Pubkey,
-    base: Duration,
-    kind: &str,
-    premium_cap: bool,
-) {
-    let (failures, repeated_premium_cap) = match backoffs.get(target) {
-        Some(BackoffState::Target(backoff)) => {
-            (backoff.failures, premium_cap && backoff.premium_cap)
-        }
-        _ => (0, false),
-    };
-    let failures = failures.saturating_add(1);
-    let delay = if repeated_premium_cap {
-        PREMIUM_CAP_BACKOFF
-    } else {
-        target_backoff_delay(base, failures)
-    };
-    backoffs.insert(
-        *target,
-        BackoffState::Target(TargetBackoff {
-            failures,
-            premium_cap,
-            retry_after: Instant::now() + delay,
-        }),
-    );
-    debug!(
-        "Backing off {} for {}s (consecutive {} failures: {})",
-        target,
-        delay.as_secs(),
-        kind,
-        failures
-    );
 }
 
 /// The feed of `oracle` when eva prices it ahead of the chain and can push it: only sponsored
@@ -197,28 +131,7 @@ pub fn pushable_feed(cache: &Cache, oracle: &Pubkey) -> Option<[u8; 32]> {
         .pyth_prices
         .onchain(oracle)
         .is_some_and(|onchain| update.price_message.publish_time > onchain);
-    (behind && sponsored_feed_address(&feed_id) == *oracle).then_some(feed_id)
-}
-
-/// `price_feed_address`, derived once per feed: evaluation asks for it on every account near the
-/// threshold.
-fn sponsored_feed_address(feed_id: &[u8; 32]) -> Pubkey {
-    static ADDRESSES: std::sync::OnceLock<std::sync::RwLock<HashMap<[u8; 32], Pubkey>>> =
-        std::sync::OnceLock::new();
-    let addresses = ADDRESSES.get_or_init(Default::default);
-    if let Some(address) = addresses
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(feed_id)
-    {
-        return *address;
-    }
-    let address = price_feed_address(feed_id);
-    addresses
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(*feed_id, address);
-    address
+    (behind && price_feed_address(&feed_id) == *oracle).then_some(feed_id)
 }
 
 /// The feeds of `oracles` still ahead of the chain, which a liquidation sized on their prices
@@ -236,6 +149,15 @@ pub fn pending_feeds(cache: &Cache, oracles: &[Pubkey]) -> Vec<[u8; 32]> {
     feeds
 }
 
+/// What became of a bundle sent to the block engine.
+enum BundleOutcome {
+    Landed,
+    /// Accepted for the auction (or possibly so) and didn't land: lost, or failed unseen.
+    NotLanded,
+    /// Refused or never delivered: it took no part in an auction.
+    Refused,
+}
+
 /// Whether `profit` is at least `share` of `full`.
 fn earns_enough(profit: I80F48, full: I80F48, share: I80F48) -> bool {
     profit >= full * share
@@ -245,7 +167,10 @@ pub struct Executor {
     rpc_client: RpcClient,
     cache: Arc<Cache>,
     /// Liability-mint no-route quarantines and per-liquidatee transient backoffs.
-    backoffs: Mutex<HashMap<Pubkey, BackoffState>>,
+    /// Accounts left alone until the instant given, after an attempt that found no plan or failed.
+    backoffs: Mutex<HashMap<Pubkey, Instant>>,
+    /// Bundles in a row that didn't land, per account, and when the first of them was sent.
+    misses: Mutex<HashMap<Pubkey, (u32, Instant)>>,
     /// Lands liquidations as Jito bundles, behind a price push when they need one; `None` when
     /// bundles (and so price pushes) are off.
     bundles: Option<BundleLanding>,
@@ -265,6 +190,7 @@ impl Executor {
             rpc_client,
             cache,
             backoffs: Mutex::new(HashMap::new()),
+            misses: Mutex::new(HashMap::new()),
             bundles,
             wallet_min_profit_share,
         }
@@ -274,11 +200,9 @@ impl Executor {
         pending_feeds(&self.cache, &intent.push_oracles)
     }
 
-    /// Whether `try_execute` would skip `intent` for now: its liability mint has no swap route, or
-    /// the target failed recently.
+    /// Whether `try_execute` would skip `intent` for now: the target failed recently.
     pub fn is_on_hold(&self, intent: &PreparedLiquidatableAccount) -> Result<bool> {
-        Ok(self.is_backed_off(&self.intent_liab_mint(intent)?)?
-            || self.is_backed_off(&intent.liquidatee_account.address)?)
+        self.is_backed_off(&intent.liquidatee_account.address)
     }
 
     /// Assemble, gate, and land a single liquidation, sized on the current state by the caller.
@@ -287,6 +211,15 @@ impl Executor {
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
     ) -> Result<()> {
+        // A target that failed recently (rate limit, no plan, a lost bundle) is backed off before
+        // any quote is spent; the backoff expires so a recovering target retries.
+        if self.is_backed_off(&intent.liquidatee_account.address)? {
+            info!(
+                "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=skipped reason=backed_off",
+                intent.attempt_id, intent.liquidatee_account.address
+            );
+            return Ok(());
+        }
         if !intent.push_oracles.is_empty() {
             let oracle_state: Vec<String> = intent
                 .push_oracles
@@ -323,24 +256,6 @@ impl Executor {
                 intent.attempt_id, intent.liquidatee_account.address, oracle_state
             );
         }
-        // Skip targets we recently failed to assemble, *before* incurring an attempt or a Jupiter
-        // quote: a liab mint with no swap route is quarantined; a target that hit a transient
-        // error (rate limit, etc.) is backed off. Both expire so recovering targets retry.
-        let liab_mint = self.intent_liab_mint(intent)?;
-        let skipped = if self.is_backed_off(&liab_mint)? {
-            Some("liab_mint_quarantined")
-        } else if self.is_backed_off(&intent.liquidatee_account.address)? {
-            Some("backed_off")
-        } else {
-            None
-        };
-        if let Some(reason) = skipped {
-            info!(
-                "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=skipped reason={} liab_mint={}",
-                intent.attempt_id, intent.liquidatee_account.address, reason, liab_mint
-            );
-            return Ok(());
-        }
         let started = Instant::now();
         let result = self.try_execute_inner(strategy, intent);
         match &result {
@@ -350,7 +265,7 @@ impl Executor {
                 intent.liquidatee_account.address,
                 started.elapsed().as_millis()
             ),
-            Err(_) => error!(
+            Err(_) => warn!(
                 "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=failure elapsed_ms={}",
                 intent.attempt_id,
                 intent.liquidatee_account.address,
@@ -365,7 +280,6 @@ impl Executor {
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
     ) -> Result<()> {
-        let liquidatee = intent.liquidatee_account.address;
         let liab_mint = self.intent_liab_mint(intent)?;
 
         // The evaluation sized the liquidation on the prices the chain holds after pushing
@@ -377,44 +291,44 @@ impl Executor {
         };
         let must_push = !pending.is_empty();
 
-        if let Some(bundles) = &self.bundles {
-            // A push never goes out alone, so a liquidation behind one waits for the block
-            // engine. Any other takes a bundle only when a request slot is free right now, and
-            // otherwise goes over RPC at once instead of queueing behind the other workers.
-            if must_push {
-                // A push that can't be built gives way to the smaller liquidation the chain's
-                // prices already allow, when there is one.
-                let unpushed = intent.without_push.as_deref();
-                if let Some(unpushed) = unpushed {
-                    if bundles.pusher.check(&pending).is_err() {
-                        return self.execute_without_push(strategy, bundles, unpushed);
-                    }
-                }
-                let slot = match bundles.jito.try_reserve() {
-                    Some(slot) => slot,
-                    None => {
-                        if let Some(landed) = self.wallet_plan_while_waiting(strategy, intent) {
-                            return landed;
-                        }
-                        bundles.jito.reserve()
-                    }
-                };
-                let result = self.execute_as_bundle(strategy, intent, liab_mint, &pending, slot);
-                // The stream may have moved on since the check.
-                if let (Err(e), Some(unpushed)) = (&result, unpushed) {
-                    if e.downcast_ref::<PushFailure>().is_some() {
-                        self.clear_target_backoff(&liquidatee);
-                        return self.execute_without_push(strategy, bundles, unpushed);
-                    }
-                }
-                return result;
+        let Some(bundles) = &self.bundles else {
+            return self.execute_over_rpc(strategy, intent, liab_mint);
+        };
+        // While the block engine is down, what needs no push goes over RPC. A push never goes out
+        // without its bundle, so a liquidation that needs one waits.
+        if bundles.jito.is_down() {
+            if !must_push {
+                return self.execute_over_rpc(strategy, intent, liab_mint);
             }
-            if let Some(slot) = bundles.jito.try_reserve() {
-                return self.execute_as_bundle(strategy, intent, liab_mint, &[], slot);
+            if let Some(unpushed) = intent.without_push.as_deref() {
+                let liab_mint = self.intent_liab_mint(unpushed)?;
+                return self.execute_over_rpc(strategy, unpushed, liab_mint);
             }
-            debug!("No bundle slot free for {liquidatee}; liquidating over RPC");
+            return Err(anyhow!(
+                "the block engine is down and the liquidation needs a price push"
+            ));
         }
-        self.execute_over_rpc(strategy, intent, liab_mint, &pending)
+        // Every liquidation goes as a bundle. A slot is all but always free at the key's rate,
+        // and a wait for one is a few milliseconds.
+        if must_push {
+            // A push that can't be built gives way to the smaller liquidation the chain's prices
+            // already allow, when there is one.
+            let unpushed = intent.without_push.as_deref();
+            if let Some(unpushed) = unpushed {
+                if bundles.pusher.check(&pending).is_err() {
+                    return self.execute_without_push(strategy, unpushed);
+                }
+            }
+            let result = self.execute_as_bundle(strategy, intent, liab_mint, &pending);
+            // The stream may have moved on since the check.
+            if let (Err(e), Some(unpushed)) = (&result, unpushed) {
+                if e.downcast_ref::<PushFailure>().is_some() {
+                    return self.execute_without_push(strategy, unpushed);
+                }
+            }
+            return result;
+        }
+        self.execute_as_bundle(strategy, intent, liab_mint, &[])
     }
 
     /// Whether a wallet-funded plan earns enough of the full liquidation's profit to go before
@@ -449,39 +363,18 @@ impl Executor {
         Err(short)
     }
 
-    /// While a liquidation behind a price push waits for a bundle slot: the wallet-funded plan over
-    /// RPC, if the chain's prices already let it pass (another push may have landed). Its
-    /// simulation fits in the wait; a sandwich isn't tried, as its quote would be spent twice.
-    fn wallet_plan_while_waiting(
-        &self,
-        strategy: &dyn LiquidationStrategy,
-        intent: &PreparedLiquidatableAccount,
-    ) -> Option<Result<()>> {
-        let plan = self
-            .sufficient_wallet_plan(strategy, intent, Landing::Rpc)
-            .ok()?;
-        if self.simulate(&plan.tx).is_err() {
-            return None;
-        }
-        let liquidatee = intent.liquidatee_account.address;
-        info!("{liquidatee} passes on the chain's prices already; liquidating it over RPC");
-        Some(self.land_wallet_plan(&liquidatee, intent.attempt_id, plan, Preflight::Skip))
-    }
-
-    /// Single transactions over RPC, each simulated: the wallet-funded plan when it earns enough,
-    /// then the sandwich. With a feed behind, a plan the chain's prices reject falls back to a
-    /// price push in a bundle.
+    /// Single transactions over RPC, with bundles off: the wallet-funded plan when it earns
+    /// enough (checked by the send's preflight), then the sandwich (simulated while built).
     fn execute_over_rpc(
         &self,
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
         liab_mint: Pubkey,
-        pending: &[[u8; 32]],
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
         let wallet_short = match self.sufficient_wallet_plan(strategy, intent, Landing::Rpc) {
             Ok(plan) => {
-                return self.land_plain_wallet_plan(strategy, intent, liab_mint, plan, pending)
+                return self.land_wallet_plan(&liquidatee, intent.attempt_id, plan, Preflight::Run)
             }
             Err(short) => short,
         };
@@ -501,88 +394,66 @@ impl Executor {
                 self.note_result(&liquidatee, &result);
                 result
             }
-            // It failed only on the chain's prices: push them.
-            Ok(Sandwich::Rejected) if !pending.is_empty() => {
-                self.execute_behind_push(strategy, intent, liab_mint, pending)
-            }
-            Ok(_) => self.no_plan(&liquidatee, liab_mint, &wallet_short),
-            Err(e) => {
-                self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
-                Err(e)
+            no_sandwich => {
+                // What the wallet funds is better than nothing when no sandwich can go.
+                if let Some(plan) = self.partial_wallet_plan(strategy, intent, Landing::Rpc) {
+                    return self.land_wallet_plan(
+                        &liquidatee,
+                        intent.attempt_id,
+                        plan,
+                        Preflight::Run,
+                    );
+                }
+                self.no_plan(&liquidatee, liab_mint, &wallet_short, no_sandwich.err())
             }
         }
     }
 
-    /// `unpushed`, a liquidation the chain's prices allow: in a bundle when a request slot is free,
-    /// otherwise over RPC. Skipped while its liability mint is quarantined.
+    /// `unpushed`, a liquidation the chain's prices allow, in a bundle without a push.
     fn execute_without_push(
         &self,
         strategy: &dyn LiquidationStrategy,
-        bundles: &BundleLanding,
         unpushed: &PreparedLiquidatableAccount,
     ) -> Result<()> {
         let liquidatee = unpushed.liquidatee_account.address;
         let liab_mint = self.intent_liab_mint(unpushed)?;
-        if self.is_backed_off(&liab_mint)? {
-            debug!("Skipping {liquidatee} without a push: liab mint {liab_mint} is quarantined");
-            return Ok(());
-        }
         info!("Liquidating {liquidatee} without a push, on the chain's prices: the push can't be built");
-        match bundles.jito.try_reserve() {
-            Some(slot) => self.execute_as_bundle(strategy, unpushed, liab_mint, &[], slot),
-            None => self.execute_over_rpc(strategy, unpushed, liab_mint, &[]),
-        }
+        self.execute_as_bundle(strategy, unpushed, liab_mint, &[])
     }
 
-    /// Neither plan: the wallet funds too little and no sandwich fits. Backed off like a failed
-    /// assembly.
-    fn no_plan(&self, liquidatee: &Pubkey, liab_mint: Pubkey, wallet_short: &str) -> Result<()> {
-        let e = anyhow!("no plan for {liquidatee}: {wallet_short}, and no sandwich fits");
-        self.note_assemble_failure(liquidatee, liab_mint, &e)?;
+    /// A wallet-funded plan for whatever share of `intent` the wallet funds, even below
+    /// [`LIQUIDATION_WALLET_MIN_PROFIT_SHARE`]: when no sandwich can go, it is the only plan. `None`
+    /// when the wallet funds less than the minimum profit.
+    fn partial_wallet_plan(
+        &self,
+        strategy: &dyn LiquidationStrategy,
+        intent: &PreparedLiquidatableAccount,
+        landing: Landing,
+    ) -> Option<ExecutionPlan> {
+        let plan = strategy.assemble_with_inventory(intent, landing).ok()?;
+        info!(
+            "{}: no sandwich; repaying the share the wallet funds, for ${:.4}",
+            intent.liquidatee_account.address,
+            plan.profit.to_num::<f64>()
+        );
+        Some(plan)
+    }
+
+    /// Neither plan: the wallet funds too little and no sandwich fits (`sandwich_error`, when it
+    /// failed outright). The account is held briefly.
+    fn no_plan(
+        &self,
+        liquidatee: &Pubkey,
+        liab_mint: Pubkey,
+        wallet_short: &str,
+        sandwich_error: Option<anyhow::Error>,
+    ) -> Result<()> {
+        let e = match sandwich_error {
+            Some(e) => anyhow!("no plan for {liquidatee} (debt {liab_mint}): {wallet_short}, and the sandwich failed: {e}"),
+            None => anyhow!("no plan for {liquidatee} (debt {liab_mint}): {wallet_short}, and no sandwich fits"),
+        };
+        self.note_assemble_failure(liquidatee, &e);
         Err(e)
-    }
-
-    /// Lands a wallet-funded plan over RPC. With a feed behind, it is simulated here to choose
-    /// between it and a price push, and that simulation is its only check; otherwise the send's
-    /// preflight is.
-    fn land_plain_wallet_plan(
-        &self,
-        strategy: &dyn LiquidationStrategy,
-        intent: &PreparedLiquidatableAccount,
-        liab_mint: Pubkey,
-        plan: ExecutionPlan,
-        pending: &[[u8; 32]],
-    ) -> Result<()> {
-        let liquidatee = intent.liquidatee_account.address;
-        if pending.is_empty() {
-            return self.land_wallet_plan(&liquidatee, intent.attempt_id, plan, Preflight::Run);
-        }
-        if let Err(e) = self.simulate(&plan.tx) {
-            debug!(
-                "The wallet-funded liquidation of {} fails on the chain's prices ({e}); pushing them",
-                liquidatee
-            );
-            // Releases its claim; the pushed plan claims afresh.
-            drop(plan);
-            return self.execute_behind_push(strategy, intent, liab_mint, pending);
-        }
-        self.land_wallet_plan(&liquidatee, intent.attempt_id, plan, Preflight::Skip)
-    }
-
-    /// A bundle behind a push of `feeds`, once the block engine admits it.
-    fn execute_behind_push(
-        &self,
-        strategy: &dyn LiquidationStrategy,
-        intent: &PreparedLiquidatableAccount,
-        liab_mint: Pubkey,
-        feeds: &[[u8; 32]],
-    ) -> Result<()> {
-        let bundles = self
-            .bundles
-            .as_ref()
-            .ok_or_else(|| anyhow!("bundles are off"))?;
-        let slot = bundles.jito.reserve();
-        self.execute_as_bundle(strategy, intent, liab_mint, feeds, slot)
     }
 
     /// Brings the cached wallet balances up to the moment of the call, after a liquidation or sell
@@ -649,16 +520,18 @@ impl Executor {
             None => Ok(()),
             Some(err) => {
                 let logs = simulation.logs.unwrap_or_default();
-                Err(anyhow!("simulation failed: {err:?}; full_logs: {logs:#?}"))
+                Err(anyhow!("simulation failed: {err:?}; full_logs: {logs:?}"))
             }
         }
     }
 
     /// Why a bundle that didn't land didn't, as far as simulating its liquidation alone now tells
-    /// (after the fact, off the landing path).
-    fn why_not_landed(&self, bundle: &[VersionedTransaction], behind_push: bool) -> String {
-        if behind_push {
-            return "lost or dropped (behind a push, so not simulated alone)".to_string();
+    /// (after the fact, off the landing path): only for a liquidation that went alone, since one
+    /// behind a push or a refresh would fail the solo simulation for their absence.
+    fn why_not_landed(&self, bundle: &[VersionedTransaction], behind_others: bool) -> String {
+        if behind_others {
+            return "lost or dropped (behind a push or a refresh, so not simulated alone)"
+                .to_string();
         }
         match bundle.last().map(|tx| self.simulate(tx)) {
             Some(Ok(())) => "its liquidation passes simulation now, so it lost or expired".into(),
@@ -675,25 +548,46 @@ impl Executor {
         intent: &PreparedLiquidatableAccount,
         liab_mint: Pubkey,
         feeds: &[[u8; 32]],
-        slot: JitoSlot<'_>,
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
         let bundles = self
             .bundles
             .as_ref()
             .ok_or_else(|| anyhow!("bundles are off"))?;
+        // Makes this bundle's push, refresh and tip transactions its own.
+        let send = NEXT_SEND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The Kamino and JupLend refreshes go ahead of the liquidation when the bundle has room:
+        // with the push, or in a transaction of their own. The liquidation's route gets their
+        // accounts. Otherwise the liquidation keeps them.
+        let refresh = if bundles.refresh_ahead {
+            strategy.refresh_ixs(intent).unwrap_or_else(|e| {
+                debug!("{liquidatee}: refreshes kept in the liquidation ({e})");
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
+        let mut landing = Landing::Bundle;
         // The push first: without it there is nothing to bundle, and no quote is spent.
         let push = if feeds.is_empty() {
             None
         } else {
-            match bundles.pusher.push_transactions(feeds) {
+            let carrying = if refresh.is_empty() {
+                None
+            } else {
+                bundles.pusher.push_transactions(feeds, &refresh, send).ok()
+            };
+            if carrying.is_some() {
+                landing = Landing::BundleRefreshed;
+            }
+            match carrying.map_or_else(|| bundles.pusher.push_transactions(feeds, &[], send), Ok) {
                 Ok(push) => Some(push),
                 Err(e) => {
+                    // Not held: the feed may be pushable, or no longer needed, any moment.
                     let e = PushFailure(format!(
                         "can't push the {} Pyth feed(s) it needs: {e}",
                         feeds.len()
                     ));
-                    self.note_execution_failure(&liquidatee, &e.0);
                     return Err(e.into());
                 }
             }
@@ -710,49 +604,78 @@ impl Executor {
                 push.as_ref().map_or(0, |push| push.txs.len())
             );
         }
+        // Push, refresh, liquidation and tip.
+        let push_txs = push.as_ref().map_or(0, |push| push.txs.len());
+        let mut refresh_tx = None;
+        if !refresh.is_empty() && landing == Landing::Bundle && push_txs + 3 <= MAX_BUNDLE_TXS {
+            match bundles.pusher.transaction(&refresh, send) {
+                Ok(Some(tx)) => {
+                    refresh_tx = Some(tx);
+                    landing = Landing::BundleRefreshed;
+                }
+                Ok(None) => debug!("{liquidatee}: its refreshes don't fit a transaction"),
+                Err(e) => debug!("{liquidatee}: refreshes kept in the liquidation ({e})"),
+            }
+        }
 
-        let wallet_short = match self.sufficient_wallet_plan(strategy, intent, Landing::Bundle) {
+        let wallet_short = match self.sufficient_wallet_plan(strategy, intent, landing) {
             Ok(plan) => {
                 return self.land_bundle(
                     strategy,
                     bundles,
                     intent,
                     push.as_ref(),
+                    refresh_tx,
                     plan,
                     "wallet-funded",
-                    slot,
+                    send,
                 )
             }
             Err(short) => short,
         };
-        match strategy.assemble_sandwich(&intent.for_sandwich(), Landing::Bundle) {
+        match strategy.assemble_sandwich(&intent.for_sandwich(), landing) {
             Ok(Sandwich::Plan(plan)) => self.land_bundle(
                 strategy,
                 bundles,
                 intent,
                 push.as_ref(),
+                refresh_tx,
                 plan,
                 "sandwich",
-                slot,
+                send,
             ),
-            Ok(_) => self.no_plan(&liquidatee, liab_mint, &wallet_short),
-            Err(e) => {
-                self.note_assemble_failure(&liquidatee, liab_mint, &e)?;
-                Err(e)
+            no_sandwich => {
+                // What the wallet funds is better than nothing when no sandwich can go.
+                if let Some(plan) = self.partial_wallet_plan(strategy, intent, landing) {
+                    return self.land_bundle(
+                        strategy,
+                        bundles,
+                        intent,
+                        push.as_ref(),
+                        refresh_tx,
+                        plan,
+                        "wallet-funded (partial)",
+                        send,
+                    );
+                }
+                self.no_plan(&liquidatee, liab_mint, &wallet_short, no_sandwich.err())
             }
         }
     }
 
-    /// Sends `[push..] [liquidation] [tip]`, the tip a share of the plan's profit, and settles it.
+    /// Sends `[push..] [refresh] [liquidation] [tip]`, the tip a share of the plan's profit, and
+    /// settles it.
+    #[allow(clippy::too_many_arguments)]
     fn land_bundle(
         &self,
         strategy: &dyn LiquidationStrategy,
         bundles: &BundleLanding,
         intent: &PreparedLiquidatableAccount,
         push: Option<&PricePush>,
+        refresh_tx: Option<VersionedTransaction>,
         plan: ExecutionPlan,
         kind: &str,
-        slot: JitoSlot<'_>,
+        send: u64,
     ) -> Result<()> {
         let liquidatee = intent.liquidatee_account.address;
         let ExecutionPlan { tx, claim, profit } = plan;
@@ -760,13 +683,18 @@ impl Executor {
             warn!("Can't price the profit of {liquidatee} in SOL ({e}); tipping the floor");
             0
         });
-        let tip = bundles.tip_estimator.tip_for(profit_lamports);
+        // A few lamports off or on per send, so two bundles' tip transactions are never the same,
+        // within the cap.
+        let tip = bundles.tip_estimator.tip_for(profit_lamports, send % 1_000);
         let mut bundle = push.map(|push| push.txs.clone()).unwrap_or_default();
         let push_signatures: Vec<String> = bundle
             .iter()
             .filter_map(|tx| tx.signatures.first().map(ToString::to_string))
             .collect();
+        let behind_refresh = refresh_tx.is_some();
+        bundle.extend(refresh_tx);
         bundle.push(tx);
+        let alone = bundle.len() == 1;
         info!(
             "LIQUIDATION_BUNDLE attempt_id={} account={} plan={} estimated_profit_usd={:.6} tip_lamports={} push_tx_count={} push_signatures={:?}",
             intent.attempt_id,
@@ -778,15 +706,46 @@ impl Executor {
             push_signatures
         );
 
+        // The request slot is taken only now, everything built, so none is held while quoting.
+        let slot = bundles.jito.reserve();
+        let mut accepted = false;
         let result = match self.send_bundle(intent.attempt_id, bundles, &bundle, tip, slot) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(anyhow!(
-                "the bundle for {liquidatee} didn't land: {}",
-                self.why_not_landed(&bundle, push.is_some())
-            )),
+            Ok(BundleOutcome::Landed) => Ok(()),
+            Ok(BundleOutcome::NotLanded) => {
+                accepted = true;
+                Err(anyhow!(
+                    "the bundle for {liquidatee} didn't land: {}",
+                    self.why_not_landed(&bundle, push.is_some() || behind_refresh)
+                ))
+            }
+            Ok(BundleOutcome::Refused) => Err(anyhow!("the bundle for {liquidatee} wasn't sent")),
             Err(e) => Err(e),
         };
-        self.note_result(&liquidatee, &result);
+        // A bundle that didn't land costs nothing and holds nothing back: the account is evaluated
+        // afresh. Only the premium cap holds it, as retrying the same sizing fails the same way.
+        match &result {
+            Ok(()) => {
+                self.clear_target_backoff(&liquidatee);
+                self.misses_reset(&liquidatee);
+            }
+            // Only when the liquidation went alone does its simulation tell.
+            Err(e) if alone && is_premium_cap_failure(&e.to_string()) => {
+                self.hold(&liquidatee, PREMIUM_CAP_HOLD, "premium cap")
+            }
+            // A lost auction is routine; a bundle that keeps not landing may fail for a reason
+            // nothing reports (it isn't simulated behind a push or refresh), so it rests briefly.
+            Err(_) if accepted => {
+                if self.miss(&liquidatee) >= MISSES_BEFORE_HOLD {
+                    self.misses_reset(&liquidatee);
+                    self.hold(
+                        &liquidatee,
+                        NO_PLAN_HOLD,
+                        &format!("{MISSES_BEFORE_HOLD} bundles in a row didn't land"),
+                    );
+                }
+            }
+            Err(_) => {}
+        }
         // A sandwich claims no wallet tokens, so nothing waits for the balances to be re-read.
         if claim.is_some() {
             self.refresh_wallet_balances();
@@ -804,7 +763,7 @@ impl Executor {
         bundle: &[VersionedTransaction],
         tip: u64,
         slot: JitoSlot<'_>,
-    ) -> Result<bool> {
+    ) -> Result<BundleOutcome> {
         let liquidation = bundle.last().ok_or_else(|| anyhow!("empty bundle"))?;
         let liquidation_sig = *liquidation
             .signatures
@@ -820,12 +779,19 @@ impl Executor {
         );
         match slot.send_bundle(&txs) {
             Ok(BundleSend::Accepted(id)) => {
-                info!("LIQUIDATION_BUNDLE_ACCEPTED attempt_id={} bundle_id={} liquidation_signature={} push_tx_count={}",
+                info!("LIQUIDATION_BUNDLE_ACCEPTED attempt_id={} bundle_id={} liquidation_signature={} txs_before_liquidation={}",
                     attempt_id, id, liquidation_sig, bundle.len().saturating_sub(1));
-                self.landed_before_expiry(
-                    &liquidation_sig,
-                    &blockhash,
-                    Some((&bundles.jito, id.as_str())),
+                Ok(
+                    // "0x0": already processed, so there's no bundle to ask about; the liquidation's
+                    // signature settles it.
+                    match self.landed_before_expiry(
+                        &liquidation_sig,
+                        &blockhash,
+                        (id != "0x0").then_some((&bundles.jito, id.as_str())),
+                    )? {
+                        true => BundleOutcome::Landed,
+                        false => BundleOutcome::NotLanded,
+                    },
                 )
             }
             Ok(BundleSend::Rejected(reason)) => {
@@ -833,16 +799,23 @@ impl Executor {
                     "LIQUIDATION_BUNDLE_REJECTED attempt_id={} liquidation_signature={} reason={}",
                     attempt_id, liquidation_sig, reason
                 );
-                Ok(false)
+                Ok(BundleOutcome::Refused)
             }
-            // The request may still have reached the block engine, which gave no id to ask about:
-            // only the blockhash's expiry settles it.
+            // Taken as not sent: nothing waits for it.
+            Ok(BundleSend::Unavailable(reason)) => {
+                warn!(
+                    "LIQUIDATION_BUNDLE_UNAVAILABLE attempt_id={} liquidation_signature={} reason={}",
+                    attempt_id, liquidation_sig, reason
+                );
+                Ok(BundleOutcome::Refused)
+            }
+            // Never sent: the bundle couldn't be encoded.
             Err(e) => {
                 warn!(
                     "LIQUIDATION_BUNDLE_SEND_ERROR attempt_id={} liquidation_signature={} error={}",
                     attempt_id, liquidation_sig, e
                 );
-                self.landed_before_expiry(&liquidation_sig, &blockhash, None)
+                Ok(BundleOutcome::Refused)
             }
         }
     }
@@ -903,12 +876,15 @@ impl Executor {
         }
     }
 
-    /// Back off a target whose execution failed just like a failed assembly: every retry
-    /// re-quotes the DEX without landing anything.
+    /// After a transaction over RPC (bundles off): clears the account's hold when it landed,
+    /// otherwise holds it briefly, or longer for the premium cap.
     fn note_result(&self, liquidatee: &Pubkey, result: &Result<()>) {
         match result {
-            Ok(()) => self.clear_target_backoff(liquidatee),
-            Err(e) => self.note_execution_failure(liquidatee, &e.to_string()),
+            Ok(()) => {
+                self.clear_target_backoff(liquidatee);
+                self.misses_reset(liquidatee);
+            }
+            Err(_) => self.hold(liquidatee, RPC_FAILURE_HOLD, "RPC failure"),
         }
     }
 
@@ -917,76 +893,52 @@ impl Executor {
         Ok(self.cache.banks.try_get_bank(&intent.liab_bank)?.bank.mint)
     }
 
-    /// Whether a mint or target is currently backed off. Expired target entries are kept for one
-    /// more `TARGET_BACKOFF_MAX` window so their failure counter — and thus the escalating delay —
-    /// survives a retry that fails again.
+    /// Whether the account `key` is held after a recent attempt.
     fn is_backed_off(&self, key: &Pubkey) -> Result<bool> {
         let now = Instant::now();
         let mut guard = self
             .backoffs
             .lock()
             .map_err(|_| anyhow!("execution backoffs mutex poisoned"))?;
-        guard.retain(|_, state| match state {
-            BackoffState::Mint(retry_after) => now < *retry_after,
-            BackoffState::Target(backoff) => now < backoff.retry_after + TARGET_BACKOFF_MAX,
-        });
-        Ok(guard
-            .get(key)
-            .is_some_and(|state| now < state.retry_after()))
+        guard.retain(|_, until| now < *until);
+        Ok(guard.contains_key(key))
     }
 
-    /// Clear a target's backoff once it assembles successfully again.
-    fn clear_target_backoff(&self, target: &Pubkey) {
-        if let Ok(mut guard) = self.backoffs.lock() {
-            if matches!(guard.get(target), Some(BackoffState::Target(_))) {
-                guard.remove(target);
-            }
-        }
+    /// Counts a bundle for `target` that didn't land; the count in a row.
+    fn miss(&self, target: &Pubkey) -> u32 {
+        let now = Instant::now();
+        let mut misses = self.misses.lock().unwrap_or_else(|e| e.into_inner());
+        misses.retain(|_, (_, first)| now.saturating_duration_since(*first) < MISS_WINDOW);
+        let (count, _) = misses.entry(*target).or_insert((0, now));
+        *count += 1;
+        *count
     }
 
-    /// Record an assemble failure: quarantine the liab mint when it has no swap route
-    /// (`NO_ROUTES_FOUND`), otherwise apply an exponential per-target backoff.
-    fn note_assemble_failure(
-        &self,
-        target: &Pubkey,
-        liab_mint: Pubkey,
-        e: &anyhow::Error,
-    ) -> Result<()> {
-        let mut guard = self
-            .backoffs
+    fn misses_reset(&self, target: &Pubkey) {
+        self.misses
             .lock()
-            .map_err(|_| anyhow!("execution backoffs mutex poisoned"))?;
-
-        if e.to_string().contains("NO_ROUTES_FOUND") {
-            guard.insert(
-                liab_mint,
-                BackoffState::Mint(Instant::now() + NO_ROUTE_QUARANTINE_TTL),
-            );
-            warn!(
-                "Quarantining liab mint {} for {}s: no swap route",
-                liab_mint,
-                NO_ROUTE_QUARANTINE_TTL.as_secs()
-            );
-            return Ok(());
-        }
-
-        bump_target_backoff(&mut guard, target, ASSEMBLE_BACKOFF_BASE, "assemble", false);
-        Ok(())
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(target);
     }
 
-    /// Record an execution failure: the plan assembled, but the liquidation could not be landed
-    /// (simulation says it would revert, or the send failed). Same exponential backoff as an
-    /// assemble failure, and a long one for a repeated premium-cap rejection.
-    fn note_execution_failure(&self, target: &Pubkey, message: &str) {
-        if let Ok(mut guard) = self.backoffs.lock() {
-            bump_target_backoff(
-                &mut guard,
-                target,
-                EXECUTION_BACKOFF_BASE,
-                "execution",
-                is_premium_cap_failure(message),
-            );
-        }
+    /// Leaves `target` alone for `hold`.
+    fn hold(&self, target: &Pubkey, hold: Duration, why: &str) {
+        let mut guard = self.backoffs.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(*target, Instant::now() + hold);
+        debug!("Holding {target} for {}s ({why})", hold.as_secs());
+    }
+
+    /// Clears a target's hold once it lands.
+    fn clear_target_backoff(&self, target: &Pubkey) {
+        self.backoffs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(target);
+    }
+
+    /// No plan for `target`: no wallet repay and no sandwich.
+    fn note_assemble_failure(&self, target: &Pubkey, e: &anyhow::Error) {
+        self.hold(target, NO_PLAN_HOLD, &format!("no plan: {e}"));
     }
 
     /// Sends the liquidation over RPC and waits for it to confirm or fail.
@@ -1161,53 +1113,41 @@ mod tests {
         assert_eq!(pending_feeds(&cache, &oracles), vec![ahead]);
     }
 
-    fn retry_in(backoffs: &HashMap<Pubkey, BackoffState>, target: &Pubkey) -> Duration {
-        backoffs[target]
-            .retry_after()
-            .saturating_duration_since(Instant::now())
+    fn executor() -> Executor {
+        Executor::new(
+            RpcClient::new("http://127.0.0.1:1".to_string()),
+            Arc::new(Cache::new(
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                Arc::new(Mutex::new(Clock::default())),
+                HashSet::new(),
+            )),
+            None,
+            I80F48::ZERO,
+        )
     }
 
     #[test]
-    fn a_second_premium_cap_failure_in_a_row_backs_off_long() {
-        let mut backoffs = HashMap::new();
-        let target = Pubkey::new_unique();
-        bump_target_backoff(
-            &mut backoffs,
-            &target,
-            EXECUTION_BACKOFF_BASE,
-            "execution",
-            true,
-        );
-        assert!(retry_in(&backoffs, &target) <= EXECUTION_BACKOFF_BASE);
-        bump_target_backoff(
-            &mut backoffs,
-            &target,
-            EXECUTION_BACKOFF_BASE,
-            "execution",
-            true,
-        );
-        assert!(retry_in(&backoffs, &target) > TARGET_BACKOFF_MAX);
-    }
+    fn holds_are_short_fixed_and_only_for_failures_that_would_repeat() {
+        let executor = executor();
+        let account = Pubkey::new_unique();
 
-    #[test]
-    fn other_failures_keep_the_exponential_backoff() {
-        let mut backoffs = HashMap::new();
-        let target = Pubkey::new_unique();
-        bump_target_backoff(
-            &mut backoffs,
-            &target,
-            EXECUTION_BACKOFF_BASE,
-            "execution",
-            true,
-        );
-        bump_target_backoff(
-            &mut backoffs,
-            &target,
-            EXECUTION_BACKOFF_BASE,
-            "execution",
-            false,
-        );
-        assert!(retry_in(&backoffs, &target) <= EXECUTION_BACKOFF_BASE * 2);
+        // No plan: held briefly, never escalating.
+        for _ in 0..5 {
+            executor.note_assemble_failure(&account, &anyhow!("NO_ROUTES_FOUND"));
+        }
+        assert!(executor.is_backed_off(&account).unwrap());
+        let until = executor.backoffs.lock().unwrap()[&account];
+        assert!(until.saturating_duration_since(Instant::now()) <= NO_PLAN_HOLD);
+
+        // Landing clears it.
+        executor.note_result(&account, &Ok(()));
+        assert!(!executor.is_backed_off(&account).unwrap());
+
+        // Over RPC every failure holds briefly, the premium cap included.
+        executor.note_result(&account, &Err(anyhow!("custom program error: 0x17ca")));
+        let until = executor.backoffs.lock().unwrap()[&account];
+        assert!(until.saturating_duration_since(Instant::now()) <= RPC_FAILURE_HOLD);
     }
 
     #[test]

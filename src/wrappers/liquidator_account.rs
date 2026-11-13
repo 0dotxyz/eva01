@@ -199,8 +199,13 @@ impl LiquidatorAccount {
         swap: Option<&SwapInstructions>,
         landing: Landing,
     ) -> Result<VersionedTransaction> {
-        let (ixs, mut luts, record) =
-            self.liquidation_ixs(account, asset_amount, liab_amount, swap)?;
+        let (ixs, mut luts, record) = self.liquidation_ixs(
+            account,
+            asset_amount,
+            liab_amount,
+            swap,
+            landing.refreshes_in_tx(),
+        )?;
 
         // Over RPC, always v1: up to 4096 bytes with every address in full, so it needs no lookup
         // table and a route's pool accounts always fit, and its header carries the compute budget,
@@ -224,12 +229,15 @@ impl LiquidatorAccount {
 
     /// The liquidation's instructions, in order, the lookup tables that cover them (the venue's
     /// tables for a swap are added by the caller) and the liquidation record they use.
+    /// Without `refresh` the Kamino and JupLend refreshes are left out: an earlier transaction in
+    /// the same bundle runs them (`refresh_ixs`).
     pub fn liquidation_ixs(
         &self,
         account: &PreparedLiquidatableAccount,
         asset_amount: I80F48,
         liab_amount: I80F48,
         swap: Option<&SwapInstructions>,
+        refresh: bool,
     ) -> Result<(Vec<Instruction>, Vec<AddressLookupTableAccount>, Pubkey)> {
         let PreparedLiquidatableAccount {
             liquidatee_account,
@@ -286,7 +294,9 @@ impl LiquidatorAccount {
             liquidatee_banks,
         );
 
-        ixs.extend(self.venue_refresh_ixs(kamino_reserves, juplend_states)?);
+        if refresh {
+            ixs.extend(self.venue_refresh_ixs(kamino_reserves, juplend_states)?);
+        }
 
         let asset_mint_wrapper = self.cache.mints.try_get_account(&asset_mint)?;
 
@@ -306,12 +316,13 @@ impl LiquidatorAccount {
                     .cache
                     .try_get_kamino_reserve(&asset_bank_wrapper.bank.integration_acc_1)?;
 
-                let refresh_obligation_ix = make_refresh_obligation_ix(
-                    asset_bank_wrapper.bank.integration_acc_2,
-                    kamino_reserve.reserve.lending_market,
-                    &[asset_bank_wrapper.bank.integration_acc_1],
-                );
-                ixs.push(refresh_obligation_ix);
+                if refresh {
+                    ixs.push(make_refresh_obligation_ix(
+                        asset_bank_wrapper.bank.integration_acc_2,
+                        kamino_reserve.reserve.lending_market,
+                        &[asset_bank_wrapper.bank.integration_acc_1],
+                    ));
+                }
 
                 make_kamino_withdraw_ix(
                     self.group,
@@ -424,7 +435,8 @@ impl LiquidatorAccount {
             without_push: None,
             sandwich_pair: None,
         };
-        let (ixs, _, record) = self.liquidation_ixs(&intent, I80F48::ONE, I80F48::ONE, None)?;
+        let (ixs, _, record) =
+            self.liquidation_ixs(&intent, I80F48::ONE, I80F48::ONE, None, true)?;
         Ok(lookupable_accounts(&self.signer.pubkey(), &ixs)
             .into_iter()
             .filter(|key| *key != liquidatee_address && *key != record)
@@ -459,6 +471,36 @@ impl LiquidatorAccount {
             ),
             Err(e) => warn!("Skipping the bank {bank} for the lookup tables: {e}"),
         }
+    }
+
+    /// What the liquidation of `account` leaves to an earlier transaction in its bundle: every Kamino
+    /// reserve and JupLend state its health reads, then the obligation of each Kamino bank it may
+    /// seize from (the main pair's and the sandwich pair's).
+    pub fn refresh_ixs(&self, account: &PreparedLiquidatableAccount) -> Result<Vec<Instruction>> {
+        let ObservationAccounts {
+            kamino_reserves,
+            juplend_states,
+            ..
+        } = &account.observation_accounts;
+        let mut ixs = self.venue_refresh_ixs(kamino_reserves, juplend_states)?;
+        let seized = std::iter::once(account.asset_bank)
+            .chain(account.sandwich_pair.as_ref().map(|pair| pair.asset_bank));
+        let mut obligations = HashSet::new();
+        for bank in seized {
+            let bank = self.cache.banks.try_get_bank(&bank)?.bank;
+            if bank.config.asset_tag != ASSET_TAG_KAMINO
+                || !obligations.insert(bank.integration_acc_2)
+            {
+                continue;
+            }
+            let reserve = self.cache.try_get_kamino_reserve(&bank.integration_acc_1)?;
+            ixs.push(make_refresh_obligation_ix(
+                bank.integration_acc_2,
+                reserve.reserve.lending_market,
+                &[bank.integration_acc_1],
+            ));
+        }
+        Ok(ixs)
     }
 
     /// Kamino and JupLend venue accounts must be refreshed in the same slot as any health
@@ -531,7 +573,7 @@ impl LiquidatorAccount {
             Some(err) => {
                 let logs = result.logs.unwrap_or_default();
                 Err(anyhow!(
-                    "simulation failed: {:?}; full_logs: {:#?}",
+                    "simulation failed: {:?}; full_logs: {:?}",
                     err,
                     logs
                 ))

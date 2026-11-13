@@ -155,13 +155,14 @@ impl InventoryStrategy {
             intent.asset_amount,
             intent.liab_amount,
             None,
+            landing.refreshes_in_tx(),
         )?;
         let transaction_accounts: Vec<Pubkey> =
             locked_accounts(&self.liquidator_account.signer.pubkey(), &liquidation_ixs)
                 .into_iter()
                 .collect();
         // A v0 transaction also loads the compute-budget program; a v1 header carries the budget.
-        let budget_program = usize::from(landing == Landing::Bundle);
+        let budget_program = usize::from(landing.is_bundle());
         let max_accounts =
             MAX_TX_ACCOUNT_LOCKS.saturating_sub(transaction_accounts.len() + budget_program);
 
@@ -319,6 +320,13 @@ impl LiquidationStrategy for InventoryStrategy {
             .value_wrapper(&spl_token::native_mint::ID)?
             .get_amount_from_value(usd)?
             .to_num())
+    }
+
+    fn refresh_ixs(
+        &self,
+        intent: &PreparedLiquidatableAccount,
+    ) -> Result<Vec<solana_instruction::Instruction>> {
+        self.liquidator_account.refresh_ixs(intent)
     }
 
     fn assemble_with_inventory(

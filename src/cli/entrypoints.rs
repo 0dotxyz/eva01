@@ -80,6 +80,28 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
             .refresh(&blockhash_rpc, &blockhash_stop)
     });
 
+    // The liquidation fee the program allows can change; liquidations are sized on it.
+    let fee_cache = cache.clone();
+    let fee_rpc =
+        RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
+    let fee_stop = stop_liquidator.clone();
+    thread::spawn(move || {
+        while !fee_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            thread::sleep(std::time::Duration::from_secs(15));
+            match crate::cache_loader::read_liquidation_max_fee(
+                &fee_rpc,
+                &fee_cache.global_fee_state_key,
+            ) {
+                Ok(fee) if fee != fee_cache.liquidation_max_fee() => {
+                    log::info!("Liquidation max fee (FeeState) changed to {fee}");
+                    fee_cache.set_liquidation_max_fee(fee);
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("Failed to re-read the liquidation max fee: {e}"),
+            }
+        }
+    });
+
     let liquidator_account = Arc::new(LiquidatorAccount::new(
         &config.clone(),
         config.marginfi_group_key,

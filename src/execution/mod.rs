@@ -39,6 +39,21 @@ pub enum Landing {
     /// block engine cannot decode v1. Not simulated: a bundle that fails doesn't land and costs
     /// nothing, and one behind a push relies on prices the chain doesn't hold yet.
     Bundle,
+    /// In a bundle whose earlier transaction refreshes the Kamino and JupLend accounts the
+    /// liquidation reads (same slot, as both venues require), so the liquidation leaves those
+    /// instructions out and its route has their room.
+    BundleRefreshed,
+}
+
+impl Landing {
+    /// Whether the liquidation refreshes the Kamino and JupLend accounts itself.
+    pub fn refreshes_in_tx(self) -> bool {
+        self != Landing::BundleRefreshed
+    }
+
+    pub fn is_bundle(self) -> bool {
+        self != Landing::Rpc
+    }
 }
 
 /// A way of funding and assembling a liquidation. Each implementation is a fully-configured
@@ -60,6 +75,13 @@ pub trait LiquidationStrategy {
 
     /// The SOL amount (lamports) worth `usd` at the oracle price, for sizing a tip.
     fn lamports_for_value(&self, usd: I80F48) -> Result<u64>;
+
+    /// The Kamino and JupLend refreshes the liquidation of `intent` (or of its sandwich pair) relies
+    /// on, in order; empty when it reads neither venue.
+    fn refresh_ixs(
+        &self,
+        intent: &PreparedLiquidatableAccount,
+    ) -> Result<Vec<solana_instruction::Instruction>>;
 
     /// Assemble the plan that spends wallet inventory, claiming the tokens it spends.
     fn assemble_with_inventory(
