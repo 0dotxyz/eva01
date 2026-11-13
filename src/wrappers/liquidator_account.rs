@@ -42,8 +42,8 @@ use std::{
 use crate::execution::Landing;
 use crate::juplend_ixs::juplend_underlying_amount;
 use crate::transaction_limits::{
-    priority_fee_lamports, MAX_COMPUTE_UNIT_LIMIT, MAX_LOADED_ACCOUNTS_DATA, MAX_TX_ACCOUNT_LOCKS,
-    MAX_V0_TX_SIZE, MAX_V1_TX_SIZE,
+    bundle_cu_price, priority_fee_lamports, MAX_COMPUTE_UNIT_LIMIT, MAX_LOADED_ACCOUNTS_DATA,
+    MAX_TX_ACCOUNT_LOCKS, MAX_V0_TX_SIZE, MAX_V1_TX_SIZE,
 };
 
 /// Collateral tags `build_liquidate_tx` can withdraw. Staked banks hold a plain SPL LST, so they go
@@ -181,9 +181,12 @@ impl LiquidatorAccount {
             rpc_url: config.rpc_url.clone(),
             cu_limit_ix: ComputeBudgetInstruction::set_compute_unit_limit(MAX_COMPUTE_UNIT_LIMIT),
             v1_priority_fee: priority_fee_lamports(config.compute_unit_price_micro_lamports),
-            cu_price_ix: ComputeBudgetInstruction::set_compute_unit_price(
+            // At least the priority fee a bundle relay takes (Helius Sender asks it of every
+            // transaction); over RPC the v1 header carries the configured price.
+            cu_price_ix: ComputeBudgetInstruction::set_compute_unit_price(bundle_cu_price(
+                MAX_COMPUTE_UNIT_LIMIT,
                 config.compute_unit_price_micro_lamports,
-            ),
+            )),
             cache,
             venue_luts: Mutex::new(HashMap::new()),
         })

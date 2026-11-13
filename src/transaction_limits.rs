@@ -29,6 +29,21 @@ pub const MICRO_LAMPORTS_PER_LAMPORT: u64 = 1_000_000;
 /// A Jito bundle holds at most this many transactions.
 pub const MAX_BUNDLE_TXS: usize = 5;
 
+/// A Helius Sender bundle holds at most this many transactions.
+pub const MAX_SENDER_BUNDLE_TXS: usize = 4;
+
+/// The least priority fee a bundled transaction pays, in lamports: Helius Sender refuses one under
+/// 5,000 and recommends 10,000.
+pub const MIN_BUNDLE_PRIORITY_FEE_LAMPORTS: u64 = 10_000;
+
+/// The compute-unit price of a bundled transaction limited to `cu_limit`: `micro_lamports_per_cu`,
+/// or more when that would pay under [`MIN_BUNDLE_PRIORITY_FEE_LAMPORTS`].
+pub fn bundle_cu_price(cu_limit: u32, micro_lamports_per_cu: u64) -> u64 {
+    let floor = (MIN_BUNDLE_PRIORITY_FEE_LAMPORTS * MICRO_LAMPORTS_PER_LAMPORT)
+        .div_ceil(u64::from(cu_limit.max(1)));
+    micro_lamports_per_cu.max(floor)
+}
+
 /// The priority fee, in lamports, of a transaction that requests [`MAX_COMPUTE_UNIT_LIMIT`] at
 /// `micro_lamports_per_cu`: what a v1 header states, since it carries a total, not a price.
 pub fn priority_fee_lamports(micro_lamports_per_cu: u64) -> u64 {
@@ -49,6 +64,16 @@ mod tests {
             priority_fee_lamports(u64::MAX),
             u64::MAX / MICRO_LAMPORTS_PER_LAMPORT
         );
+    }
+
+    #[test]
+    fn a_bundled_transaction_pays_at_least_the_minimum_priority_fee() {
+        for limit in [1_000, 120_000, MAX_COMPUTE_UNIT_LIMIT] {
+            let fee = bundle_cu_price(limit, 1) * u64::from(limit) / MICRO_LAMPORTS_PER_LAMPORT;
+            assert!(fee >= MIN_BUNDLE_PRIORITY_FEE_LAMPORTS, "{limit}: {fee}");
+        }
+        // A higher configured price is kept.
+        assert_eq!(bundle_cu_price(MAX_COMPUTE_UNIT_LIMIT, 10_000), 10_000);
     }
 
     #[test]

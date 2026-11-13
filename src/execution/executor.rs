@@ -39,14 +39,16 @@ use crate::cache::{
     pyth_prices::{price_update, PushedPrices},
     Cache,
 };
-use crate::transaction_limits::MAX_BUNDLE_TXS;
+use crate::transaction_limits::{MAX_BUNDLE_TXS, MAX_SENDER_BUNDLE_TXS};
 use crate::utils::{
+    helius_sender::{self, HeliusSender, SenderSend},
     jito::{BundleSend, InflightStatus, JitoClient, JitoSlot, TipEstimator},
     pyth_cranker::price_feed_address,
     pyth_push::{PricePush, PythPusher},
 };
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 use solana_keypair::Keypair;
+use solana_signer::Signer;
 
 use super::{inventory::WalletClaimed, ExecutionPlan, Landing, LiquidationStrategy, Sandwich};
 
@@ -59,6 +61,11 @@ const INFLIGHT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const INFLIGHT_CHECK_INTERVAL_UNAUTHENTICATED: Duration = Duration::from_secs(2);
 /// Polls of the liquidation's signature, after an unconfirmed bundle, this far apart.
 const SIGNATURE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long a bundle sent through Helius Sender is given to land: about three slots (bundles were
+/// seen confirmed ~0.65 s after sending). Sender reports nothing about a bundle, so past this it
+/// counts as lost, unless the chain shows its liquidation processed.
+const SENDER_LANDING_WINDOW: Duration = Duration::from_millis(1_200);
 
 /// Whether the RPC simulates a transaction before forwarding it. Every transaction is checked
 /// exactly once: one eva already simulated skips it.
@@ -93,13 +100,18 @@ impl std::fmt::Display for LostRace {
 
 impl std::error::Error for LostRace {}
 
-/// What landing a liquidation as a Jito bundle needs, behind a price push or not.
+/// What landing a liquidation as a bundle needs, behind a price push or not.
 pub struct BundleLanding {
     pub pusher: Arc<PythPusher>,
     pub jito: JitoClient,
     pub tip_estimator: TipEstimator,
     /// Pays the tip.
     pub signer: Keypair,
+    /// Also sends each bundle whose tip meets its minimum, with the same liquidation, so at most
+    /// one of the two lands.
+    pub sender: Option<HeliusSender>,
+    /// For the Sender tip transaction's priority fee.
+    pub cu_price_micro_lamports: u64,
 }
 
 /// A transaction sent over RPC is re-sent this often until it confirms or its blockhash expires:
@@ -165,7 +177,48 @@ struct WalletShort {
     claimed: bool,
 }
 
-/// What became of a bundle sent to the block engine.
+/// The bundle for Helius Sender, without its tip transaction when its push carries the tip.
+struct SenderBundle {
+    txs: Vec<VersionedTransaction>,
+    /// A tip transaction goes last.
+    tip_tx: bool,
+}
+
+/// Which bundle landed the liquidation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path {
+    Jito,
+    Sender,
+}
+
+impl std::fmt::Display for Path {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Path::Jito => "jito",
+            Path::Sender => "sender",
+        })
+    }
+}
+
+/// A signature's state on chain.
+enum SignatureState {
+    Confirmed(u64),
+    /// Processed, not yet confirmed: it may still land.
+    Processed,
+    Reverted(anyhow::Error),
+    /// Not known, or the status couldn't be read.
+    Unknown,
+}
+
+/// The bundles a liquidation went out in, as far as telling whether it landed goes.
+struct InFlight<'a> {
+    /// The block engine took it (or may have); with its id unless already processed.
+    jito: Option<Option<(&'a JitoClient, &'a str)>>,
+    /// Sender took it: its tip transaction's signature, which lands only with Sender's bundle.
+    sender_tip: Option<Signature>,
+}
+
+/// What became of a bundle sent to the block engine and Helius Sender.
 enum BundleOutcome {
     /// At this slot.
     Landed(u64),
@@ -269,13 +322,14 @@ impl Executor {
                         .and_then(|account| price_update(&account))
                         .map(|update| update.price_message.publish_time);
                     format!(
-                        "{}:pushed_time={},cached_time={:?},chain_time={:?},price={}e{}",
+                        "{}:pushed_time={},cached_time={:?},chain_time={:?},price={}e{},conf={}",
                         oracle,
                         signed.message.publish_time,
                         cached,
                         self.cache.pyth_prices.onchain(oracle),
                         signed.message.price,
-                        signed.message.exponent
+                        signed.message.exponent,
+                        signed.message.conf
                     )
                 })
                 .collect();
@@ -322,18 +376,21 @@ impl Executor {
             return self.execute_over_rpc(strategy, intent, liab_mint);
         };
         // While the block engine is down, what needs no push goes over RPC. A push never goes out
-        // without its bundle, so a liquidation that needs one waits.
+        // without its bundle, so a liquidation that needs one goes through Sender alone, or, with
+        // no Sender, waits.
         if bundles.jito.is_down() {
             if !must_push {
                 return self.execute_over_rpc(strategy, intent, liab_mint);
             }
-            if let Some(unpushed) = intent.without_push.as_deref() {
-                let liab_mint = self.intent_liab_mint(unpushed)?;
-                return self.execute_over_rpc(strategy, unpushed, liab_mint);
+            if bundles.sender.is_none() {
+                if let Some(unpushed) = intent.without_push.as_deref() {
+                    let liab_mint = self.intent_liab_mint(unpushed)?;
+                    return self.execute_over_rpc(strategy, unpushed, liab_mint);
+                }
+                return Err(anyhow!(
+                    "the block engine is down and the liquidation needs a price push"
+                ));
             }
-            return Err(anyhow!(
-                "the block engine is down and the liquidation needs a price push"
-            ));
         }
         // Every liquidation goes as a bundle. A slot is all but always free at the key's rate,
         // and a wait for one is a few milliseconds.
@@ -647,15 +704,16 @@ impl Executor {
                 } else {
                     bundles
                         .pusher
-                        .push_transactions(prices, &refresh, send)
+                        .push_transactions(prices, &refresh, None, send)
                         .ok()
                 };
                 if carrying.is_some() {
                     landing = Landing::BundleRefreshed;
                 }
-                match carrying
-                    .map_or_else(|| bundles.pusher.push_transactions(prices, &[], send), Ok)
-                {
+                match carrying.map_or_else(
+                    || bundles.pusher.push_transactions(prices, &[], None, send),
+                    Ok,
+                ) {
                     Ok(push) => Some(push),
                     Err(e) => {
                         // Not held: the next evaluation sizes on what can be pushed then.
@@ -768,6 +826,23 @@ impl Executor {
         // A few lamports off or on per send, so two bundles' tip transactions are never the same,
         // within the cap.
         let tip = bundles.tip_estimator.tip_for(profit_lamports, send % 1_000);
+        // Sender's copy, at most four transactions (it can't decode v1): the same refresh and
+        // liquidation, behind the push built again with Sender's tip inside, or followed by a
+        // tip transaction.
+        let sender_bundle = match (&bundles.sender, push) {
+            (Some(_), _) if tip < helius_sender::MIN_TIP_LAMPORTS => None,
+            (Some(_), Some(push)) => self.sender_push(bundles, push, tip, send).and_then(|txs| {
+                let mut txs = txs;
+                txs.extend(refresh_tx.clone());
+                txs.push(tx.clone());
+                (txs.len() <= MAX_SENDER_BUNDLE_TXS).then_some(SenderBundle { txs, tip_tx: false })
+            }),
+            (Some(_), None) => Some(SenderBundle {
+                txs: refresh_tx.iter().cloned().chain([tx.clone()]).collect(),
+                tip_tx: true,
+            }),
+            (None, _) => None,
+        };
         let mut bundle = push.map(|push| push.txs.clone()).unwrap_or_default();
         let push_signatures: Vec<String> = bundle
             .iter()
@@ -778,19 +853,34 @@ impl Executor {
         bundle.push(tx);
         let alone = bundle.len() == 1;
         info!(
-            "LIQUIDATION_BUNDLE attempt_id={} account={} plan={} estimated_profit_usd={:.6} tip_lamports={} push_tx_count={} push_signatures={:?}",
+            "LIQUIDATION_BUNDLE attempt_id={} account={} plan={} estimated_profit_usd={:.6} tip_lamports={} push_tx_count={} push_signatures={:?} sender={}",
             intent.attempt_id,
             liquidatee,
             kind,
             profit.to_num::<f64>(),
             tip,
             push.map_or(0, |push| push.txs.len()),
-            push_signatures
+            push_signatures,
+            sender_bundle.is_some()
         );
 
         // The request slot is taken only now, everything built, so none is held while quoting.
-        let slot = bundles.jito.reserve();
-        let result = match self.send_bundle(intent.attempt_id, bundles, &bundle, tip, slot) {
+        // With Sender taking the bundle too, it never waits for one.
+        let slot = if bundles.jito.is_down() {
+            None
+        } else if sender_bundle.is_some() {
+            bundles.jito.try_reserve()
+        } else {
+            Some(bundles.jito.reserve())
+        };
+        let result = match self.send_bundle(
+            intent.attempt_id,
+            bundles,
+            &bundle,
+            sender_bundle.as_ref(),
+            tip,
+            slot,
+        ) {
             Ok(BundleOutcome::Landed(slot)) => {
                 self.landed_slots
                     .lock()
@@ -824,130 +914,255 @@ impl Executor {
         result
     }
 
-    /// Sends `bundle` with a tip transaction appended. Returns whether its liquidation, the last
-    /// transaction, landed.
+    /// `push` built again with Sender's tip in one of its transactions, so Sender's bundle has
+    /// room for the liquidation within its four.
+    fn sender_push(
+        &self,
+        bundles: &BundleLanding,
+        push: &PricePush,
+        tip: u64,
+        send: u64,
+    ) -> Option<Vec<VersionedTransaction>> {
+        let tip = helius_sender::tip_instruction(&bundles.signer.pubkey(), tip)
+            .map_err(|e| warn!("No Sender tip: {e}"))
+            .ok()?;
+        bundles
+            .pusher
+            .push_transactions(&push.prices, &push.trailing, Some(&tip), send)
+            .map(|push| push.txs)
+            .map_err(|e| debug!("No Sender bundle: the push with its tip doesn't fit ({e})"))
+            .ok()
+    }
+
+    /// Sends `bundle` to the block engine in `slot` with a Jito tip transaction appended, and
+    /// `sender_bundle` to Helius Sender, both at once. Both end in the same liquidation, so at
+    /// most one lands. Returns whether it landed.
     fn send_bundle(
         &self,
         attempt_id: u64,
         bundles: &BundleLanding,
         bundle: &[VersionedTransaction],
+        sender_bundle: Option<&SenderBundle>,
         tip: u64,
-        slot: JitoSlot<'_>,
+        slot: Option<JitoSlot<'_>>,
     ) -> Result<BundleOutcome> {
         let liquidation = bundle.last().ok_or_else(|| anyhow!("empty bundle"))?;
         let liquidation_sig = *liquidation
             .signatures
             .first()
             .ok_or_else(|| anyhow!("unsigned liquidation"))?;
-        // The tip goes out with the liquidation's blockhash, so it expires with it.
+        // The tips go out with the liquidation's blockhash, so they expire with it.
         let blockhash = *liquidation.message.recent_blockhash();
-        let mut txs = bundle.to_vec();
-        txs.push(
-            bundles
-                .tip_estimator
-                .build_tip_transaction(&bundles.signer, blockhash, tip)?,
-        );
-        match slot.send_bundle(&txs) {
-            Ok(BundleSend::Accepted(id)) => {
-                info!("LIQUIDATION_BUNDLE_ACCEPTED attempt_id={} bundle_id={} liquidation_signature={} txs_before_liquidation={}",
-                    attempt_id, id, liquidation_sig, bundle.len().saturating_sub(1));
-                Ok(
-                    // "0x0": already processed, so there's no bundle to ask about; the liquidation's
-                    // signature settles it.
-                    match self.landed_before_expiry(
-                        &liquidation_sig,
-                        &blockhash,
-                        (id != "0x0").then_some((&bundles.jito, id.as_str())),
-                    )? {
-                        Some(slot) => BundleOutcome::Landed(slot),
-                        None => BundleOutcome::NotLanded,
-                    },
-                )
+        let jito_txs = match slot {
+            Some(slot) => {
+                let mut txs = bundle.to_vec();
+                txs.push(bundles.tip_estimator.build_tip_transaction(
+                    &bundles.signer,
+                    blockhash,
+                    tip,
+                )?);
+                Some((slot, txs))
             }
-            Ok(BundleSend::Rejected(reason)) => {
-                warn!(
-                    "LIQUIDATION_BUNDLE_REJECTED attempt_id={} liquidation_signature={} reason={}",
-                    attempt_id, liquidation_sig, reason
-                );
-                Ok(BundleOutcome::Refused)
+            None => None,
+        };
+        let sender_txs = match (&bundles.sender, sender_bundle) {
+            (Some(sender), Some(sender_bundle)) => {
+                let mut txs = sender_bundle.txs.clone();
+                if sender_bundle.tip_tx {
+                    txs.push(helius_sender::build_tip_transaction(
+                        &bundles.signer,
+                        blockhash,
+                        tip,
+                        bundles.cu_price_micro_lamports,
+                    )?);
+                }
+                Some((sender, txs))
             }
-            // Taken as not sent: nothing waits for it.
-            Ok(BundleSend::Unavailable(reason)) => {
+            _ => None,
+        };
+        if jito_txs.is_none() && sender_txs.is_none() {
+            warn!(
+                "LIQUIDATION_BUNDLE_REJECTED attempt_id={attempt_id} liquidation_signature={liquidation_sig} reason=no free Jito request slot and no Sender bundle"
+            );
+            return Ok(BundleOutcome::Refused);
+        }
+        let (jito_send, sender_send) = thread::scope(|scope| {
+            let sender_send = sender_txs
+                .as_ref()
+                .map(|(sender, txs)| scope.spawn(|| sender.send_bundle(txs)));
+            let jito_send = jito_txs.map(|(slot, txs)| slot.send_bundle(&txs));
+            (
+                jito_send,
+                sender_send.map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| SenderSend::Refused("send panicked".to_string()))
+                }),
+            )
+        });
+
+        let jito_id = match jito_send {
+            Some(Ok(BundleSend::Accepted(id))) => Some(id),
+            Some(Ok(BundleSend::Rejected(reason))) => {
                 warn!(
-                    "LIQUIDATION_BUNDLE_UNAVAILABLE attempt_id={} liquidation_signature={} reason={}",
-                    attempt_id, liquidation_sig, reason
+                    "LIQUIDATION_BUNDLE_REJECTED attempt_id={attempt_id} liquidation_signature={liquidation_sig} reason={reason}"
                 );
-                Ok(BundleOutcome::Refused)
+                None
+            }
+            // Taken as not sent.
+            Some(Ok(BundleSend::Unavailable(reason))) => {
+                warn!(
+                    "LIQUIDATION_BUNDLE_UNAVAILABLE attempt_id={attempt_id} liquidation_signature={liquidation_sig} reason={reason}"
+                );
+                None
             }
             // Never sent: the bundle couldn't be encoded.
-            Err(e) => {
+            Some(Err(e)) => {
                 warn!(
-                    "LIQUIDATION_BUNDLE_SEND_ERROR attempt_id={} liquidation_signature={} error={}",
-                    attempt_id, liquidation_sig, e
+                    "LIQUIDATION_BUNDLE_SEND_ERROR attempt_id={attempt_id} liquidation_signature={liquidation_sig} error={e}"
                 );
-                Ok(BundleOutcome::Refused)
+                None
             }
+            None => None,
+        };
+        // A transaction only Sender's bundle has tells which copy landed.
+        let sender_tip = match (sender_send, &sender_txs) {
+            (Some(SenderSend::Accepted), Some((_, txs))) => txs
+                .iter()
+                .filter_map(|tx| tx.signatures.first().copied())
+                .find(|sig| !bundle.iter().any(|tx| tx.signatures.first() == Some(sig))),
+            (Some(SenderSend::Refused(reason)), _) => {
+                warn!(
+                    "LIQUIDATION_SENDER_REJECTED attempt_id={attempt_id} liquidation_signature={liquidation_sig} reason={reason}"
+                );
+                None
+            }
+            _ => None,
+        };
+        if jito_id.is_none() && sender_tip.is_none() {
+            return Ok(BundleOutcome::Refused);
         }
+        info!(
+            "LIQUIDATION_BUNDLE_ACCEPTED attempt_id={} bundle_id={} sender={} liquidation_signature={} txs_before_liquidation={}",
+            attempt_id,
+            jito_id.as_deref().unwrap_or("-"),
+            sender_tip.is_some(),
+            liquidation_sig,
+            bundle.len().saturating_sub(1)
+        );
+        let in_flight = InFlight {
+            // "0x0": already processed, so there's no bundle to ask about; the liquidation's
+            // signature settles it.
+            jito: jito_id
+                .as_deref()
+                .map(|id| (id != "0x0").then_some((&bundles.jito, id))),
+            sender_tip,
+        };
+        Ok(
+            match self.landed_before_expiry(attempt_id, &liquidation_sig, &blockhash, in_flight)? {
+                Some(slot) => BundleOutcome::Landed(slot),
+                None => BundleOutcome::NotLanded,
+            },
+        )
     }
 
     /// The slot `sig` lands at while its `blockhash` is valid, if it does. Until settled, the caller
-    /// keeps its claim and reports no failure, since the bundle may still land. A bundle the block
-    /// engine reports failed or unknown settles it early, as most lost auctions do.
+    /// keeps its claim and reports no failure, since the bundle may still land. It is lost early
+    /// once every bundle carrying it is: the block engine reports its copy failed or unknown, as
+    /// most lost auctions are, and Sender's had [`SENDER_LANDING_WINDOW`]. A liquidation the chain
+    /// shows processed is waited for until it confirms.
     fn landed_before_expiry(
         &self,
+        attempt_id: u64,
         sig: &Signature,
         blockhash: &Hash,
-        bundle: Option<(&JitoClient, &str)>,
+        in_flight: InFlight<'_>,
     ) -> Result<Option<u64>> {
         let started = Instant::now();
         let mut last_inflight_check = Instant::now();
-        let check_interval = match bundle {
-            Some((jito, _)) if jito.capacity() < 2 => INFLIGHT_CHECK_INTERVAL_UNAUTHENTICATED,
+        let check_interval = match in_flight.jito {
+            Some(Some((jito, _))) if jito.capacity() < 2 => INFLIGHT_CHECK_INTERVAL_UNAUTHENTICATED,
             _ => INFLIGHT_CHECK_INTERVAL,
         };
+        // The block engine's copy can't land: never sent, or reported failed.
+        let mut jito_lost = in_flight.jito.is_none();
+        let mut watched = vec![*sig];
+        watched.extend(in_flight.sender_tip);
         loop {
-            match self.landed_status(sig) {
-                Some(Ok(slot)) => {
-                    info!("Bundle landed late, confirmed via {sig}");
+            let (state, via_sender) = self.signature_states(&watched);
+            let processed = match state {
+                SignatureState::Confirmed(slot) => {
+                    let via = if via_sender { Path::Sender } else { Path::Jito };
+                    info!(
+                        "LIQUIDATION_BUNDLE_LANDED attempt_id={attempt_id} liquidation_signature={sig} slot={slot} via={via} elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
                     return Ok(Some(slot));
                 }
-                Some(Err(reverted)) => return Err(reverted),
-                None => {}
-            }
-            let dead = match bundle {
-                Some((jito, id)) if last_inflight_check.elapsed() >= check_interval => {
+                SignatureState::Reverted(reverted) => return Err(reverted),
+                SignatureState::Processed => true,
+                SignatureState::Unknown => false,
+            };
+            if let Some(Some((jito, id))) = in_flight.jito {
+                if !jito_lost && last_inflight_check.elapsed() >= check_interval {
                     last_inflight_check = Instant::now();
                     // Only in a spare slot: sends need them more.
-                    jito.try_reserve_spare().is_some_and(|slot| {
+                    jito_lost = jito.try_reserve_spare().is_some_and(|slot| {
                         slot.inflight_bundle_status(id)
                             .ok()
                             .flatten()
                             .is_some_and(InflightStatus::is_dead)
-                    })
+                    });
                 }
-                _ => false,
-            };
+            }
+            let sender_lost =
+                in_flight.sender_tip.is_none() || started.elapsed() >= SENDER_LANDING_WINDOW;
             let valid = self
                 .rpc_client
                 .is_blockhash_valid(blockhash, CommitmentConfig::processed())
                 .unwrap_or(true);
-            if dead || !valid || started.elapsed() > SEND_MAX_WAIT {
-                // It may have been processed in the blockhash's last slots.
-                return match self.landed_status(sig) {
-                    Some(Ok(slot)) => Ok(Some(slot)),
-                    Some(Err(reverted)) => Err(reverted),
-                    None => {
-                        if dead {
-                            warn!("The block engine gave up on the bundle with {sig}");
-                        } else {
-                            warn!("The bundle with {sig} expired without landing");
-                        }
-                        Ok(None)
+            let lost = (jito_lost && sender_lost) || !valid;
+            if (lost && !processed) || started.elapsed() > SEND_MAX_WAIT {
+                // It may have been processed in the meantime.
+                if let (SignatureState::Confirmed(slot), _) = self.signature_states(&watched) {
+                    return Ok(Some(slot));
+                }
+                warn!(
+                    "LIQUIDATION_BUNDLE_LOST attempt_id={attempt_id} liquidation_signature={sig} elapsed_ms={} reason={}",
+                    started.elapsed().as_millis(),
+                    if !valid {
+                        "blockhash expired"
+                    } else if started.elapsed() > SEND_MAX_WAIT {
+                        "timed out"
+                    } else {
+                        "every relay gave up"
                     }
-                };
+                );
+                return Ok(None);
             }
             thread::sleep(SIGNATURE_POLL_INTERVAL);
         }
+    }
+
+    /// The state of `sigs[0]`, and whether `sigs[1]`, when given, is on chain too.
+    fn signature_states(&self, sigs: &[Signature]) -> (SignatureState, bool) {
+        let Ok(statuses) = self.rpc_client.get_signature_statuses(sigs) else {
+            return (SignatureState::Unknown, false);
+        };
+        let mut statuses = statuses.value.into_iter();
+        let state = match statuses.next().flatten() {
+            None => SignatureState::Unknown,
+            Some(status) => match status.err {
+                Some(err) => {
+                    SignatureState::Reverted(anyhow!("{} reverted on-chain: {err:?}", sigs[0]))
+                }
+                None if status.satisfies_commitment(CommitmentConfig::confirmed()) => {
+                    SignatureState::Confirmed(status.slot)
+                }
+                None => SignatureState::Processed,
+            },
+        };
+        (state, statuses.next().flatten().is_some())
     }
 
     /// After a transaction over RPC (bundles off): clears the account's hold when it landed,

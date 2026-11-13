@@ -1,4 +1,5 @@
 pub mod healthcheck;
+pub mod helius_sender;
 pub mod hermes_stream;
 pub mod integration_account_fetcher;
 pub mod jito;
