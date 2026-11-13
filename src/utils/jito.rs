@@ -57,6 +57,23 @@ pub struct JitoClient {
     endpoint: String,
     api_key: Option<String>,
     slot: Mutex<SlotState>,
+    outage: Mutex<Outage>,
+}
+
+/// How long a request to the block engine may take before the bundle is taken as not sent.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The block engine is taken as down after this many failed requests within
+/// [`OUTAGE_WINDOW`], for [`OUTAGE_PAUSE`].
+const OUTAGE_FAILURES: usize = 3;
+const OUTAGE_WINDOW: Duration = Duration::from_secs(30);
+const OUTAGE_PAUSE: Duration = Duration::from_secs(30);
+
+/// Recent requests the block engine failed, and until when it is taken as down.
+#[derive(Default)]
+struct Outage {
+    failures: std::collections::VecDeque<Instant>,
+    down_until: Option<Instant>,
 }
 
 /// The requests the block engine admits per [`RATE_WINDOW`]: a slot counts from its reservation,
@@ -83,6 +100,13 @@ impl SlotState {
 
     fn is_full(&self) -> bool {
         self.held + self.sent.len() >= self.capacity
+    }
+
+    /// Whether more than half the window's requests are still free; with one request a window,
+    /// whether it is.
+    fn has_spare(&self) -> bool {
+        let used = self.held + self.sent.len();
+        self.capacity.saturating_sub(used) > self.capacity / 2
     }
 }
 
@@ -114,7 +138,10 @@ impl JitoSlot<'_> {
             .push_back(Instant::now());
     }
 
-    /// Submits a bundle in this slot. An `Err` is a request that may or may not have arrived.
+    /// Submits a bundle in this slot. An `Err` is a bundle that couldn't be encoded, never sent. A
+    /// request that failed or timed out is `Unavailable`: taken as not sent, though a timed-out one
+    /// may still have arrived and land; the bundle is atomic, so at worst a later plan counting the
+    /// same wallet tokens fails.
     pub fn send_bundle(self, txs: &[VersionedTransaction]) -> Result<BundleSend> {
         if txs.is_empty() {
             return Err(anyhow!("Cannot send an empty bundle"));
@@ -127,12 +154,39 @@ impl JitoSlot<'_> {
             "params": [encoded, { "encoding": "base64" }],
         });
         self.mark_sent();
-        let resp = self.jito.http.post(self.jito.url()).json(&body).send()?;
-        // Over the rate limit: refused before the auction, so it can't land.
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let resp = match self.jito.http.post(self.jito.url()).json(&body).send() {
+            Ok(resp) => resp,
+            // Unreachable, no answer in time, or the connection dropped: taken as not sent.
+            Err(e) => {
+                self.jito.note_unavailable();
+                return Ok(BundleSend::Unavailable(e.to_string()));
+            }
+        };
+        // Our own rate limit: refused before the auction, so nothing waits for it.
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Ok(BundleSend::Rejected("rate limited (HTTP 429)".to_string()));
         }
-        let resp: Value = resp.json()?;
+        // The block engine failing, as opposed to refusing this bundle: taken as not sent.
+        if status.is_server_error()
+            || status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::NOT_FOUND
+        {
+            self.jito.note_unavailable();
+            return Ok(BundleSend::Unavailable(format!("HTTP {status}")));
+        }
+        // Anything else carries the block engine's JSON-RPC answer, an error included (HTTP 400):
+        // an invalid bundle, or one already processed, which means it landed.
+        // Not the block engine's JSON-RPC (a proxy's page, a wrong endpoint): as good as down.
+        let resp: Value = match resp.json() {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.jito.note_unavailable();
+                return Ok(BundleSend::Unavailable(format!("unreadable answer: {e}")));
+            }
+        };
+        self.jito.note_reachable();
         Ok(match parse_send_bundle_result(&resp) {
             Ok(id) => BundleSend::Accepted(id),
             Err(e) => BundleSend::Rejected(e.to_string()),
@@ -176,15 +230,55 @@ impl JitoClient {
             }
         );
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             endpoint: endpoint.unwrap_or_else(|| DEFAULT_BUNDLE_ENDPOINT.to_string()),
             api_key,
+            outage: Mutex::new(Outage::default()),
             slot: Mutex::new(SlotState {
                 capacity,
                 sent: std::collections::VecDeque::with_capacity(capacity),
                 held: 0,
             }),
         }
+    }
+
+    /// Whether the block engine is taken as down: several requests failed lately.
+    pub fn is_down(&self) -> bool {
+        let outage = self.outage.lock().unwrap_or_else(|e| e.into_inner());
+        outage
+            .down_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn note_unavailable(&self) {
+        let now = Instant::now();
+        let mut outage = self.outage.lock().unwrap_or_else(|e| e.into_inner());
+        outage.failures.push_back(now);
+        while outage
+            .failures
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) > OUTAGE_WINDOW)
+        {
+            outage.failures.pop_front();
+        }
+        if outage.failures.len() >= OUTAGE_FAILURES {
+            outage.failures.clear();
+            outage.down_until = Some(now + OUTAGE_PAUSE);
+            warn!(
+                "Jito: the block engine failed {OUTAGE_FAILURES} requests in {}s; taken as down for {}s, liquidations that need no push go over RPC",
+                OUTAGE_WINDOW.as_secs(),
+                OUTAGE_PAUSE.as_secs()
+            );
+        }
+    }
+
+    fn note_reachable(&self) {
+        let mut outage = self.outage.lock().unwrap_or_else(|e| e.into_inner());
+        outage.failures.clear();
+        outage.down_until = None;
     }
 
     /// A request slot, if one is free now, without waiting: a liquidation that finds none goes
@@ -194,6 +288,23 @@ impl JitoClient {
         let mut state = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         state.prune(Instant::now());
         if state.is_full() {
+            return None;
+        }
+        state.held += 1;
+        Some(JitoSlot { jito: self })
+    }
+
+    /// Requests admitted per window.
+    pub fn capacity(&self) -> usize {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).capacity
+    }
+
+    /// A request slot only while more than half the window's are free, for a request that can
+    /// wait (a status check), so sends always keep the other half.
+    pub fn try_reserve_spare(&self) -> Option<JitoSlot<'_>> {
+        let mut state = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        state.prune(Instant::now());
+        if !state.has_spare() {
             return None;
         }
         state.held += 1;
@@ -246,6 +357,9 @@ pub enum BundleSend {
     Accepted(String),
     /// Refused, such as over the rate limit: it will never land.
     Rejected(String),
+    /// The block engine couldn't be reached or answered with an error: the bundle is taken as not
+    /// sent, and repeated, as the block engine being down.
+    Unavailable(String),
 }
 
 /// Serialize each transaction with bincode and base64-encode it for the bundle payload.
@@ -355,10 +469,16 @@ impl TipEstimator {
         }
     }
 
-    /// The tip for a bundle expected to earn `profit_lamports`.
-    pub fn tip_for(&self, profit_lamports: u64) -> u64 {
+    /// The tip for a bundle expected to earn `profit_lamports`, moved by `jitter` lamports (up, or
+    /// down when that would pass the cap) so two bundles never send the same tip transaction.
+    pub fn tip_for(&self, profit_lamports: u64, jitter: u64) -> u64 {
         let floor = *self.floor.lock().unwrap_or_else(|e| e.into_inner());
-        tip(profit_lamports, self.profit_share, floor, self.max_lamports)
+        let tip = tip(profit_lamports, self.profit_share, floor, self.max_lamports);
+        if tip.saturating_add(jitter) <= self.max_lamports {
+            tip + jitter
+        } else {
+            tip.saturating_sub(jitter)
+        }
     }
 
     /// The tip transfer, the bundle's last transaction. It can't go inside the liquidation:
@@ -459,6 +579,19 @@ mod tests {
             jito.try_reserve().is_none(),
             "used: the next one is a second away"
         );
+    }
+
+    #[test]
+    fn status_checks_leave_sends_half_the_window() {
+        let jito = JitoClient::new(None, Some("uuid".to_string()));
+        let half = AUTHENTICATED_REQUESTS / 2;
+        let sends: Vec<_> = (0..half - 1)
+            .map(|_| jito.try_reserve().expect("within the limit"))
+            .collect();
+        let check = jito.try_reserve_spare().expect("more than half free");
+        assert!(jito.try_reserve_spare().is_none(), "only half left");
+        assert!(jito.try_reserve().is_some(), "sends still get one");
+        drop((sends, check));
     }
 
     #[test]

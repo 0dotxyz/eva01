@@ -6,7 +6,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Condvar, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Condvar, Mutex, MutexGuard,
+    },
     time::{Duration, Instant},
 };
 
@@ -16,6 +19,15 @@ use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 
 /// How long a waiting worker sleeps before re-checking cooldowns and the stop flag.
 const WORKER_WAIT: Duration = Duration::from_millis(250);
+
+/// Lost races in a row, with the account unchanged between them, that an account retries at once;
+/// from the next one on it cools down, so a bundle that fails unseen every time (one behind a push
+/// isn't simulated) can't be resent every cycle. A race lost to another liquidation changes the
+/// account and starts the count over.
+const FREE_RETRIES: u32 = 2;
+
+/// Lost races further apart than this aren't in a row.
+const LOST_RACE_WINDOW: Duration = Duration::from_secs(30);
 
 pub struct QueuedIntent {
     pub intent: PreparedLiquidatableAccount,
@@ -27,6 +39,11 @@ pub struct ExecutionQueue {
     ready: Condvar,
     /// How long an account is left alone after an attempt on it.
     cooldown: Duration,
+    /// The newest slot Geyser delivered each account at.
+    seen: Mutex<HashMap<Pubkey, u64>>,
+    /// How many accounts wait for their state after a landing, so an update takes the state lock
+    /// only when one may.
+    awaiting_count: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -34,6 +51,11 @@ struct State {
     pending: HashMap<Pubkey, QueuedIntent>,
     in_flight: HashSet<Pubkey>,
     cooldowns: HashMap<Pubkey, Instant>,
+    /// Accounts cooling down after a landing, until Geyser delivers them at the slot it landed at.
+    awaiting: HashMap<Pubkey, u64>,
+    /// Lost races in a row per account, when the last was, and the slot Geyser had delivered the
+    /// account at then.
+    lost_races: HashMap<Pubkey, (u32, Instant, Option<u64>)>,
     stopped: bool,
 }
 
@@ -43,6 +65,8 @@ impl ExecutionQueue {
             state: Mutex::new(State::default()),
             ready: Condvar::new(),
             cooldown,
+            seen: Mutex::new(HashMap::new()),
+            awaiting_count: AtomicUsize::new(0),
         }
     }
 
@@ -75,7 +99,11 @@ impl ExecutionQueue {
             if state.stopped {
                 return None;
             }
-            if let Some(queued) = state.take_ready(Instant::now()) {
+            let ready = state.take_ready(Instant::now());
+            // Expired cooldowns no longer wait for their state.
+            self.awaiting_count
+                .store(state.awaiting.len(), Ordering::SeqCst);
+            if let Some(queued) = ready {
                 return Some(queued);
             }
             state = self
@@ -86,15 +114,101 @@ impl ExecutionQueue {
         }
     }
 
-    /// Marks the attempt on `address` finished; it may be taken again after the cooldown.
-    pub fn release(&self, address: Pubkey) {
+    /// Marks the attempt on `address` finished; it may be taken again after the cooldown, or at
+    /// once without one (`cool_down` false).
+    pub fn release(&self, address: Pubkey, cool_down: bool) {
         let mut state = self.lock();
         state.in_flight.remove(&address);
+        if cool_down {
+            state
+                .cooldowns
+                .insert(address, Instant::now() + self.cooldown);
+        }
+        drop(state);
+        self.ready.notify_all();
+    }
+
+    /// After an attempt that landed at `slot`: the account may be taken again once Geyser has
+    /// delivered it at that slot, which the next attempt is sized on, or after the cooldown at the
+    /// latest.
+    pub fn release_after_landing(&self, address: Pubkey, slot: u64) {
+        let mut state = self.lock();
+        state.in_flight.remove(&address);
+        state.lost_races.remove(&address);
+        // Waiting before `seen` is read: an update recorded after that read sees the count and
+        // frees the account itself.
         state
             .cooldowns
             .insert(address, Instant::now() + self.cooldown);
+        state.awaiting.insert(address, slot);
+        self.awaiting_count
+            .store(state.awaiting.len(), Ordering::SeqCst);
+        let seen = self
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&address)
+            .copied();
+        if seen.is_some_and(|seen| seen >= slot) {
+            state.awaiting.remove(&address);
+            state.cooldowns.remove(&address);
+            self.awaiting_count
+                .store(state.awaiting.len(), Ordering::SeqCst);
+        }
         drop(state);
         self.ready.notify_all();
+    }
+
+    /// After an attempt that lost a race: the account may be taken again at once, unless it lost
+    /// more than [`FREE_RETRIES`] in a row, when it cools down.
+    pub fn release_after_lost_race(&self, address: Pubkey) {
+        let now = Instant::now();
+        let seen = self
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&address)
+            .copied();
+        let cool_down = {
+            let mut state = self.lock();
+            state
+                .lost_races
+                .retain(|_, (_, last, _)| now.saturating_duration_since(*last) < LOST_RACE_WINDOW);
+            let (count, last, at) = state.lost_races.entry(address).or_insert((0, now, seen));
+            if *at != seen {
+                *count = 0;
+            }
+            *count += 1;
+            *last = now;
+            *at = seen;
+            *count > FREE_RETRIES
+        };
+        self.release(address, cool_down);
+    }
+
+    /// Geyser delivered `address` at `slot`: an account waiting for that state is free to go.
+    pub fn account_updated(&self, address: Pubkey, slot: u64) {
+        {
+            let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+            let newest = seen.entry(address).or_insert(slot);
+            *newest = (*newest).max(slot);
+        }
+        if self.awaiting_count.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let mut state = self.lock();
+        if state
+            .awaiting
+            .get(&address)
+            .is_some_and(|landed| slot >= *landed)
+        {
+            state.awaiting.remove(&address);
+            state.cooldowns.remove(&address);
+            self.awaiting_count
+                .store(state.awaiting.len(), Ordering::SeqCst);
+            drop(state);
+            self.ready.notify_all();
+        }
     }
 
     pub fn stop(&self) {
@@ -107,6 +221,9 @@ impl State {
     /// The most profitable intent not being worked or cooling down, now marked in flight.
     fn take_ready(&mut self, now: Instant) -> Option<QueuedIntent> {
         self.cooldowns.retain(|_, until| *until > now);
+        let cooldowns = &self.cooldowns;
+        self.awaiting
+            .retain(|address, _| cooldowns.contains_key(address));
         let address = self
             .pending
             .iter()
@@ -129,6 +246,7 @@ mod tests {
 
     fn intent(address: Pubkey, profit: i32) -> PreparedLiquidatableAccount {
         PreparedLiquidatableAccount {
+            attempt_id: 0,
             liquidatee_account: MarginfiAccountWrapper::new(address, bytemuck::Zeroable::zeroed()),
             observation_accounts: ObservationAccounts {
                 observation_accounts: vec![],
@@ -141,7 +259,9 @@ mod tests {
             asset_amount: I80F48::ONE,
             liab_amount: I80F48::ONE,
             profit: I80F48::from_num(profit),
-            push_oracles: Vec::new(),
+            estimated_repay_usd: profit as f64,
+            binding_cap: "test",
+            push: None,
             without_push: None,
             sandwich_pair: None,
         }
@@ -202,17 +322,17 @@ mod tests {
         queue.offer(&[a], vec![intent(a, 2)]);
         assert!(take_now(&queue).is_none());
 
-        queue.release(a);
+        queue.release(a, false);
         assert_eq!(take_now(&queue), Some((a, I80F48::from_num(2))));
     }
 
     #[test]
-    fn an_account_cools_down_after_an_attempt() {
+    fn an_account_cools_down_unless_its_attempt_lost_a_race() {
         let queue = ExecutionQueue::new(Duration::from_secs(3));
         let a = Pubkey::new_unique();
         queue.offer(&[a], vec![intent(a, 1)]);
         assert!(take_now(&queue).is_some());
-        queue.release(a);
+        queue.release(a, true);
         queue.offer(&[a], vec![intent(a, 1)]);
 
         let now = Instant::now();
@@ -221,6 +341,67 @@ mod tests {
             .lock()
             .take_ready(now + Duration::from_secs(4))
             .is_some());
+
+        // A lost race changed nothing: it may go again at once.
+        queue.release(a, false);
+        queue.offer(&[a], vec![intent(a, 1)]);
+        assert!(queue.lock().take_ready(Instant::now()).is_some());
+    }
+
+    #[test]
+    fn after_a_landing_an_account_goes_once_geyser_delivers_its_state() {
+        let queue = ExecutionQueue::new(Duration::from_secs(3));
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        for address in [a, b] {
+            queue.offer(&[address], vec![intent(address, 1)]);
+            assert!(take_now(&queue).is_some());
+        }
+
+        // Landed at slot 10; an older update changes nothing, the landing's own frees it.
+        queue.release_after_landing(a, 10);
+        queue.offer(&[a], vec![intent(a, 1)]);
+        queue.account_updated(a, 9);
+        assert!(queue.lock().take_ready(Instant::now()).is_none());
+        queue.account_updated(a, 10);
+        assert!(queue.lock().take_ready(Instant::now()).is_some());
+
+        // Its state already delivered when the attempt ends: no wait at all.
+        queue.account_updated(b, 20);
+        queue.release_after_landing(b, 20);
+        queue.offer(&[b], vec![intent(b, 1)]);
+        assert!(queue.lock().take_ready(Instant::now()).is_some());
+    }
+
+    #[test]
+    fn only_a_few_lost_races_in_a_row_retry_at_once() {
+        let queue = ExecutionQueue::new(Duration::from_secs(3));
+        let a = Pubkey::new_unique();
+        let attempt = || {
+            queue.offer(&[a], vec![intent(a, 1)]);
+            take_now(&queue).is_some()
+        };
+        assert!(attempt());
+        for _ in 0..FREE_RETRIES {
+            queue.release_after_lost_race(a);
+            assert!(attempt(), "retried at once");
+        }
+        queue.release_after_lost_race(a);
+        assert!(!attempt(), "cooling down");
+
+        // Lost to a liquidation that changed the account: retried at once.
+        queue.lock().cooldowns.clear();
+        assert!(attempt());
+        queue.account_updated(a, 5);
+        queue.release_after_lost_race(a);
+        assert!(attempt());
+
+        // A landing starts the count over (its state, at slot 5, is already delivered).
+        queue.release_after_landing(a, 5);
+        assert!(attempt());
+        for _ in 0..FREE_RETRIES {
+            queue.release_after_lost_race(a);
+            assert!(attempt(), "retried at once");
+        }
     }
 
     #[test]

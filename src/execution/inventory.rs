@@ -48,6 +48,27 @@ impl std::fmt::Display for SimulationRejected {
 
 impl std::error::Error for SimulationRejected {}
 
+/// The wallet holds the debt's token, but liquidations in flight have claimed all of it: free
+/// again once they settle, in seconds.
+#[derive(Debug)]
+pub struct WalletClaimed(String);
+
+impl std::fmt::Display for WalletClaimed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for WalletClaimed {}
+
+/// Whether the swap venues' answer was that no route pays or fits ("No route pays …", "No route
+/// fits …"), rather than a failure to answer. A venue that failed while the others answered short
+/// looks the same, so the executor holds long only once a retry finds no route again.
+fn is_no_route(e: &anyhow::Error) -> bool {
+    let outermost = e.to_string();
+    outermost.starts_with("No route pays") || outermost.starts_with("No route fits")
+}
+
 /// The share of a `repay_units` repay that `held` free wallet tokens cover, at most 1, or `None`
 /// when they cover nothing.
 fn wallet_share(repay_units: u64, held: u64) -> Option<I80F48> {
@@ -155,13 +176,14 @@ impl InventoryStrategy {
             intent.asset_amount,
             intent.liab_amount,
             None,
+            landing.refreshes_in_tx(),
         )?;
         let transaction_accounts: Vec<Pubkey> =
             locked_accounts(&self.liquidator_account.signer.pubkey(), &liquidation_ixs)
                 .into_iter()
                 .collect();
         // A v0 transaction also loads the compute-budget program; a v1 header carries the budget.
-        let budget_program = usize::from(landing == Landing::Bundle);
+        let budget_program = usize::from(landing.is_bundle());
         let max_accounts =
             MAX_TX_ACCOUNT_LOCKS.saturating_sub(transaction_accounts.len() + budget_program);
 
@@ -231,11 +253,13 @@ impl InventoryStrategy {
             self.reservations
                 .claim_available(&mut claim, liab_mint, repay_units, wallet_balance);
         let Some(share) = wallet_share(repay_units, held) else {
-            return Err(anyhow!(
-                "the wallet holds no free {} to repay with ({} held, all claimed)",
-                liab_mint,
-                wallet_balance
-            ));
+            if wallet_balance == 0 {
+                return Err(anyhow!("the wallet holds no {liab_mint} to repay with"));
+            }
+            return Err(WalletClaimed(format!(
+                "the wallet holds no free {liab_mint} to repay with ({wallet_balance} held, all claimed)"
+            ))
+            .into());
         };
 
         let (asset_amount, repay_amount) = if share < I80F48::ONE {
@@ -308,7 +332,9 @@ impl LiquidationStrategy for InventoryStrategy {
                 if e.downcast_ref::<SimulationRejected>().is_some() {
                     Ok(Sandwich::Rejected)
                 } else {
-                    Ok(Sandwich::Unavailable)
+                    Ok(Sandwich::Unavailable {
+                        no_route: is_no_route(&e),
+                    })
                 }
             }
         }
@@ -319,6 +345,13 @@ impl LiquidationStrategy for InventoryStrategy {
             .value_wrapper(&spl_token::native_mint::ID)?
             .get_amount_from_value(usd)?
             .to_num())
+    }
+
+    fn refresh_ixs(
+        &self,
+        intent: &PreparedLiquidatableAccount,
+    ) -> Result<Vec<solana_instruction::Instruction>> {
+        self.liquidator_account.refresh_ixs(intent)
     }
 
     fn assemble_with_inventory(
@@ -335,6 +368,22 @@ impl LiquidationStrategy for InventoryStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_venue_answer_of_no_route_counts_as_no_route() {
+        assert!(is_no_route(&anyhow!(
+            "No route pays 1430810 Es9 for at most 13734804 J1to"
+        )));
+        assert!(is_no_route(&anyhow!(
+            "No route fits (Titan: adds 54 accounts)"
+        )));
+        // Every venue failed, one of them saying its route doesn't fit: not an answer.
+        assert!(!is_no_route(&anyhow!(
+            "No aggregator returned a quote (Titan: No route fits (adds 54); Jupiter: HTTP 429)"
+        )));
+        assert!(!is_no_route(&anyhow!("Titan quote timed out")));
+        assert!(!is_no_route(&anyhow!("HTTP 429 Too Many Requests")));
+    }
     use fixed_macro::types::I80F48;
 
     #[test]

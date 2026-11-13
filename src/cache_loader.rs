@@ -26,6 +26,22 @@ use crate::{
     wrappers::marginfi_account::MarginfiAccountWrapper,
 };
 use anyhow::{anyhow, Result};
+
+/// FeeState's `liquidation_max_fee`, read from the chain.
+pub fn read_liquidation_max_fee(
+    rpc_client: &RpcClient,
+    fee_state_key: &Pubkey,
+) -> Result<fixed::types::I80F48> {
+    let fee_state_account = rpc_client.get_account(fee_state_key)?;
+    let fee_state = bytemuck::try_from_bytes::<FeeState>(
+        fee_state_account
+            .data
+            .get(8..8 + std::mem::size_of::<FeeState>())
+            .ok_or_else(|| anyhow!("FeeState account is too short"))?,
+    )
+    .map_err(|e| anyhow!("Failed to decode FeeState: {:?}", e))?;
+    Ok(fee_state.liquidation_max_fee.into())
+}
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 const BANK_GROUP_PK_OFFSET: usize = 32 + 1 + 8;
@@ -66,19 +82,9 @@ impl CacheLoader {
         cache.global_fee_wallet = marginfi_group.fee_state_cache.global_fee_wallet;
         cache.marginfi_group = *marginfi_group;
 
-        let fee_state_account = self.rpc_client.get_account(&cache.global_fee_state_key)?;
-        let fee_state = bytemuck::try_from_bytes::<FeeState>(
-            fee_state_account
-                .data
-                .get(8..8 + std::mem::size_of::<FeeState>())
-                .ok_or_else(|| anyhow!("FeeState account is too short"))?,
-        )
-        .map_err(|e| anyhow!("Failed to decode FeeState: {:?}", e))?;
-        cache.liquidation_max_fee = fee_state.liquidation_max_fee.into();
-        info!(
-            "Liquidation max fee (FeeState): {}",
-            cache.liquidation_max_fee
-        );
+        let fee = read_liquidation_max_fee(&self.rpc_client, &cache.global_fee_state_key)?;
+        cache.set_liquidation_max_fee(fee);
+        info!("Liquidation max fee (FeeState): {}", fee);
 
         self.load_luts(cache)?;
         self.load_marginfi_accounts(cache)?;

@@ -12,8 +12,8 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use anchor_lang::AccountDeserialize;
-use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
+use anchor_lang::{AccountDeserialize, AccountSerialize};
+use pyth_solana_receiver_sdk::price_update::{PriceFeedMessage, PriceUpdateV2};
 use pythnet_sdk::wire::v1::MerklePriceUpdate;
 use solana_account::Account;
 use solana_pubkey::Pubkey;
@@ -26,13 +26,71 @@ pub fn price_update(account: &Account) -> Option<PriceUpdateV2> {
     PriceUpdateV2::try_deserialize(&mut account.data.as_slice()).ok()
 }
 
-/// A feed's price as Hermes signed it: the VAA carrying the merkle root, and the feed's update
-/// proven against it. Feeds published in the same Pythnet slot share one VAA.
+/// A feed's price as Hermes signed it: the VAA carrying the merkle root, the feed's update proven
+/// against it, and the price message it carries. Feeds published in the same Pythnet slot share
+/// one VAA.
 #[derive(Clone)]
 pub struct SignedUpdate {
-    pub publish_time: i64,
+    pub message: PriceFeedMessage,
     pub vaa: Arc<Vec<u8>>,
     pub update: MerklePriceUpdate,
+}
+
+impl SignedUpdate {
+    pub fn publish_time(&self) -> i64 {
+        self.message.publish_time
+    }
+}
+
+/// What one push posts: one VAA and, per oracle, the feed's update under it. A liquidation behind
+/// the push is sized on exactly these prices.
+#[derive(Clone)]
+pub struct PushedPrices {
+    pub vaa: Arc<Vec<u8>>,
+    /// The oracles pushed and their updates, in push order.
+    pub feeds: Vec<(Pubkey, SignedUpdate)>,
+}
+
+impl PushedPrices {
+    /// The account the program reads at `oracle` once the push is posted: `cached` carrying the
+    /// pushed price message. `None` when `oracle` isn't pushed.
+    pub fn account(&self, oracle: &Pubkey, cached: &Account) -> Option<Account> {
+        let (_, signed) = self.feeds.iter().find(|(pushed, _)| pushed == oracle)?;
+        let mut update = price_update(cached)?;
+        update.price_message = signed.message;
+        let mut data = Vec::with_capacity(cached.data.len());
+        update.try_serialize(&mut data).ok()?;
+        data.resize(cached.data.len(), 0);
+        Some(Account {
+            data,
+            ..cached.clone()
+        })
+    }
+}
+
+/// The prices an account is valued on.
+#[derive(Clone, Copy)]
+pub enum Pricing<'a> {
+    /// The newest eva knows: Hermes's, for the feeds it streams.
+    Newest,
+    /// The program's as the chain stands: every Pyth feed eva prices ahead of it at its price.
+    Chain,
+    /// The program's once this push is posted; every other feed at the chain's price.
+    Pushed(&'a PushedPrices),
+}
+
+impl Pricing<'_> {
+    /// `cached`, eva's account for `oracle`, as this pricing reads it.
+    pub fn account(&self, prices: &PythPrices, oracle: &Pubkey, cached: Account) -> Account {
+        match self {
+            Self::Newest => cached,
+            Self::Pushed(push) => match push.account(oracle, &cached) {
+                Some(pushed) => pushed,
+                None => prices.onchain_if_behind(oracle, &cached).unwrap_or(cached),
+            },
+            Self::Chain => prices.onchain_if_behind(oracle, &cached).unwrap_or(cached),
+        }
+    }
 }
 
 /// Signed updates kept per feed: about 10 s, at one Hermes event a second. An event carries only
@@ -90,10 +148,10 @@ impl PythPrices {
     pub fn record_signed(&self, feed_id: [u8; 32], signed: SignedUpdate) {
         let mut all = self.signed.write().unwrap_or_else(|e| e.into_inner());
         let history = all.entry(feed_id).or_default();
-        let at = history.partition_point(|known| known.publish_time < signed.publish_time);
+        let at = history.partition_point(|known| known.publish_time() < signed.publish_time());
         if history
             .get(at)
-            .is_some_and(|known| known.publish_time == signed.publish_time)
+            .is_some_and(|known| known.publish_time() == signed.publish_time())
         {
             return;
         }
@@ -103,6 +161,29 @@ impl PythPrices {
         }
     }
 
+    /// The push of `feeds` (each an oracle and its feed id) at the newest prices one VAA carries for
+    /// all of them, each still ahead of the chain. `None` when no VAA covers them all.
+    pub fn push_of(&self, feeds: &[(Pubkey, [u8; 32])]) -> Option<PushedPrices> {
+        let ids: Vec<[u8; 32]> = feeds.iter().map(|(_, feed_id)| *feed_id).collect();
+        let (vaa, updates) = self.signed_together(&ids, |feed_id, publish_time| {
+            feeds
+                .iter()
+                .find(|(_, id)| id == feed_id)
+                .is_some_and(|(oracle, _)| {
+                    self.onchain(oracle)
+                        .is_none_or(|chain| publish_time > chain)
+                })
+        })?;
+        Some(PushedPrices {
+            vaa,
+            feeds: feeds
+                .iter()
+                .map(|(oracle, _)| *oracle)
+                .zip(updates)
+                .collect(),
+        })
+    }
+
     /// The newest VAA under which every feed in `feed_ids` has an update `ahead` accepts (given the
     /// feed and the update's publish time), with those updates in order. A push carries one VAA.
     /// `None` when no VAA covers them all.
@@ -110,26 +191,27 @@ impl PythPrices {
         &self,
         feed_ids: &[[u8; 32]],
         ahead: impl Fn(&[u8; 32], i64) -> bool,
-    ) -> Option<(Arc<Vec<u8>>, Vec<MerklePriceUpdate>)> {
+    ) -> Option<(Arc<Vec<u8>>, Vec<SignedUpdate>)> {
         let all = self.signed.read().unwrap_or_else(|e| e.into_inner());
         let (first, rest) = feed_ids.split_first()?;
         let candidates = all
             .get(first)?
             .iter()
             .rev()
-            .filter(|signed| ahead(first, signed.publish_time));
+            .filter(|signed| ahead(first, signed.publish_time()));
         'vaa: for candidate in candidates {
             let mut updates = Vec::with_capacity(feed_ids.len());
-            updates.push(candidate.update.clone());
+            updates.push(candidate.clone());
             for feed_id in rest {
                 let Some(signed) = all.get(feed_id).and_then(|history| {
                     history.iter().rev().find(|signed| {
-                        same_vaa(&signed.vaa, &candidate.vaa) && ahead(feed_id, signed.publish_time)
+                        same_vaa(&signed.vaa, &candidate.vaa)
+                            && ahead(feed_id, signed.publish_time())
                     })
                 }) else {
                     continue 'vaa;
                 };
-                updates.push(signed.update.clone());
+                updates.push(signed.clone());
             }
             return Some((Arc::clone(&candidate.vaa), updates));
         }
@@ -208,9 +290,22 @@ mod tests {
             .is_none());
     }
 
+    fn message(publish_time: i64, price: i64) -> PriceFeedMessage {
+        PriceFeedMessage {
+            feed_id: [0u8; 32],
+            price,
+            conf: 1,
+            exponent: -8,
+            publish_time,
+            prev_publish_time: publish_time - 1,
+            ema_price: price,
+            ema_conf: 1,
+        }
+    }
+
     fn signed(publish_time: i64, vaa: &Arc<Vec<u8>>, tag: u8) -> SignedUpdate {
         SignedUpdate {
-            publish_time,
+            message: message(publish_time, i64::from(tag)),
             vaa: Arc::clone(vaa),
             update: MerklePriceUpdate {
                 message: vec![tag].into(),
@@ -223,8 +318,11 @@ mod tests {
         true
     }
 
-    fn tags(updates: &[MerklePriceUpdate]) -> Vec<u8> {
-        updates.iter().map(|u| u.message.as_ref()[0]).collect()
+    fn tags(updates: &[SignedUpdate]) -> Vec<u8> {
+        updates
+            .iter()
+            .map(|u| u.update.message.as_ref()[0])
+            .collect()
     }
 
     #[test]
@@ -268,6 +366,41 @@ mod tests {
     }
 
     #[test]
+    fn a_push_carries_and_prices_exactly_the_updates_under_one_vaa() {
+        let prices = PythPrices::default();
+        let (sol, thin) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let (sol_id, thin_id) = ([1u8; 32], [2u8; 32]);
+        let (k, k1) = (Arc::new(vec![1u8; 3]), Arc::new(vec![2u8; 3]));
+        prices.record_onchain(sol, &test_price_update_account(sol_id, 99, 1));
+        prices.record_onchain(thin, &test_price_update_account(thin_id, 99, 1));
+        prices.record_signed(sol_id, signed(100, &k, 10));
+        prices.record_signed(thin_id, signed(100, &k, 20));
+        prices.record_signed(sol_id, signed(101, &k1, 11));
+
+        let push = prices.push_of(&[(sol, sol_id), (thin, thin_id)]).unwrap();
+        assert_eq!(push.vaa.as_slice(), k.as_slice());
+        let oracles: Vec<Pubkey> = push.feeds.iter().map(|(oracle, _)| *oracle).collect();
+        assert_eq!(oracles, vec![sol, thin]);
+        // SOL is read at its price under that VAA, not at its newest.
+        let cached = test_price_update_account(sol_id, 101, 11);
+        let read = |pricing: Pricing| {
+            price_update(&pricing.account(&prices, &sol, cached.clone()))
+                .unwrap()
+                .price_message
+        };
+        let pushed = read(Pricing::Pushed(&push));
+        assert_eq!((pushed.price, pushed.publish_time), (10, 100));
+        assert_eq!(read(Pricing::Newest).price, 11);
+        assert_eq!(read(Pricing::Chain).price, 1);
+
+        // An update the chain already holds isn't pushed.
+        prices.record_onchain(thin, &test_price_update_account(thin_id, 100, 20));
+        assert!(prices.push_of(&[(sol, sol_id), (thin, thin_id)]).is_none());
+        let alone = prices.push_of(&[(sol, sol_id)]).unwrap();
+        assert_eq!(alone.vaa.as_slice(), k1.as_slice());
+    }
+
+    #[test]
     fn only_the_last_signed_updates_are_kept() {
         let prices = PythPrices::default();
         let feed = [1u8; 32];
@@ -276,6 +409,6 @@ mod tests {
         }
         let history = &prices.signed.read().unwrap()[&feed];
         assert_eq!(history.len(), SIGNED_HISTORY);
-        assert_eq!(history.front().unwrap().publish_time, 3);
+        assert_eq!(history.front().unwrap().publish_time(), 3);
     }
 }

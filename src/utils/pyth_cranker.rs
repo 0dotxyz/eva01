@@ -477,13 +477,29 @@ pub(crate) fn close_encoded_vaa_ix(
 }
 
 /// The Pyth-sponsored push feed account for `feed_id`. marginfi no longer sponsors a shard of its
-/// own, so shard 0 is the only one banks point at.
+/// own, so shard 0 is the only one banks point at. Derived once per feed and remembered: the
+/// evaluation asks for it on every account near the threshold.
 pub(crate) fn price_feed_address(feed_id: &[u8; 32]) -> Pubkey {
-    Pubkey::find_program_address(
+    static ADDRESSES: std::sync::OnceLock<std::sync::RwLock<HashMap<[u8; 32], Pubkey>>> =
+        std::sync::OnceLock::new();
+    let addresses = ADDRESSES.get_or_init(Default::default);
+    if let Some(address) = addresses
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(feed_id)
+    {
+        return *address;
+    }
+    let address = Pubkey::find_program_address(
         &[&PYTH_SPONSORED_SHARD_ID.to_le_bytes(), feed_id],
         &PYTH_PUSH_ORACLE_ID,
     )
-    .0
+    .0;
+    addresses
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(*feed_id, address);
+    address
 }
 
 /// Guardian set that signed the VAA: bytes 1..5 of the header, big-endian.

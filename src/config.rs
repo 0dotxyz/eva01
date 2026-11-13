@@ -54,8 +54,8 @@ pub struct Eva01Config {
     pub jito_tip_max_lamports: u64,
     /// The share of a bundle's expected profit tipped (`BUNDLE_TIP_PROFIT_SHARE`).
     pub bundle_tip_profit_share: f64,
-    /// The share of a liquidation's full profit a wallet-funded plan must earn to go first, ahead
-    /// of the plans that quote a swap (`LIQUIDATION_WALLET_MIN_PROFIT_SHARE`).
+    /// The share of its pair's full profit a wallet-funded plan must earn more than to go first,
+    /// ahead of the sandwich (`LIQUIDATION_WALLET_MIN_PROFIT_SHARE`).
     pub wallet_min_profit_share: f64,
     /// API key/uuid for `sendBundle`; `None` for the public (unauthenticated) path.
     pub bundle_api_key: Option<String>,
@@ -157,7 +157,9 @@ impl Eva01Config {
             .expect("Invalid JITO_TIP_MAX_LAMPORTS number");
         let bundle_tip_profit_share = share_from_env("BUNDLE_TIP_PROFIT_SHARE", 0.08);
         let wallet_min_profit_share = share_from_env("LIQUIDATION_WALLET_MIN_PROFIT_SHARE", 0.1);
-        let bundle_api_key = std::env::var("JITO_API_KEY").ok();
+        let bundle_api_key = std::env::var("JITO_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty());
 
         Ok(Eva01Config {
             rpc_url,

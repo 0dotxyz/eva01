@@ -51,7 +51,8 @@ pub struct Cache {
     pub luts: Arc<LutRegistry>,
     pub global_fee_state_key: Pubkey,
     pub global_fee_wallet: Pubkey,
-    pub liquidation_max_fee: I80F48,
+    /// FeeState's `liquidation_max_fee`, re-read in the background: the admin can change it.
+    liquidation_max_fee: std::sync::RwLock<I80F48>,
 }
 
 #[derive(Clone)]
@@ -85,8 +86,24 @@ impl Cache {
             luts: Arc::new(LutRegistry::default()),
             global_fee_state_key,
             global_fee_wallet: Pubkey::default(),
-            liquidation_max_fee: I80F48::ZERO,
+            liquidation_max_fee: std::sync::RwLock::new(I80F48::ZERO),
         }
+    }
+
+    /// The premium the program allows a liquidation before any tag: FeeState's
+    /// `liquidation_max_fee`, as last read.
+    pub fn liquidation_max_fee(&self) -> I80F48 {
+        *self
+            .liquidation_max_fee
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set_liquidation_max_fee(&self, fee: I80F48) {
+        *self
+            .liquidation_max_fee
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = fee;
     }
 
     fn build_kamino_reserve(address: Pubkey, reserve: Reserve) -> KaminoReserve {
