@@ -48,17 +48,14 @@ pub struct Eva01Config {
     /// Land liquidations as Jito bundles, and price them on Hermes prices pushed on chain in the
     /// same bundle when the chain's aren't enough (`PRICE_PUSH_ENABLED`, on unless "false").
     pub price_push_enabled: bool,
-    /// In a bundle, the Kamino and JupLend refreshes go in a transaction ahead of the liquidation
-    /// rather than in it (`REFRESH_AHEAD_ENABLED`, on unless "false").
-    pub refresh_ahead_enabled: bool,
     /// Jito block-engine `sendBundle` endpoint; `None` uses the client's built-in default.
     pub jito_block_engine_url: Option<String>,
     /// Hard cap on the Jito tip per bundle (lamports).
     pub jito_tip_max_lamports: u64,
     /// The share of a bundle's expected profit tipped (`BUNDLE_TIP_PROFIT_SHARE`).
     pub bundle_tip_profit_share: f64,
-    /// The share of a liquidation's full profit a wallet-funded plan must earn to go first, ahead
-    /// of the plans that quote a swap (`LIQUIDATION_WALLET_MIN_PROFIT_SHARE`).
+    /// The share of its pair's full profit a wallet-funded plan must earn more than to go first,
+    /// ahead of the sandwich (`LIQUIDATION_WALLET_MIN_PROFIT_SHARE`).
     pub wallet_min_profit_share: f64,
     /// API key/uuid for `sendBundle`; `None` for the public (unauthenticated) path.
     pub bundle_api_key: Option<String>,
@@ -153,8 +150,6 @@ impl Eva01Config {
             std::env::var("PYTH_CRANKER_ENABLED").is_ok_and(|value| value == "true");
 
         let price_push_enabled = std::env::var("PRICE_PUSH_ENABLED").map_or(true, |v| v != "false");
-        let refresh_ahead_enabled =
-            std::env::var("REFRESH_AHEAD_ENABLED").map_or(true, |v| v != "false");
         let jito_block_engine_url = std::env::var("JITO_BLOCK_ENGINE_URL").ok();
         let jito_tip_max_lamports: u64 = std::env::var("JITO_TIP_MAX_LAMPORTS")
             .unwrap_or_else(|_| "5000000".to_string())
@@ -193,7 +188,6 @@ impl Eva01Config {
             dflow_api_key,
             jupiter_api_key,
             price_push_enabled,
-            refresh_ahead_enabled,
             jito_block_engine_url,
             jito_tip_max_lamports,
             bundle_tip_profit_share,

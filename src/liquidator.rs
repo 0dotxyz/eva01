@@ -1,10 +1,13 @@
 use crate::{
-    cache::Cache,
+    cache::{
+        pyth_prices::{Pricing, PushedPrices},
+        Cache,
+    },
     clock_manager,
     config::Eva01Config,
     execution::{
         activity::LiquidationActivity,
-        executor::{pending_feeds, pushable_feed, BundleLanding, Executor},
+        executor::{pushable_feed, BundleLanding, Executor, LostRace},
         inventory::InventoryStrategy,
         queue::{ExecutionQueue, QueuedIntent},
         reservations::TokenReservations,
@@ -31,7 +34,7 @@ use crate::{
 };
 use anchor_lang::AccountDeserialize;
 use anyhow::{anyhow, Result};
-use crossbeam::channel::{bounded, Receiver, RecvTimeoutError};
+use crossbeam::channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{debug, error, info, warn};
@@ -246,26 +249,24 @@ fn is_better_pair(profit: I80F48, weight: u8, best_profit: I80F48, best_weight: 
     }
 }
 
-/// Of pairs earning `profit`, seizing at `weight`, and whose debt the wallet holds enough of to
-/// repay (`repayable`), in order: the pair for a repay from the wallet, and, when that one is
-/// heavy, the pair an in-tx swap should take instead if that differs (a lighter one unless the
-/// heavier earns more than [`PAIR_PROFIT_TIE_MARGIN`] more). The first is the most profitable,
-/// counting a repayable pair's profit [`PAIR_PROFIT_TIE_MARGIN`] higher, since it needs no quote
-/// and no route (the lighter on a tie). Indexes into the pairs; `None` when there are none.
-fn choose_pairs(pairs: impl Iterator<Item = (I80F48, u8, bool)>) -> Option<(usize, Option<usize>)> {
-    // (index, the profit compared, raw profit, weight)
+/// Of pairs earning `profit`, seizing at `weight`, and earning `funded` of that from what the
+/// wallet holds of their debt, in order: the pair for the wallet repay, the one the wallet funds
+/// the most profit of (then the most profitable, then the lighter), and the pair for a sandwich
+/// when that differs and earns more (a lighter one unless the heavier earns more than
+/// [`PAIR_PROFIT_TIE_MARGIN`] more). The executor weighs the two (`wallet_goes_first`). Indexes
+/// into the pairs; `None` when there are none.
+fn choose_pairs(
+    pairs: impl Iterator<Item = (I80F48, u8, I80F48)>,
+) -> Option<(usize, Option<usize>)> {
+    // (index, funded, profit, weight)
     let mut main: Option<(usize, I80F48, I80F48, u8)> = None;
     let mut sandwich: Option<(usize, I80F48, u8)> = None;
-    for (index, (profit, weight, repayable)) in pairs.enumerate() {
-        let preferred = if repayable {
-            profit * (I80F48::ONE + PAIR_PROFIT_TIE_MARGIN)
-        } else {
-            profit
-        };
-        if main.is_none_or(|(_, best, _, best_weight)| {
-            preferred > best || (preferred == best && weight < best_weight)
+    for (index, (profit, weight, funded)) in pairs.enumerate() {
+        if main.is_none_or(|(_, best_funded, best_profit, best_weight)| {
+            (funded, profit, std::cmp::Reverse(weight))
+                > (best_funded, best_profit, std::cmp::Reverse(best_weight))
         }) {
-            main = Some((index, preferred, profit, weight));
+            main = Some((index, funded, profit, weight));
         }
         if sandwich.is_none_or(|(_, best_profit, best_weight)| {
             is_better_pair(profit, weight, best_profit, best_weight)
@@ -274,8 +275,7 @@ fn choose_pairs(pairs: impl Iterator<Item = (I80F48, u8, bool)>) -> Option<(usiz
         }
     }
     let (main, _, main_profit, main_weight) = main?;
-    // Chosen on profit and weight alone, whatever the wallet holds; only when it beats the main
-    // pair for an in-tx swap.
+    // Only when it beats the main pair for an in-tx swap.
     let sandwich = sandwich
         .filter(|(index, profit, weight)| {
             *index != main && is_better_pair(*profit, *weight, main_profit, main_weight)
@@ -287,20 +287,23 @@ fn choose_pairs(pairs: impl Iterator<Item = (I80F48, u8, bool)>) -> Option<(usiz
 /// Where an SPL token account's `amount: u64` sits, after its mint and owner.
 const TOKEN_AMOUNT: std::ops::Range<usize> = 64..72;
 
-/// Whether the wallet holds at least `amount` (native units) of `liab_bank`'s mint, as last read.
-/// Claims by liquidations in flight aren't counted: the executor checks them when it plans.
-fn wallet_covers(cache: &Cache, liab_bank: &Pubkey, amount: I80F48) -> bool {
-    let Ok(bank) = cache.banks.try_get_bank(liab_bank) else {
-        return false;
-    };
-    cache
-        .tokens
-        .try_get_token_for_mint(&bank.bank.mint)
+/// The share of an `amount` (native units) repay of `liab_bank`'s mint that the wallet holds, as
+/// last read, at most 1. Claims by liquidations in flight aren't counted: the executor checks them
+/// when it plans.
+fn wallet_share(cache: &Cache, liab_bank: &Pubkey, amount: I80F48) -> I80F48 {
+    if amount <= I80F48::ZERO {
+        return I80F48::ZERO;
+    }
+    let held = cache
+        .banks
+        .try_get_bank(liab_bank)
+        .and_then(|bank| cache.tokens.try_get_token_for_mint(&bank.bank.mint))
         .and_then(|token| cache.tokens.try_get_account(&token))
         .ok()
         .and_then(|token| token.data.get(TOKEN_AMOUNT)?.try_into().ok())
         .map(u64::from_le_bytes)
-        .is_some_and(|held| amount > I80F48::ZERO && I80F48::from_num(held) >= amount)
+        .unwrap_or(0);
+    I80F48::min(I80F48::ONE, I80F48::from_num(held) / amount)
 }
 
 /// A cycle's results: the liquidations, the unhealthy accounts not worth liquidating, and each
@@ -365,13 +368,42 @@ impl<'a> UnitValues<'a> {
     }
 }
 
+/// A tag the tag policy found due.
+struct DueTag {
+    address: Pubkey,
+    observation_accounts: ObservationAccounts,
+    waited: Duration,
+}
+
+/// Sends the tags it is handed, one after another; it stops once the sender is dropped.
+fn spawn_tagger(liquidator_account: Arc<LiquidatorAccount>) -> Result<Sender<DueTag>> {
+    let (tags, due) = unbounded::<DueTag>();
+    thread::Builder::new()
+        .name("tagger".to_string())
+        .spawn(move || {
+            for tag in due {
+                match liquidator_account.send_tag_tx(tag.address, &tag.observation_accounts) {
+                    Ok(signature) => info!(
+                        "Sent a tag for {} after {} min unhealthy with nobody liquidating it, so its premium grows: {}",
+                        tag.address,
+                        tag.waited.as_secs() / 60,
+                        signature
+                    ),
+                    Err(err) => error!("Failed to tag {}: {:?}", tag.address, err),
+                }
+            }
+        })?;
+    Ok(tags)
+}
+
 /// How often each unhealthy account we are not liquidating is reported.
 const SKIP_REPORT_INTERVAL: Duration = Duration::from_secs(1200);
 
-/// After an attempt the same account is left alone this long. An attempt only ends once its
-/// transaction is confirmed or can no longer land, and Geyser streams the account at processed
-/// commitment, so the update is already on its way; this covers its delivery and the loop applying
-/// it, so the next attempt is sized on the state the last one produced.
+/// After an attempt the same account is left alone this long, unless it lost a race. After a
+/// landing it goes again as soon as Geyser delivers the account at the slot it landed at, so the
+/// next attempt is sized on the state the landing produced; this is the most it waits. It also
+/// spaces out retries of a failure that would repeat (a refused bundle, an account on hold). A lost
+/// race changed nothing, so the account may go again at once, a few times in a row.
 const ATTEMPT_COOLDOWN: Duration = Duration::from_secs(3);
 
 pub struct Liquidator {
@@ -386,6 +418,8 @@ pub struct Liquidator {
     threads: Vec<JoinHandle<()>>,
     liquidator_account: Arc<LiquidatorAccount>,
     tag_policy: TagPolicy,
+    /// Tags due, sent from a thread of their own so the scan never waits on the RPC.
+    tags: Sender<DueTag>,
     skip_reports: RateLimiter<Pubkey>,
     /// Which borrowers updates can skip.
     health_watch: HealthWatch,
@@ -470,8 +504,8 @@ struct Sizing {
     /// Kamino or JupLend bank and a lighter pair earns nearly as much (`is_better_pair`).
     sandwich: Option<(Pubkey, Pubkey, LiquidationAmounts)>,
     maintenance_health: I80F48,
-    /// The Pyth oracles to push first, whose newer prices the pairs are sized on.
-    push_oracles: Vec<Pubkey>,
+    /// The push to post first, whose prices the pairs are sized on.
+    push: Option<PushedPrices>,
     /// The liquidation the chain's prices already allow, when a push lets this one earn more.
     without_push: Option<Box<Sizing>>,
 }
@@ -492,13 +526,11 @@ fn strongest_pushes(
         .collect()
 }
 
-/// The bank and oracle accounts behind `banks_and_oracles` as eva prices them, or, with `pushed`, as
-/// the program reads them once those Pyth oracles are pushed: every other oracle eva prices ahead
-/// of the chain at the chain's price.
+/// The bank and oracle accounts behind `banks_and_oracles`, the oracles on `pricing`'s prices.
 fn program_accounts(
     cache: &Cache,
     banks_and_oracles: &[Pubkey],
-    pushed: Option<&[Pubkey]>,
+    pricing: Pricing,
 ) -> Result<Vec<Account>> {
     banks_and_oracles
         .iter()
@@ -507,13 +539,7 @@ fn program_accounts(
                 return Ok(wrapper.account);
             }
             let cached = cache.oracles.try_get_account(pk)?;
-            Ok(match pushed {
-                Some(pushed) if !pushed.contains(pk) => cache
-                    .pyth_prices
-                    .onchain_if_behind(pk, &cached)
-                    .unwrap_or(cached),
-                _ => cached,
-            })
+            Ok(pricing.account(&cache.pyth_prices, pk, cached))
         })
         .collect()
 }
@@ -725,7 +751,6 @@ impl Liquidator {
                     config.bundle_tip_profit_share,
                 ),
                 signer: Keypair::try_from(config.wallet_keypair.as_slice())?,
-                refresh_ahead: config.refresh_ahead_enabled,
             })
         } else {
             None
@@ -759,6 +784,7 @@ impl Liquidator {
             queue: Arc::new(ExecutionQueue::new(ATTEMPT_COOLDOWN)),
             activity,
             threads: Vec::new(),
+            tags: spawn_tagger(liquidator_account.clone())?,
             liquidator_account,
             tag_policy: TagPolicy::new(),
             skip_reports: RateLimiter::new(SKIP_REPORT_INTERVAL),
@@ -1109,6 +1135,7 @@ impl Liquidator {
                 // Only queue accounts that carry debt — a debt-free account can't be liquidated, so
                 // evaluating it is wasted work. It rejoins the queue the moment it borrows (that
                 // update will report liabilities).
+                self.queue.account_updated(address, slot);
                 if has_liabilities {
                     changes.accounts.insert(address);
                 }
@@ -1177,18 +1204,13 @@ impl Liquidator {
         let by_address: HashMap<Pubkey, &UnhealthyAccount> =
             unhealthy.iter().map(|a| (a.address, a)).collect();
         for (address, waited) in due {
-            let observation_accounts = &by_address[&address].observation_accounts;
-            match self
-                .liquidator_account
-                .send_tag_tx(address, observation_accounts)
-            {
-                Ok(signature) => info!(
-                    "Sent a tag for {} after {} min unhealthy with nobody liquidating it, so its premium grows: {}",
-                    address,
-                    waited.as_secs() / 60,
-                    signature
-                ),
-                Err(err) => error!("Failed to tag {}: {:?}", address, err),
+            let tag = DueTag {
+                address,
+                observation_accounts: by_address[&address].observation_accounts.clone(),
+                waited,
+            };
+            if self.tags.send(tag).is_err() {
+                error!("Failed to tag {address}: the tagging thread is gone");
             }
         }
     }
@@ -1231,20 +1253,27 @@ fn run_worker(
         let attempt = panic::catch_unwind(AssertUnwindSafe(|| {
             attempt_liquidation(queued, evaluator, executor, strategy, activity)
         }));
-        if attempt.is_err() {
+        // A panic cools down too, so it can't repeat in a tight loop.
+        let lost_race = attempt.unwrap_or_else(|_| {
             error!("The liquidation attempt on {} panicked.", liquidatee);
+            false
+        });
+        match executor.landed_slot(&liquidatee) {
+            Some(slot) => queue.release_after_landing(liquidatee, slot),
+            None if lost_race => queue.release_after_lost_race(liquidatee),
+            None => queue.release(liquidatee, true),
         }
-        queue.release(liquidatee);
     }
 }
 
+/// Whether the attempt lost a race (`LostRace`), which leaves nothing to wait for.
 fn attempt_liquidation(
     QueuedIntent { intent, queued_at }: QueuedIntent,
     evaluator: &Evaluator,
     executor: &Executor,
     strategy: &InventoryStrategy,
     activity: &LiquidationActivity,
-) {
+) -> bool {
     let liquidatee = intent.liquidatee_account.address;
     // The intent was sized on the state at evaluation time. By now another liquidator may have
     // taken a chunk of the account or prices may have moved, so it is re-sized on the current
@@ -1276,14 +1305,17 @@ fn attempt_liquidation(
             );
             info!("LIQUIDATION_QUEUE attempt_id={} account={} queue_delay_ms={} asset_bank={} liab_bank={} estimated_repay_usd={:.4} estimated_profit_usd={:.4} binding_cap={} push_feed_count={} sandwich_pair={}",
                 fresh.attempt_id, liquidatee, queued_at.elapsed().as_millis(), fresh.asset_bank,
-                fresh.liab_bank, fresh.estimated_repay_usd, fresh.profit.to_num::<f64>(), fresh.binding_cap, fresh.push_oracles.len(), sandwich);
+                fresh.liab_bank, fresh.estimated_repay_usd, fresh.profit.to_num::<f64>(), fresh.binding_cap, fresh.push.as_ref().map_or(0, |push| push.feeds.len()), sandwich);
             let mut attempt = activity.attempt(liquidatee);
             match executor.try_execute(strategy, &fresh) {
                 Ok(()) => attempt.succeeded(),
-                Err(e) => error!(
-                    "LIQUIDATION_EXECUTION_FAILURE attempt_id={} account={} error={:#}",
-                    fresh.attempt_id, liquidatee, e
-                ),
+                Err(e) => {
+                    error!(
+                        "LIQUIDATION_EXECUTION_FAILURE attempt_id={} account={} error={:#}",
+                        fresh.attempt_id, liquidatee, e
+                    );
+                    return e.downcast_ref::<LostRace>().is_some();
+                }
             }
         }
         Ok(None) => info!(
@@ -1295,6 +1327,7 @@ fn attempt_liquidation(
             intent.attempt_id, liquidatee, e
         ),
     }
+    false
 }
 
 /// Sells leftover tokens back to the swap mint and refills the inventory whenever a pass is due
@@ -1491,7 +1524,7 @@ impl Evaluator {
             amounts: liquidation_amounts,
             sandwich,
             maintenance_health,
-            push_oracles,
+            push,
             without_push,
         } = sizing;
 
@@ -1574,7 +1607,7 @@ impl Evaluator {
             estimated_repay_usd: (liquidation_amounts.max_repay * LIQUIDATION_SIZE_HAIRCUT)
                 .to_num::<f64>(),
             binding_cap: liquidation_amounts.caps.binding,
-            push_oracles,
+            push,
             without_push,
             sandwich_pair,
         })))
@@ -1639,8 +1672,8 @@ impl Evaluator {
 
     /// Sizes the account's pairs on the prices the program will read. Where eva prices Pyth feeds
     /// ahead of the chain, a liquidation goes behind a push of the few that lower the account's
-    /// health the most, sized on them with every other feed at the chain's price, unless the
-    /// chain's prices already allow one earning nearly as much.
+    /// health the most, sized on exactly the prices the push posts with every other feed at the
+    /// chain's price, unless the chain's prices already allow one earning nearly as much.
     #[allow(clippy::too_many_arguments)]
     fn compute_max_liquidatable_amounts_with_banks(
         &self,
@@ -1652,19 +1685,19 @@ impl Evaluator {
         asset_banks: &[Pubkey],
         liab_banks: &[Pubkey],
     ) -> Result<PairSearch> {
-        let size = |pushed: Option<&[Pubkey]>| {
+        let size = |pricing: Pricing| {
             self.size_on_accounts(
                 cache,
                 clock.clone(),
                 account,
                 group,
                 banks_and_oracles,
-                pushed,
+                pricing,
                 asset_banks,
                 liab_banks,
             )
         };
-        let search = size(None)?;
+        let search = size(Pricing::Newest)?;
         let near_threshold = match &search {
             PairSearch::Healthy(margin) => *margin < CHAIN_CHECK_MARGIN,
             PairSearch::Sized(_) => true,
@@ -1673,30 +1706,33 @@ impl Evaluator {
         if !near_threshold {
             return Ok(search);
         }
-        let behind: Vec<Pubkey> = banks_and_oracles
-            .iter()
-            .filter(|pk| pushable_feed(cache, pk).is_some())
-            .copied()
-            .collect();
+        let mut behind: Vec<(Pubkey, [u8; 32])> = Vec::new();
+        for oracle in banks_and_oracles {
+            if let Some(feed_id) = pushable_feed(cache, oracle) {
+                if !behind.iter().any(|(_, known)| *known == feed_id) {
+                    behind.push((*oracle, feed_id));
+                }
+            }
+        }
         if behind.is_empty() {
             return Ok(search);
         }
-        let sizing = match search {
-            PairSearch::Sized(sizing) if sizing.amounts.is_liquidatable() => sizing,
+        match search {
+            PairSearch::Sized(sizing) if sizing.amounts.is_liquidatable() => {}
             // Not liquidatable on eva's prices, but the chain may still hold older ones the
             // account fails on: a price that recovered on Hermes before the chain caught up.
             search => {
-                return Ok(match size(Some(&[])) {
+                return Ok(match size(Pricing::Chain) {
                     Ok(PairSearch::Sized(on_chain)) if on_chain.amounts.is_liquidatable() => {
                         PairSearch::Sized(on_chain)
                     }
                     _ => search,
                 })
             }
-        };
+        }
 
-        let health = |pushed: &[Pubkey]| -> Result<I80F48> {
-            let mut accounts = program_accounts(cache, banks_and_oracles, Some(pushed))?;
+        let health = |pricing: Pricing| -> Result<I80F48> {
+            let mut accounts = program_accounts(cache, banks_and_oracles, pricing)?;
             let (assets, liabilities) = health_components(
                 account,
                 group,
@@ -1707,38 +1743,44 @@ impl Evaluator {
             )?;
             Ok(assets - liabilities)
         };
-        let on_chain = match health(&[]) {
+        let on_chain = match health(Pricing::Chain) {
             Ok(health) => health,
             // The chain's price is unusable as it stands (too old for the program, say): only
             // pushing every feed can make this liquidation pass.
             Err(e) => {
-                let pushable = self
-                    .pusher
-                    .as_ref()
-                    .is_some_and(|pusher| pusher.check(&pending_feeds(cache, &behind)).is_ok());
+                let push = self.pusher.as_ref().and_then(|pusher| {
+                    cache
+                        .pyth_prices
+                        .push_of(&behind)
+                        .filter(|push| pusher.check(push).is_ok())
+                });
                 debug!(
                     "Account {}: can't price it on the chain's Pyth prices ({e}); {}",
                     account.address,
-                    if pushable {
+                    if push.is_some() {
                         "pushing every feed"
                     } else {
                         "one bundle can't push every feed"
                     }
                 );
-                return Ok(if pushable {
-                    PairSearch::Sized(Sizing {
-                        push_oracles: behind,
-                        ..sizing
-                    })
-                } else {
-                    PairSearch::None
-                });
+                let Some(push) = push else {
+                    return Ok(PairSearch::None);
+                };
+                return Ok(
+                    match size(Pricing::Pushed(&push)).unwrap_or(PairSearch::None) {
+                        PairSearch::Sized(sizing) => PairSearch::Sized(Sizing {
+                            push: Some(push),
+                            ..sizing
+                        }),
+                        _ => PairSearch::None,
+                    },
+                );
             }
         };
 
         // On the chain's prices as they stand, when those already find the account unhealthy.
         let unpushed = if on_chain < I80F48::ZERO {
-            match size(Some(&[])).unwrap_or(PairSearch::None) {
+            match size(Pricing::Chain).unwrap_or(PairSearch::None) {
                 PairSearch::Sized(sizing) => Some(sizing),
                 _ => None,
             }
@@ -1747,18 +1789,18 @@ impl Evaluator {
         };
         // Behind a push of the feeds that lower its health the most, as many as a bundle carries.
         let pushed = self
-            .strongest_fitting_pushes(cache, on_chain, &behind, |oracle| health(&[*oracle]).ok());
-        let pushed = if pushed.is_empty() {
-            None
-        } else {
-            match size(Some(&pushed)).unwrap_or(PairSearch::None) {
-                PairSearch::Sized(sizing) => Some(Sizing {
-                    push_oracles: pushed,
-                    ..sizing
-                }),
-                _ => None,
-            }
-        };
+            .strongest_fitting_push(cache, on_chain, &behind, |push| {
+                health(Pricing::Pushed(push)).ok()
+            })
+            .and_then(
+                |push| match size(Pricing::Pushed(&push)).unwrap_or(PairSearch::None) {
+                    PairSearch::Sized(sizing) => Some(Sizing {
+                        push: Some(push),
+                        ..sizing
+                    }),
+                    _ => None,
+                },
+            );
 
         let earned = |sizing: &Sizing| {
             if sizing.amounts.is_liquidatable() {
@@ -1789,28 +1831,38 @@ impl Evaluator {
         })
     }
 
-    /// Of the `behind` oracles, those whose newer price alone (`health_with`) lowers the account's
-    /// health below `on_chain` the most, as many as one bundle's push carries. None with bundles
-    /// off, when nothing is pushed.
-    fn strongest_fitting_pushes(
+    /// The push of the `behind` feeds (oracle and feed id) whose price alone (`health_with`) lowers
+    /// the account's health below `on_chain` the most, as many as one bundle's push carries and one
+    /// VAA covers. `None` with bundles off, when nothing is pushed, or when no push lowers it.
+    fn strongest_fitting_push(
         &self,
         cache: &Cache,
         on_chain: I80F48,
-        behind: &[Pubkey],
-        health_with: impl Fn(&Pubkey) -> Option<I80F48>,
-    ) -> Vec<Pubkey> {
-        let Some(pusher) = &self.pusher else {
-            return Vec::new();
-        };
-        let singles = behind
-            .iter()
-            .filter_map(|oracle| health_with(oracle).map(|h| (h, *oracle)));
-        let mut pushed = strongest_pushes(on_chain, singles);
+        behind: &[(Pubkey, [u8; 32])],
+        health_with: impl Fn(&PushedPrices) -> Option<I80F48>,
+    ) -> Option<PushedPrices> {
+        let pusher = self.pusher.as_ref()?;
+        let singles = behind.iter().filter_map(|feed| {
+            let alone = cache.pyth_prices.push_of(std::slice::from_ref(feed))?;
+            health_with(&alone).map(|h| (h, feed.0))
+        });
+        let mut strongest = strongest_pushes(on_chain, singles);
         // Dropping the weakest first.
-        while !pushed.is_empty() && pusher.check(&pending_feeds(cache, &pushed)).is_err() {
-            pushed.pop();
+        while !strongest.is_empty() {
+            let feeds: Vec<(Pubkey, [u8; 32])> = strongest
+                .iter()
+                .filter_map(|oracle| behind.iter().find(|(known, _)| known == oracle).copied())
+                .collect();
+            if let Some(push) = cache
+                .pyth_prices
+                .push_of(&feeds)
+                .filter(|push| pusher.check(push).is_ok())
+            {
+                return Some(push);
+            }
+            strongest.pop();
         }
-        pushed
+        None
     }
 
     /// Sizes every pair on `accounts`, the bank and oracle accounts behind `banks_and_oracles`.
@@ -1822,11 +1874,11 @@ impl Evaluator {
         account: &MarginfiAccountWrapper,
         group: &MarginfiGroup,
         banks_and_oracles: &[Pubkey],
-        pushed: Option<&[Pubkey]>,
+        pricing: Pricing,
         asset_banks: &[Pubkey],
         liab_banks: &[Pubkey],
     ) -> Result<PairSearch> {
-        let mut accounts = program_accounts(cache, banks_and_oracles, pushed)?;
+        let mut accounts = program_accounts(cache, banks_and_oracles, pricing)?;
         let mut bank_to_emode_config = HashMap::<Pubkey, EmodeConfig>::new();
         for pk in banks_and_oracles {
             if let Ok(wrapper) = cache.banks.try_get_bank(pk) {
@@ -1912,7 +1964,7 @@ impl Evaluator {
                             maintenance_health,
                             total_assets_equity,
                             total_liabs_equity,
-                            pushed,
+                            pricing,
                         )
                     });
                 let amounts = match amounts {
@@ -1931,15 +1983,19 @@ impl Evaluator {
         }
         let Some((main, sandwich)) =
             choose_pairs(candidates.iter().map(|(_, liab_bank, amounts, weight)| {
-                // Only a pair worth liquidating can be preferred: one below the minimum is sized at
-                // nothing, which any wallet "covers".
-                let repayable = amounts.is_liquidatable()
-                    && wallet_covers(
-                        cache,
-                        liab_bank,
-                        amounts.max_liquidatable_liab_amount * LIQUIDATION_SIZE_HAIRCUT,
-                    );
-                (amounts.liquidator_profit, *weight, repayable)
+                // Only a pair worth liquidating can be funded: one below the minimum is sized at
+                // nothing.
+                let funded = if amounts.is_liquidatable() {
+                    amounts.liquidator_profit
+                        * wallet_share(
+                            cache,
+                            liab_bank,
+                            amounts.max_liquidatable_liab_amount * LIQUIDATION_SIZE_HAIRCUT,
+                        )
+                } else {
+                    I80F48::ZERO
+                };
+                (amounts.liquidator_profit, *weight, funded)
             }))
         else {
             return Ok(PairSearch::None);
@@ -1959,7 +2015,7 @@ impl Evaluator {
             },
             sandwich,
             maintenance_health,
-            push_oracles: Vec::new(),
+            push: None,
             without_push: None,
         }))
     }
@@ -1978,15 +2034,15 @@ impl Evaluator {
         maintenance_health: I80F48,
         total_assets_equity: I80F48,
         total_liabs_equity: I80F48,
-        pushed: Option<&[Pubkey]>,
+        pricing: Pricing,
     ) -> Result<LiquidationAmounts> {
         let in_bad_debt = total_assets_equity < total_liabs_equity;
         // Valued and converted on the prices the program reads, like the health above.
         let asset_oracle_wrapper =
-            OracleWrapper::build_on(&self.cache, &clock, &asset_bank_wrapper.address, pushed)?;
+            OracleWrapper::build_on(&self.cache, &clock, &asset_bank_wrapper.address, pricing)?;
 
         let liab_oracle_wrapper =
-            OracleWrapper::build_on(&self.cache, &clock, &liab_bank_wrapper.address, pushed)?;
+            OracleWrapper::build_on(&self.cache, &clock, &liab_bank_wrapper.address, pricing)?;
 
         let asset_weight_maint: I80F48 = asset_bank_wrapper
             .bank
@@ -2303,7 +2359,10 @@ mod pair_preference_tests {
     #[test]
     fn a_heavy_most_profitable_pair_gets_a_native_one_for_the_sandwich() {
         let pairs = |list: &[(f64, u8)]| {
-            choose_pairs(list.iter().map(|(p, w)| (I80F48::from_num(*p), *w, false)))
+            choose_pairs(
+                list.iter()
+                    .map(|(p, w)| (I80F48::from_num(*p), *w, I80F48::ZERO)),
+            )
         };
         // A Kamino pair earning 1.2 against a native one earning 1: the wallet repay takes the
         // Kamino one, the sandwich the native one (within the 30% margin).
@@ -2318,20 +2377,21 @@ mod pair_preference_tests {
     }
 
     #[test]
-    fn a_pair_the_wallet_can_repay_wins_within_the_margin() {
-        let pairs = |list: &[(f64, u8, bool)]| {
-            choose_pairs(list.iter().map(|(p, w, r)| (I80F48::from_num(*p), *w, *r)))
+    fn the_pair_the_wallet_funds_most_of_wins() {
+        let pairs = |list: &[(f64, u8, f64)]| {
+            choose_pairs(
+                list.iter()
+                    .map(|(p, w, share)| (I80F48::from_num(*p), *w, I80F48::from_num(*p * *share))),
+            )
         };
         // The same seizure against two stable debts: the one the wallet holds wins.
-        assert_eq!(pairs(&[(1.0, 0, false), (1.0, 0, true)]), Some((1, None)));
-        assert_eq!(pairs(&[(1.0, 0, true), (1.0, 0, false)]), Some((0, None)));
-        // It still loses to a pair earning more than 30% more.
-        assert_eq!(pairs(&[(1.0, 0, true), (1.31, 0, false)]), Some((1, None)));
-        // Within the margin it wins the wallet repay; the sandwich keeps the more profitable one.
-        assert_eq!(
-            pairs(&[(1.0, 0, true), (1.25, 0, false)]),
-            Some((0, Some(1)))
-        );
+        assert_eq!(pairs(&[(1.0, 0, 0.0), (1.0, 0, 1.0)]), Some((1, None)));
+        // A debt the wallet holds 99% of counts nearly in full: no all-or-nothing.
+        assert_eq!(pairs(&[(1.0, 0, 0.99), (1.0, 0, 0.5)]), Some((0, None)));
+        // A more profitable pair the wallet doesn't hold: the sandwich takes it.
+        assert_eq!(pairs(&[(1.0, 0, 1.0), (3.0, 0, 0.0)]), Some((0, Some(1))));
+        // The wallet funds none: the most profitable pair.
+        assert_eq!(pairs(&[(1.0, 0, 0.0), (1.2, 0, 0.0)]), Some((1, None)));
     }
 
     #[test]
@@ -2477,11 +2537,33 @@ mod push_choice_tests {
         };
         let oracles = [sol, eth];
 
-        let ours = program_accounts(&cache, &oracles, None).unwrap();
+        let ours = program_accounts(&cache, &oracles, Pricing::Newest).unwrap();
         assert_eq!(ours.iter().map(price).collect::<Vec<_>>(), vec![2, 2]);
-        let chain = program_accounts(&cache, &oracles, Some(&[])).unwrap();
+        let chain = program_accounts(&cache, &oracles, Pricing::Chain).unwrap();
         assert_eq!(chain.iter().map(price).collect::<Vec<_>>(), vec![1, 1]);
-        let sol_pushed = program_accounts(&cache, &oracles, Some(&[sol])).unwrap();
-        assert_eq!(sol_pushed.iter().map(price).collect::<Vec<_>>(), vec![2, 1]);
+        // SOL at the price its push posts, which need not be the newest eva holds.
+        let mut message =
+            crate::cache::pyth_prices::price_update(&cache.oracles.try_get_account(&sol).unwrap())
+                .unwrap()
+                .price_message;
+        message.price = 3;
+        message.publish_time = 105;
+        let vaa = Arc::new(vec![1u8]);
+        let push = PushedPrices {
+            vaa: Arc::clone(&vaa),
+            feeds: vec![(
+                sol,
+                crate::cache::pyth_prices::SignedUpdate {
+                    message,
+                    vaa,
+                    update: pythnet_sdk::wire::v1::MerklePriceUpdate {
+                        message: vec![0u8].into(),
+                        proof: pythnet_sdk::accumulators::merkle::MerklePath::new(vec![]),
+                    },
+                },
+            )],
+        };
+        let sol_pushed = program_accounts(&cache, &oracles, Pricing::Pushed(&push)).unwrap();
+        assert_eq!(sol_pushed.iter().map(price).collect::<Vec<_>>(), vec![3, 1]);
     }
 }

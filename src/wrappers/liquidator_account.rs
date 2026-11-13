@@ -3,7 +3,7 @@ use super::{
     marginfi_account::{MarginfiAccountWrapper, ObservationAccounts},
 };
 use crate::{
-    cache::Cache,
+    cache::{pyth_prices::PushedPrices, Cache},
     config::Eva01Config,
     juplend_ixs::make_update_lending_rate_ix,
     kamino_ixs::{make_refresh_obligation_ix, make_refresh_reserve_ix},
@@ -100,9 +100,9 @@ pub struct PreparedLiquidatableAccount {
     pub profit: I80F48,
     pub estimated_repay_usd: f64,
     pub binding_cap: &'static str,
-    /// The Pyth oracles whose newer price (from Hermes) the liquidation is sized on, so it goes
-    /// behind a push of them; empty when the chain's prices suffice.
-    pub push_oracles: Vec<Pubkey>,
+    /// The push the liquidation is sized on, which goes ahead of it; `None` when the chain's
+    /// prices suffice.
+    pub push: Option<PushedPrices>,
     /// The smaller liquidation the chain's prices already allow, taken instead when no bundle
     /// can carry the push right away.
     pub without_push: Option<Box<PreparedLiquidatableAccount>>,
@@ -431,7 +431,7 @@ impl LiquidatorAccount {
             profit: I80F48::ZERO,
             estimated_repay_usd: 0.0,
             binding_cap: "test",
-            push_oracles: Vec::new(),
+            push: None,
             without_push: None,
             sandwich_pair: None,
         };
@@ -559,9 +559,8 @@ impl LiquidatorAccount {
         ));
 
         let tx = self.compile_v1(&ixs)?;
-        // Sent, not confirmed: the liquidator loop runs tags inline, and waiting out a tag that
-        // never lands would hold up every liquidation behind it. Preflight still rejects a tag the
-        // program would refuse.
+        // Sent, not confirmed: a tag that never lands would hold up the tags behind it. Preflight
+        // still rejects a tag the program would refuse.
         Ok(self.rpc_client.send_transaction(&tx)?)
     }
 

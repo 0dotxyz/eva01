@@ -96,8 +96,11 @@ pub trait LiquidationStrategy {
 #[allow(clippy::large_enum_variant)]
 pub enum Sandwich {
     Plan(ExecutionPlan),
-    /// No sandwich (no route, doesn't fit): the wallet-funded plan is next.
-    Unavailable,
+    /// No sandwich: the wallet-funded plan is next. `no_route` when the venues answered and no
+    /// route pays or fits, as opposed to a venue's failure, which a retry may not meet.
+    Unavailable {
+        no_route: bool,
+    },
     /// The sandwich was built but its simulation failed. With newer prices than the chain holds,
     /// pushing them may make it land.
     Rejected,

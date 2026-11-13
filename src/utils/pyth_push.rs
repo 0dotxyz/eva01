@@ -4,9 +4,8 @@
 //! the sponsored push feed marginfi reads. A liquidation sized on such a price only passes once
 //! the feed holds it, so the price is posted in the same bundle, ahead of the liquidation: post
 //! the update's VAA to Wormhole, verify it, write each feed with `update_price_feed`, and close the
-//! VAA account to reclaim its rent. A push carries one VAA for every feed: the newest one the Hermes
-//! stream delivered under which every feed has an update the chain doesn't hold yet. Nothing is
-//! fetched from Hermes on the way.
+//! VAA account to reclaim its rent. A push carries one VAA for every feed, the one the liquidation
+//! was sized on (`PushedPrices`). Nothing is fetched from Hermes on the way.
 
 use anyhow::{anyhow, Result};
 use log::debug;
@@ -27,13 +26,12 @@ use pyth_solana_receiver_sdk::pda::get_config_address;
 
 use std::sync::Arc;
 
-use crate::cache::{pyth_prices::price_update, Cache};
+use crate::cache::{pyth_prices::PushedPrices, Cache};
 use crate::config::Eva01Config;
 use crate::transaction_limits::{MAX_BUNDLE_TXS, MAX_COMPUTE_UNIT_LIMIT, MAX_V0_TX_SIZE};
 use crate::utils::pyth_cranker::{
-    close_encoded_vaa_ix, guardian_set_index, init_encoded_vaa_ix, price_feed_address,
-    update_price_feed_ix, verify_encoded_vaa_ix, write_encoded_vaa_ix, VAA_HEADER_SIZE,
-    VAA_SPLIT_INDEX,
+    close_encoded_vaa_ix, guardian_set_index, init_encoded_vaa_ix, update_price_feed_ix,
+    verify_encoded_vaa_ix, write_encoded_vaa_ix, VAA_HEADER_SIZE, VAA_SPLIT_INDEX,
 };
 
 /// The push transactions a bundle has room for: the liquidation and the tip take two. The tip
@@ -92,15 +90,15 @@ impl PythPusher {
         })
     }
 
-    /// The transactions that post the latest Hermes prices of `feed_ids` ahead of a liquidation,
-    /// with `trailing` (the liquidation's Kamino and JupLend refreshes) after them.
+    /// The transactions that post `push` ahead of a liquidation, with `trailing` (the
+    /// liquidation's Kamino and JupLend refreshes) after them.
     pub fn push_transactions(
         &self,
-        feed_ids: &[[u8; 32]],
+        push: &PushedPrices,
         trailing: &[Instruction],
         attempt: u64,
     ) -> Result<PricePush> {
-        let (chunks, encoded_vaa) = self.layout(feed_ids, trailing)?;
+        let (chunks, encoded_vaa) = self.layout(push, trailing)?;
         let blockhash = self.cache.blockhash.get(&self.rpc_client)?;
         let mut txs = Vec::with_capacity(chunks.len());
         for (i, chunk) in chunks.iter().enumerate() {
@@ -115,18 +113,15 @@ impl PythPusher {
         debug!(
             "PythPusher: {} transaction(s) push {} feed(s)",
             txs.len(),
-            feed_ids.len()
+            push.feeds.len()
         );
         Ok(PricePush { txs })
     }
 
-    /// Whether a push of `feed_ids` fits a bundle on the updates streamed so far. Nothing is
-    /// signed or fetched: only the transactions' sizes are measured.
-    pub fn check(&self, feed_ids: &[[u8; 32]]) -> Result<()> {
-        if feed_ids.is_empty() {
-            return Ok(());
-        }
-        self.layout(feed_ids, &[]).map(|_| ())
+    /// Whether `push` fits a bundle. Nothing is signed or fetched: only the transactions' sizes
+    /// are measured.
+    pub fn check(&self, push: &PushedPrices) -> Result<()> {
+        self.layout(push, &[]).map(|_| ())
     }
 
     /// `ixs` alone in one signed transaction, ahead of a liquidation in its bundle: its Kamino and
@@ -152,11 +147,11 @@ impl PythPusher {
     /// account's keypair, which signs the first.
     fn layout(
         &self,
-        feed_ids: &[[u8; 32]],
+        push: &PushedPrices,
         trailing: &[Instruction],
     ) -> Result<(Vec<Vec<Instruction>>, Keypair)> {
         let encoded_vaa = Keypair::new();
-        let (post, rest) = self.instructions(feed_ids, &encoded_vaa.pubkey())?;
+        let (post, rest) = self.instructions(push, &encoded_vaa.pubkey())?;
         if !self.fits(&post)? {
             return Err(anyhow!("posting the VAA doesn't fit a transaction"));
         }
@@ -168,7 +163,7 @@ impl PythPusher {
         if chunks.len() > MAX_PUSH_TXS {
             return Err(anyhow!(
                 "pushing {} feeds takes {} transactions (max {})",
-                feed_ids.len(),
+                push.feeds.len(),
                 chunks.len(),
                 MAX_PUSH_TXS
             ));
@@ -180,34 +175,10 @@ impl PythPusher {
     /// `vaa_account` and write its head, then the rest in order.
     fn instructions(
         &self,
-        feed_ids: &[[u8; 32]],
+        push: &PushedPrices,
         vaa_account: &Pubkey,
     ) -> Result<(Vec<Instruction>, Vec<Instruction>)> {
-        // Each feed's update must be the price eva holds for it, which the liquidation was sized
-        // on, and still ahead of the chain.
-        let prices = &self.cache.pyth_prices;
-        let (vaa, updates) = prices
-            .signed_together(feed_ids, |feed_id, publish_time| {
-                let oracle = price_feed_address(feed_id);
-                let sized_on = self
-                    .cache
-                    .oracles
-                    .try_get_account(&oracle)
-                    .ok()
-                    .and_then(|account| price_update(&account))
-                    .map(|update| update.price_message.publish_time);
-                sized_on == Some(publish_time)
-                    && prices
-                        .onchain(&oracle)
-                        .is_none_or(|chain| publish_time > chain)
-            })
-            .ok_or_else(|| {
-                anyhow!(
-                    "the stream holds no signed update carrying the {} feed(s) at the prices sized on",
-                    feed_ids.len()
-                )
-            })?;
-        let vaa = vaa.as_slice();
+        let vaa = push.vaa.as_slice();
 
         let payer = self.payer.pubkey();
         let wormhole = &self.wormhole_program_id;
@@ -251,12 +222,12 @@ impl PythPusher {
             vaa_account,
             guardian_set_index(vaa)?,
         ));
-        for (feed_id, merkle_price_update) in feed_ids.iter().zip(updates) {
+        for (_, signed) in &push.feeds {
             rest.push(update_price_feed_ix(
                 &payer,
                 vaa_account,
-                *feed_id,
-                merkle_price_update,
+                signed.message.feed_id,
+                signed.update.clone(),
             )?);
         }
         rest.push(close_encoded_vaa_ix(wormhole, &payer, vaa_account));

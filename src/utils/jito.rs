@@ -101,6 +101,13 @@ impl SlotState {
     fn is_full(&self) -> bool {
         self.held + self.sent.len() >= self.capacity
     }
+
+    /// Whether more than half the window's requests are still free; with one request a window,
+    /// whether it is.
+    fn has_spare(&self) -> bool {
+        let used = self.held + self.sent.len();
+        self.capacity.saturating_sub(used) > self.capacity / 2
+    }
 }
 
 /// How often a caller waiting for a slot looks again while the others are all held.
@@ -281,6 +288,23 @@ impl JitoClient {
         let mut state = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         state.prune(Instant::now());
         if state.is_full() {
+            return None;
+        }
+        state.held += 1;
+        Some(JitoSlot { jito: self })
+    }
+
+    /// Requests admitted per window.
+    pub fn capacity(&self) -> usize {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).capacity
+    }
+
+    /// A request slot only while more than half the window's are free, for a request that can
+    /// wait (a status check), so sends always keep the other half.
+    pub fn try_reserve_spare(&self) -> Option<JitoSlot<'_>> {
+        let mut state = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        state.prune(Instant::now());
+        if !state.has_spare() {
             return None;
         }
         state.held += 1;
@@ -555,6 +579,19 @@ mod tests {
             jito.try_reserve().is_none(),
             "used: the next one is a second away"
         );
+    }
+
+    #[test]
+    fn status_checks_leave_sends_half_the_window() {
+        let jito = JitoClient::new(None, Some("uuid".to_string()));
+        let half = AUTHENTICATED_REQUESTS / 2;
+        let sends: Vec<_> = (0..half - 1)
+            .map(|_| jito.try_reserve().expect("within the limit"))
+            .collect();
+        let check = jito.try_reserve_spare().expect("more than half free");
+        assert!(jito.try_reserve_spare().is_none(), "only half left");
+        assert!(jito.try_reserve().is_some(), "sends still get one");
+        drop((sends, check));
     }
 
     #[test]

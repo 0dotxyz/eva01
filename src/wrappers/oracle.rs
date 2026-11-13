@@ -16,7 +16,10 @@ use solana_account_info::IntoAccountInfo;
 use solana_clock::Clock;
 use solana_pubkey::Pubkey;
 
-use crate::{cache::Cache, utils::staked_onramp};
+use crate::{
+    cache::{pyth_prices::Pricing, Cache},
+    utils::staked_onramp,
+};
 
 const SOL_POOL_INDEX: usize = 2;
 
@@ -154,19 +157,17 @@ impl OracleWrapper {
     /// use cases where an approximate price is acceptable (e.g. the rebalancer's
     /// threshold comparisons) and a stale feed should not block execution.
     pub fn build_lenient(cache: &Cache, clock: &Clock, bank_address: &Pubkey) -> Result<Self> {
-        Self::build_inner(cache, clock, bank_address, Some(u16::MAX), None)
+        Self::build_inner(cache, clock, bank_address, Some(u16::MAX), Pricing::Newest)
     }
 
-    /// Builds the OracleWrapper on the prices the program reads once the Pyth oracles in `pushed`
-    /// are pushed: every other oracle eva prices ahead of the chain at the chain's price. `None`
-    /// keeps eva's prices.
+    /// Builds the OracleWrapper on `pricing`'s prices.
     pub fn build_on(
         cache: &Cache,
         clock: &Clock,
         bank_address: &Pubkey,
-        pushed: Option<&[Pubkey]>,
+        pricing: Pricing,
     ) -> Result<Self> {
-        Self::build_inner(cache, clock, bank_address, None, pushed)
+        Self::build_inner(cache, clock, bank_address, None, pricing)
     }
 
     fn build_inner(
@@ -174,7 +175,7 @@ impl OracleWrapper {
         clock: &Clock,
         bank_address: &Pubkey,
         max_age_override: Option<u16>,
-        pushed: Option<&[Pubkey]>,
+        pricing: Pricing,
     ) -> Result<Self> {
         let bank_wrapper = cache.banks.try_get_bank(bank_address)?;
 
@@ -198,13 +199,7 @@ impl OracleWrapper {
             .iter()
             .map(|address| {
                 let cached = cache.oracles.try_get_account(address)?;
-                Ok(match pushed {
-                    Some(pushed) if !pushed.contains(address) => cache
-                        .pyth_prices
-                        .onchain_if_behind(address, &cached)
-                        .unwrap_or(cached),
-                    _ => cached,
-                })
+                Ok(pricing.account(&cache.pyth_prices, address, cached))
             })
             .collect::<Result<Vec<Account>>>()?;
 
@@ -233,7 +228,7 @@ impl OracleWrapperTrait for OracleWrapper {
     }
 
     fn build(cache: &Cache, clock: &Clock, bank_address: &Pubkey) -> Result<Self> {
-        Self::build_inner(cache, clock, bank_address, None, None)
+        Self::build_inner(cache, clock, bank_address, None, Pricing::Newest)
     }
 }
 

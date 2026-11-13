@@ -375,7 +375,7 @@ fn signed_updates(payload: &[u8]) -> Result<Vec<([u8; 32], SignedUpdate)>> {
         signed.push((
             message.feed_id,
             SignedUpdate {
-                publish_time: message.publish_time,
+                message,
                 vaa: Arc::clone(&vaa),
                 update,
             },
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(signed.len(), 2);
         assert_eq!(signed[0].0, [1u8; 32]);
         assert_eq!(signed[1].0, [2u8; 32]);
-        assert_eq!(signed[1].1.publish_time, 101);
+        assert_eq!(signed[1].1.publish_time(), 101);
         assert_eq!(signed[0].1.vaa.as_slice(), &[9, 8, 7]);
         assert!(Arc::ptr_eq(&signed[0].1.vaa, &signed[1].1.vaa));
         assert!(signed_updates(&[1, 2, 3]).is_err());
