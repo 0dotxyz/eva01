@@ -5,7 +5,7 @@
 //! slow send occupies one worker and never holds up evaluation or the other intents.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Condvar, Mutex, MutexGuard,
@@ -29,6 +29,20 @@ const FREE_RETRIES: u32 = 2;
 /// Lost races further apart than this aren't in a row.
 const LOST_RACE_WINDOW: Duration = Duration::from_secs(30);
 
+/// Attempts on one account at once. A second starts while one is in flight only for a piece a
+/// newer evaluation found [`SUPERSEDING_GAIN`] more profitable (a new price opened more room): the
+/// first may be losing its race, and a burst opens a piece every second. Bundles are atomic, so
+/// if the first lands the second fails without cost.
+const MAX_ATTEMPTS_PER_ACCOUNT: u32 = 2;
+const SUPERSEDING_GAIN: f64 = 1.1;
+
+/// The attempts in flight on an account, and the profit of the newest.
+#[derive(Clone, Copy)]
+struct InFlight {
+    attempts: u32,
+    profit: fixed::types::I80F48,
+}
+
 pub struct QueuedIntent {
     pub intent: PreparedLiquidatableAccount,
     pub queued_at: Instant,
@@ -49,7 +63,7 @@ pub struct ExecutionQueue {
 #[derive(Default)]
 struct State {
     pending: HashMap<Pubkey, QueuedIntent>,
-    in_flight: HashSet<Pubkey>,
+    in_flight: HashMap<Pubkey, InFlight>,
     cooldowns: HashMap<Pubkey, Instant>,
     /// Accounts cooling down after a landing, until Geyser delivers them at the slot it landed at.
     awaiting: HashMap<Pubkey, u64>,
@@ -118,7 +132,7 @@ impl ExecutionQueue {
     /// once without one (`cool_down` false).
     pub fn release(&self, address: Pubkey, cool_down: bool) {
         let mut state = self.lock();
-        state.in_flight.remove(&address);
+        state.finish(&address);
         if cool_down {
             state
                 .cooldowns
@@ -133,7 +147,7 @@ impl ExecutionQueue {
     /// latest.
     pub fn release_after_landing(&self, address: Pubkey, slot: u64) {
         let mut state = self.lock();
-        state.in_flight.remove(&address);
+        state.finish(&address);
         state.lost_races.remove(&address);
         // Waiting before `seen` is read: an update recorded after that read sees the count and
         // frees the account itself.
@@ -211,6 +225,14 @@ impl ExecutionQueue {
         }
     }
 
+    /// The attempt in flight on `address` was re-sized to `profit`: a newer evaluation must beat
+    /// that to go alongside it.
+    pub fn resized(&self, address: &Pubkey, profit: fixed::types::I80F48) {
+        if let Some(flight) = self.lock().in_flight.get_mut(address) {
+            flight.profit = profit;
+        }
+    }
+
     pub fn stop(&self) {
         self.lock().stopped = true;
         self.ready.notify_all();
@@ -218,23 +240,45 @@ impl ExecutionQueue {
 }
 
 impl State {
-    /// The most profitable intent not being worked or cooling down, now marked in flight.
+    /// The most profitable intent not cooling down whose account is free, or has an attempt in
+    /// flight that this one supersedes; now marked in flight.
     fn take_ready(&mut self, now: Instant) -> Option<QueuedIntent> {
         self.cooldowns.retain(|_, until| *until > now);
         let cooldowns = &self.cooldowns;
         self.awaiting
             .retain(|address, _| cooldowns.contains_key(address));
+        let in_flight = &self.in_flight;
         let address = self
             .pending
             .iter()
-            .filter(|(address, _)| {
-                !self.in_flight.contains(*address) && !self.cooldowns.contains_key(*address)
+            .filter(|(address, queued)| {
+                !self.cooldowns.contains_key(*address)
+                    && in_flight.get(*address).is_none_or(|flight| {
+                        flight.attempts < MAX_ATTEMPTS_PER_ACCOUNT
+                            && queued.intent.profit.to_num::<f64>()
+                                > flight.profit.to_num::<f64>() * SUPERSEDING_GAIN
+                    })
             })
             .max_by_key(|(_, queued)| queued.intent.profit)
             .map(|(address, _)| *address)?;
         let queued = self.pending.remove(&address)?;
-        self.in_flight.insert(address);
+        let flight = self.in_flight.entry(address).or_insert(InFlight {
+            attempts: 0,
+            profit: queued.intent.profit,
+        });
+        flight.attempts += 1;
+        flight.profit = queued.intent.profit;
         Some(queued)
+    }
+
+    /// One attempt on `address` finished.
+    fn finish(&mut self, address: &Pubkey) {
+        if let Some(flight) = self.in_flight.get_mut(address) {
+            flight.attempts = flight.attempts.saturating_sub(1);
+            if flight.attempts == 0 {
+                self.in_flight.remove(address);
+            }
+        }
     }
 }
 
@@ -318,12 +362,35 @@ mod tests {
         queue.offer(&[a], vec![intent(a, 1)]);
         assert!(take_now(&queue).is_some());
 
-        // Re-evaluated while the first attempt is still running.
-        queue.offer(&[a], vec![intent(a, 2)]);
+        // Re-evaluated while the first attempt is still running, the piece no bigger.
+        queue.offer(&[a], vec![intent(a, 1)]);
         assert!(take_now(&queue).is_none());
 
         queue.release(a, false);
-        assert_eq!(take_now(&queue), Some((a, I80F48::from_num(2))));
+        assert_eq!(take_now(&queue), Some((a, I80F48::from_num(1))));
+    }
+
+    #[test]
+    fn a_bigger_piece_goes_while_an_attempt_is_in_flight_two_at_most() {
+        let queue = ExecutionQueue::new(Duration::ZERO);
+        let a = Pubkey::new_unique();
+        queue.offer(&[a], vec![intent(a, 10)]);
+        assert!(take_now(&queue).is_some());
+
+        // A newer price opened a piece over 10% bigger: a second attempt goes now.
+        queue.offer(&[a], vec![intent(a, 12)]);
+        assert_eq!(take_now(&queue), Some((a, I80F48::from_num(12))));
+
+        // Two in flight: not a third, however big.
+        queue.offer(&[a], vec![intent(a, 50)]);
+        assert!(take_now(&queue).is_none());
+
+        // One finishes: the bigger piece may go.
+        queue.release(a, false);
+        assert_eq!(take_now(&queue), Some((a, I80F48::from_num(50))));
+        queue.release(a, false);
+        queue.release(a, false);
+        assert!(queue.lock().in_flight.is_empty(), "every attempt finished");
     }
 
     #[test]
