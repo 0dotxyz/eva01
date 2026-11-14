@@ -176,6 +176,8 @@ pub struct Rebalancer {
     /// Recreates the wallet's wSOL account when a route has closed it.
     rpc_client: RpcClient,
     signer: Keypair,
+    /// SOL bought for refills lately: when, and how many lamports.
+    sol_bought: Vec<(Instant, u64)>,
 }
 
 const WSOL: Pubkey = spl_token::native_mint::ID;
@@ -189,6 +191,9 @@ const SOL_REFILL_BELOW: u64 = 500_000_000;
 const SOL_REFILL_TO: u64 = 1_000_000_000;
 /// SOL bought for a refill is this much more than the shortfall, for the swap's slippage.
 const SOL_BUY_MARGIN: I80F48 = I80F48!(1.02);
+/// SOL bought with the swap mint for refills, at most this much per [`SOL_BUY_WINDOW`].
+const SOL_BUY_CAP: u64 = 3_000_000_000;
+const SOL_BUY_WINDOW: Duration = Duration::from_secs(60 * 60);
 /// What the unwrap transaction's fee may take, besides the temporary account's rent.
 const UNWRAP_FEE_ALLOWANCE: u64 = 20_000;
 
@@ -274,6 +279,7 @@ impl Rebalancer {
                 CommitmentConfig::confirmed(),
             ),
             signer: signer()?,
+            sol_bought: Vec::new(),
         })
     }
 
@@ -576,11 +582,11 @@ impl Rebalancer {
     /// [`SOL_REFILL_BELOW`]: from its own wrapped SOL (what no liquidation in flight has claimed),
     /// buying SOL with the swap mint for whatever that lacks. Checked often and regardless of
     /// liquidations: a wallet out of SOL lands nothing.
-    pub fn refill_native_sol(&mut self) -> anyhow::Result<()> {
+    pub fn refill_native_sol(&mut self) -> anyhow::Result<Option<Claim>> {
         let owner = self.signer.pubkey();
         let native = self.rpc_client.get_balance(&owner)?;
         if native >= SOL_REFILL_BELOW {
-            return Ok(());
+            return Ok(None);
         }
         let needed = SOL_REFILL_TO - native;
         warn!(
@@ -591,37 +597,33 @@ impl Rebalancer {
             self.recreate_wsol_account(0)?;
         }
         let wsol_account = associated_wsol_account(&owner);
-        let mut claim = self.reservations.new_claim();
-        let wrapped = self.wsol_balance(&wsol_account)?;
-        let free = self.reservations.unclaimed(&WSOL, wrapped);
-        if free < needed {
-            self.buy_sol(&mut claim, needed - free)?;
-        }
-        // What the buy left wrapped (a route that closed the account was wrapped back).
-        let native = self.rpc_client.get_balance(&owner)?;
-        let needed = SOL_REFILL_TO.saturating_sub(native);
-        if needed == 0 {
-            return Ok(());
-        }
-        let wrapped = self.wsol_balance(&wsol_account)?;
         // Too little SOL even for the temporary account's rent: close the wSOL account instead,
         // which pays out all of it, and wrap back what is over the target.
         let rent = self
             .rpc_client
             .get_minimum_balance_for_rent_exemption(TOKEN_ACCOUNT_SIZE)?;
         if native < rent + UNWRAP_FEE_ALLOWANCE {
-            return self.unwrap_all_and_rewrap(&wsol_account);
+            self.unwrap_all_and_rewrap(&wsol_account)?;
+            return Ok(Some(self.reservations.new_claim()));
         }
+        // The wallet's own wrapped SOL first, as much as is free; then SOL bought with the swap
+        // mint for the rest, unwrapped on the next check (a failed buy doesn't stop the unwrap).
+        let mut claim = self.reservations.new_claim();
+        let wrapped = self.wsol_balance(&wsol_account)?;
         let units = self
             .reservations
             .claim_available(&mut claim, WSOL, needed, wrapped);
-        if units == 0 {
-            return Err(anyhow::anyhow!(
-                "no unclaimed wrapped SOL to unwrap ({} wrapped)",
-                wrapped
-            ));
+        if units > 0 {
+            self.unwrap_sol(&wsol_account, units)?;
         }
-        self.unwrap_sol(&wsol_account, units)
+        if units < needed {
+            if let Err(e) = self.buy_sol(&mut claim, needed - units) {
+                warn!("Could not buy SOL for the refill: {e}");
+            }
+        }
+        // Held until the caller has re-read the balances, so no liquidation counts what was
+        // spent here.
+        Ok(Some(claim))
     }
 
     /// Closes the wallet's wSOL account (all of it and its rent paid out natively), then recreates
@@ -674,12 +676,28 @@ impl Rebalancer {
             .cache
             .try_get_token_wrapper_lenient(&self.swap_mint, &reserve_token)?;
         let wanted = reserve.get_amount_from_value(value)?.to_num::<u64>();
+        // At most `SOL_BUY_CAP` an hour: a steady leak of SOL isn't fed from the inventory
+        // without bound.
+        let now = Instant::now();
+        self.sol_bought
+            .retain(|(at, _)| now.saturating_duration_since(*at) < SOL_BUY_WINDOW);
+        let bought: u64 = self.sol_bought.iter().map(|(_, lamports)| lamports).sum();
+        if bought.saturating_add(lamports) > SOL_BUY_CAP {
+            return Err(anyhow::anyhow!(
+                "already bought {} lamports of SOL this hour (cap {}); is something leaking SOL?",
+                bought,
+                SOL_BUY_CAP
+            ));
+        }
         let units =
             self.reservations
                 .claim_available(claim, self.swap_mint, wanted, reserve.balance);
-        if units == 0 {
+        // Less than half of it free: tiny buys would only churn.
+        if units == 0 || units < wanted / 2 {
             return Err(anyhow::anyhow!(
-                "no unclaimed {} to buy SOL with",
+                "only {} of the {} {} it needs is free",
+                units,
+                wanted,
                 self.swap_mint
             ));
         }
@@ -690,6 +708,7 @@ impl Rebalancer {
             units
         );
         self.swap(units, self.swap_mint, WSOL, spent)?;
+        self.sol_bought.push((now, lamports));
         Ok(())
     }
 

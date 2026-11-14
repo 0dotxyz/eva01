@@ -73,18 +73,19 @@ const UNASKED_JITO_WINDOW: Duration = Duration::from_secs(5);
 /// Every relay given up and the RPC unreadable this long: taken as lost rather than held.
 const UNREADABLE_WHEN_LOST: Duration = Duration::from_secs(5);
 /// The blockhash is checked every this many polls.
-const BLOCKHASH_CHECK_EVERY: u32 = 4;
+const BLOCKHASH_CHECK_EVERY: u32 = 8;
 
 /// The most a bundle is watched, whatever the RPC answers.
 const WATCH_MAX_WAIT: Duration = Duration::from_secs(45);
 
 /// Polls of the liquidation's signature, after an unconfirmed bundle, this far apart.
-const SIGNATURE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SIGNATURE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// How long a bundle sent through Helius Sender is given to land: about seven slots (~215 ms each),
-/// against ~0.65 s seen from sending to confirmed. Sender reports nothing about a bundle, so
-/// past this it counts as lost, unless the chain shows its liquidation processed.
-const SENDER_LANDING_WINDOW: Duration = Duration::from_millis(1_600);
+/// How long a bundle sent through Helius Sender is given to land: ~0.65 s was seen from sending
+/// to confirmed, and it shows processed before that. Sender reports nothing about a bundle, so
+/// past this it counts as lost, unless the chain shows its liquidation processed. Kept short: the
+/// account can't go again until it is settled, and in a burst a new piece opens every second.
+const SENDER_LANDING_WINDOW: Duration = Duration::from_millis(1_000);
 
 /// Whether the RPC simulates a transaction before forwarding it. Every transaction is checked
 /// exactly once: one eva already simulated skips it.
@@ -200,13 +201,19 @@ const NO_PLAN_HOLD: Duration = Duration::from_secs(120);
 const VENUE_FAILURE_HOLD: Duration = Duration::from_secs(5);
 
 /// No route found again within this long confirms it, and the account is held [`NO_PLAN_HOLD`].
+/// One found less than [`NO_ROUTE_SAME_INCIDENT`] after the first is the same moment's (two
+/// attempts on one account), not a confirmation.
 const NO_ROUTE_CONFIRM_WINDOW: Duration = Duration::from_secs(60);
+const NO_ROUTE_SAME_INCIDENT: Duration = Duration::from_secs(2);
 
 /// How long an account is left alone after `end_liquidation` rejected the seizure as above the
 /// premium cap (6090). Sized on exactly the prices the program reads, a liquidation hits it only
 /// when the sizing disagrees with the program's, or when the collateral's price rose past the
 /// premium margin before it landed; the hold stays short for the latter.
 const PREMIUM_CAP_HOLD: Duration = Duration::from_secs(60);
+
+/// How recent another attempt's landing on the account must be to explain a premium-cap failure.
+const LANDED_LATELY: Duration = Duration::from_secs(10);
 
 /// How long an account is left alone after its transaction over RPC (bundles off) failed.
 const RPC_FAILURE_HOLD: Duration = Duration::from_secs(5);
@@ -392,7 +399,9 @@ pub struct Executor {
     /// Accounts left alone until the instant given, after an attempt that found no plan or failed.
     backoffs: Mutex<HashMap<Pubkey, Instant>>,
     /// The slot each account's last bundle landed at, for its worker to wait for (`landed_slot`).
-    landed_slots: Mutex<HashMap<Pubkey, u64>>,
+    landed_slots: Mutex<HashMap<u64, u64>>,
+    /// When an attempt on each account last landed, for a concurrent attempt's failure.
+    recent_landings: Mutex<HashMap<Pubkey, Instant>>,
     /// When each account last found no route, held only briefly then.
     no_routes: Mutex<HashMap<Pubkey, Instant>>,
     /// Lands liquidations as Jito bundles, behind a price push when they need one; `None` when
@@ -415,19 +424,20 @@ impl Executor {
             cache,
             backoffs: Mutex::new(HashMap::new()),
             landed_slots: Mutex::new(HashMap::new()),
+            recent_landings: Mutex::new(HashMap::new()),
             no_routes: Mutex::new(HashMap::new()),
             bundles,
             wallet_min_profit_share,
         }
     }
 
-    /// The slot the liquidation of `account` that just returned landed at, when it went as a
-    /// bundle; taken, so it is reported once.
-    pub fn landed_slot(&self, account: &Pubkey) -> Option<u64> {
+    /// The slot attempt `attempt_id`, which just returned, landed at, when it went as a bundle;
+    /// taken, so it is reported once. By attempt: two may be in flight on one account.
+    pub fn landed_slot(&self, attempt_id: u64) -> Option<u64> {
         self.landed_slots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(account)
+            .remove(&attempt_id)
     }
 
     /// Whether `try_execute` would skip `intent` for now: the target failed recently.
@@ -738,11 +748,20 @@ impl Executor {
         let now = Instant::now();
         let mut no_routes = self.no_routes.lock().unwrap_or_else(|e| e.into_inner());
         no_routes.retain(|_, at| now.saturating_duration_since(*at) < NO_ROUTE_CONFIRM_WINDOW);
-        if no_routes.remove(liquidatee).is_some() {
-            NO_PLAN_HOLD
-        } else {
-            no_routes.insert(*liquidatee, now);
-            VENUE_FAILURE_HOLD
+        match no_routes.get(liquidatee).copied() {
+            // Another attempt on the account at the same moment saw the same venue answers: that
+            // isn't a retry confirming it.
+            Some(first) if now.saturating_duration_since(first) < NO_ROUTE_SAME_INCIDENT => {
+                VENUE_FAILURE_HOLD
+            }
+            Some(_) => {
+                no_routes.remove(liquidatee);
+                NO_PLAN_HOLD
+            }
+            None => {
+                no_routes.insert(*liquidatee, now);
+                VENUE_FAILURE_HOLD
+            }
         }
     }
 
@@ -1069,7 +1088,7 @@ impl Executor {
                 self.landed_slots
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(liquidatee, slot);
+                    .insert(intent.attempt_id, slot);
                 Ok(())
             }
             // Why is asked after the claim is released, below: it costs a simulation.
@@ -1106,9 +1125,21 @@ impl Executor {
         // A bundle that didn't land costs nothing and holds nothing back: the account is evaluated
         // afresh. Only the premium cap holds it, as retrying the same sizing fails the same way.
         match &result {
-            Ok(()) => self.clear_target_backoff(&liquidatee),
-            // Only when the liquidation went alone does its simulation tell.
-            Err(e) if alone && is_premium_cap_failure(&e.to_string()) => {
+            Ok(()) => {
+                self.clear_target_backoff(&liquidatee);
+                self.recent_landings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(liquidatee, Instant::now());
+            }
+            // Only when the liquidation went alone does its simulation tell; and not just after
+            // another attempt on the account landed, which restarts its premium's growth: this
+            // one was sized on the grown premium, the next is sized on the new one.
+            Err(e)
+                if alone
+                    && is_premium_cap_failure(&e.to_string())
+                    && !self.landed_lately(&liquidatee) =>
+            {
                 self.hold(&liquidatee, PREMIUM_CAP_HOLD, "premium cap")
             }
             Err(_) => {}
@@ -1534,11 +1565,25 @@ impl Executor {
         Ok(guard.contains_key(key))
     }
 
-    /// Leaves `target` alone for `hold`.
+    /// Leaves `target` alone for `hold`, or longer when a longer hold is already set (two
+    /// attempts on one account may both set one).
     fn hold(&self, target: &Pubkey, hold: Duration, why: &str) {
         let mut guard = self.backoffs.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(*target, Instant::now() + hold);
+        let until = Instant::now() + hold;
+        let held = guard.entry(*target).or_insert(until);
+        *held = (*held).max(until);
         debug!("Holding {target} for {}s ({why})", hold.as_secs());
+    }
+
+    /// Whether an attempt on `target` landed in the last [`LANDED_LATELY`].
+    fn landed_lately(&self, target: &Pubkey) -> bool {
+        let now = Instant::now();
+        let mut landings = self
+            .recent_landings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        landings.retain(|_, at| now.saturating_duration_since(*at) < LANDED_LATELY);
+        landings.contains_key(target)
     }
 
     /// Clears a target's hold once it lands.
@@ -1813,6 +1858,18 @@ mod tests {
             .no_plan(&account, Pubkey::new_unique(), &short(false), no_route())
             .is_err());
         assert!(held_for(&account) <= VENUE_FAILURE_HOLD);
+        // A second attempt on the account at the same moment isn't a confirmation.
+        assert!(executor
+            .no_plan(&account, Pubkey::new_unique(), &short(false), no_route())
+            .is_err());
+        assert!(held_for(&account) <= VENUE_FAILURE_HOLD);
+        // A retry seconds later is.
+        *executor
+            .no_routes
+            .lock()
+            .unwrap()
+            .get_mut(&account)
+            .unwrap() -= NO_ROUTE_SAME_INCIDENT;
         assert!(executor
             .no_plan(&account, Pubkey::new_unique(), &short(false), no_route())
             .is_err());

@@ -1259,16 +1259,17 @@ fn run_worker(
 ) {
     while let Some(queued) = queue.take() {
         let liquidatee = queued.intent.liquidatee_account.address;
+        let attempt_id = queued.intent.attempt_id;
         // A panic would otherwise end the worker and leave the account marked in flight for good.
         let attempt = panic::catch_unwind(AssertUnwindSafe(|| {
-            attempt_liquidation(queued, evaluator, executor, strategy, activity)
+            attempt_liquidation(queued, queue, evaluator, executor, strategy, activity)
         }));
         // A panic cools down too, so it can't repeat in a tight loop.
         let lost_race = attempt.unwrap_or_else(|_| {
             error!("The liquidation attempt on {} panicked.", liquidatee);
             false
         });
-        match executor.landed_slot(&liquidatee) {
+        match executor.landed_slot(attempt_id) {
             Some(slot) => queue.release_after_landing(liquidatee, slot),
             None if lost_race => queue.release_after_lost_race(liquidatee),
             None => queue.release(liquidatee, true),
@@ -1279,6 +1280,7 @@ fn run_worker(
 /// Whether the attempt lost a race (`LostRace`), which leaves nothing to wait for.
 fn attempt_liquidation(
     QueuedIntent { intent, queued_at }: QueuedIntent,
+    queue: &ExecutionQueue,
     evaluator: &Evaluator,
     executor: &Executor,
     strategy: &InventoryStrategy,
@@ -1316,6 +1318,7 @@ fn attempt_liquidation(
             info!("LIQUIDATION_QUEUE attempt_id={} account={} queue_delay_ms={} asset_bank={} liab_bank={} estimated_repay_usd={:.4} estimated_profit_usd={:.4} binding_cap={} push_feed_count={} sandwich_pair={}",
                 fresh.attempt_id, liquidatee, queued_at.elapsed().as_millis(), fresh.asset_bank,
                 fresh.liab_bank, fresh.estimated_repay_usd, fresh.profit.to_num::<f64>(), fresh.binding_cap, fresh.push.as_ref().map_or(0, |push| push.feeds.len()), sandwich);
+            queue.resized(&liquidatee, fresh.profit);
             let mut attempt = activity.attempt(liquidatee);
             match executor.try_execute(strategy, &fresh) {
                 Ok(()) => attempt.succeeded(),
@@ -1353,7 +1356,12 @@ fn run_rebalancer(
     while let Err(RecvTimeoutError::Timeout) = workers_gone.recv_timeout(REBALANCE_CHECK_INTERVAL) {
         // Whatever the liquidations are doing: out of SOL, none of them lands.
         match panic::catch_unwind(AssertUnwindSafe(|| rebalancer.refill_native_sol())) {
-            Ok(Ok(())) => {}
+            // The claim is released once the balances show what the refill spent.
+            Ok(Ok(Some(claim))) => {
+                executor.refresh_wallet_balances();
+                drop(claim);
+            }
+            Ok(Ok(None)) => {}
             Ok(Err(error)) => error!("Refilling the native SOL failed: {:?}", error),
             Err(_) => error!("Refilling the native SOL panicked"),
         }
