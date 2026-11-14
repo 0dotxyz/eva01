@@ -21,9 +21,7 @@ use marginfi_type_crate::{
 };
 use mints::MintsCache;
 use oracles::OraclesCache;
-use solana_client::rpc_client::RpcClient;
 use solana_clock::Clock;
-use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use tokens::TokensCache;
 
@@ -164,17 +162,19 @@ impl Cache {
     /// liquidator loop drains them, so right after a liquidation lands the cached balances still show
     /// the pre-liquidation state; anything that sizes a swap from them must refresh first.
     /// Re-reads every wallet token account and returns the oldest slot the reads were made at, so
-    /// the caller knows how recent the cached balances now are at least.
-    pub fn refresh_wallet_tokens(&self, rpc_client: &RpcClient) -> Result<u64> {
+    /// the caller knows how recent the cached balances now are at least. `read` reads a chunk of up
+    /// to 100 accounts and returns the slot read at (processed commitment, like the Geyser stream)
+    /// and the accounts in order.
+    pub fn refresh_wallet_tokens_with(
+        &self,
+        read: impl Fn(&[Pubkey]) -> Result<(u64, Vec<Option<solana_account::Account>>)>,
+    ) -> Result<u64> {
         let addresses = self.mints.get_tokens();
         let mut read_at = u64::MAX;
         for chunk in addresses.chunks(100) {
-            // At processed commitment, like the Geyser stream.
-            let response = rpc_client
-                .get_multiple_accounts_with_commitment(chunk, CommitmentConfig::processed())?;
-            let slot = response.context.slot;
+            let (slot, accounts) = read(chunk)?;
             read_at = read_at.min(slot);
-            for (address, account) in chunk.iter().zip(response.value) {
+            for (address, account) in chunk.iter().zip(accounts) {
                 if let Some(account) = account {
                     self.tokens.try_update_account(*address, account, slot)?;
                 }

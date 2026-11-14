@@ -26,7 +26,9 @@ use crate::clock_manager;
 use crate::rebalancer::DexGate;
 use crate::transaction_limits::MAX_TX_ACCOUNT_LOCKS;
 use crate::wrappers::{
-    liquidator_account::{locked_accounts, LiquidatorAccount, PreparedLiquidatableAccount},
+    liquidator_account::{
+        locked_accounts, LiquidatorAccount, PreparedLiquidatableAccount, SimulationFailed,
+    },
     oracle::OracleWrapper,
     token_account::TokenAccountWrapper,
 };
@@ -222,9 +224,15 @@ impl InventoryStrategy {
         // isn't simulated at all: a bundle that fails doesn't land, and one behind a push relies
         // on prices the chain doesn't hold yet.
         if landing == Landing::Rpc {
-            self.liquidator_account
-                .simulate_tx(&tx)
-                .map_err(SimulationRejected)?;
+            // Only a simulation that ran and failed rejects it; one that couldn't run (the RPC
+            // timing out) is a venue-side failure.
+            self.liquidator_account.simulate_tx(&tx).map_err(|e| {
+                if e.downcast_ref::<SimulationFailed>().is_some() {
+                    anyhow::Error::from(SimulationRejected(e))
+                } else {
+                    e
+                }
+            })?;
         }
         Ok(tx)
     }

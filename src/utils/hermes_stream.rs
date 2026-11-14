@@ -359,7 +359,7 @@ impl HermesStream {
 }
 
 /// Every feed's update in an accumulator payload, under the payload's single VAA.
-fn signed_updates(payload: &[u8]) -> Result<Vec<([u8; 32], SignedUpdate)>> {
+pub(crate) fn signed_updates(payload: &[u8]) -> Result<Vec<([u8; 32], SignedUpdate)>> {
     let data = AccumulatorUpdateData::try_from_slice(payload)
         .map_err(|e| anyhow!("not an accumulator update: {e:?}"))?;
     let Proof::WormholeMerkle { vaa, updates } = data.proof;

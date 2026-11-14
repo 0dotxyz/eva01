@@ -60,8 +60,21 @@ pub struct JitoClient {
     outage: Mutex<Outage>,
 }
 
-/// How long a request to the block engine may take before the bundle is taken as not sent.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// When a rejected auth uuid was last reported; it is reported again this often while it lasts.
+static AUTH_REJECTED_LOGGED: Mutex<Option<Instant>> = Mutex::new(None);
+const AUTH_REJECTED_LOG_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Failures closer together than this count as one toward an outage: several requests timing out
+/// together in one network hiccup aren't several failures.
+const OUTAGE_FAILURE_SPACING: Duration = Duration::from_secs(1);
+
+/// How long a request to the block engine may take; it answers in a few hundred ms. A request that times out is taken as possibly sent and watched,
+/// so waiting longer gains nothing and only delays watching the bundle.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// A connection (TCP and TLS, ~0.4 s cold) not made by then is a request never sent.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// A bundle-status request's whole budget.
+const STATUS_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The block engine is taken as down after this many failed requests within
 /// [`OUTAGE_WINDOW`], for [`OUTAGE_PAUSE`].
@@ -118,30 +131,33 @@ const HELD_SLOT_RECHECK: Duration = Duration::from_millis(20);
 /// request over it; dropping it unused gives it back.
 pub struct JitoSlot<'a> {
     jito: &'a JitoClient,
+    /// Its request went out: it counts in `sent`, no longer as held.
+    used: std::cell::Cell<bool>,
 }
 
 impl Drop for JitoSlot<'_> {
     fn drop(&mut self) {
-        let mut state = self.jito.slot.lock().unwrap_or_else(|e| e.into_inner());
-        state.held = state.held.saturating_sub(1);
+        if !self.used.get() {
+            let mut state = self.jito.slot.lock().unwrap_or_else(|e| e.into_inner());
+            state.held = state.held.saturating_sub(1);
+        }
     }
 }
 
 impl JitoSlot<'_> {
-    /// Counts the slot as used from now.
+    /// Counts the slot as used from now, in the window instead of held, so a request in flight
+    /// counts once.
     fn mark_sent(&self) {
-        self.jito
-            .slot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .sent
-            .push_back(Instant::now());
+        let mut state = self.jito.slot.lock().unwrap_or_else(|e| e.into_inner());
+        state.sent.push_back(Instant::now());
+        if !self.used.replace(true) {
+            state.held = state.held.saturating_sub(1);
+        }
     }
 
     /// Submits a bundle in this slot. An `Err` is a bundle that couldn't be encoded, never sent. A
-    /// request that failed or timed out is `Unavailable`: taken as not sent, though a timed-out one
-    /// may still have arrived and land; the bundle is atomic, so at worst a later plan counting the
-    /// same wallet tokens fails.
+    /// request that couldn't connect, or was refused for auth, is `Unavailable`: not sent. One that
+    /// timed out, dropped, or met a server error after going out is `Uncertain`: it may land.
     pub fn send_bundle(self, txs: &[VersionedTransaction]) -> Result<BundleSend> {
         if txs.is_empty() {
             return Err(anyhow!("Cannot send an empty bundle"));
@@ -156,23 +172,49 @@ impl JitoSlot<'_> {
         self.mark_sent();
         let resp = match self.jito.http.post(self.jito.url()).json(&body).send() {
             Ok(resp) => resp,
-            // Unreachable, no answer in time, or the connection dropped: taken as not sent.
+            // Unreachable: not sent. No answer in time, or the connection dropped after the
+            // request went out: it may have arrived. Without the URL, which carries the auth uuid.
+            // Counts toward an outage, a hang included. A merely slow block engine still answers
+            // some requests in a burst, and any answer clears the count.
             Err(e) => {
                 self.jito.note_unavailable();
-                return Ok(BundleSend::Unavailable(e.to_string()));
+                let connect = e.is_connect();
+                let message = e.without_url().to_string();
+                return Ok(if connect {
+                    BundleSend::Unavailable(message)
+                } else {
+                    BundleSend::Uncertain(message)
+                });
             }
         };
-        // Our own rate limit: refused before the auction, so nothing waits for it.
+        // Refused before the auction, so nothing waits for it. Not an outage: the block engine
+        // answers 429 when congested, in exactly the bursts that matter, and answers fast.
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Ok(BundleSend::Rejected("rate limited (HTTP 429)".to_string()));
         }
-        // The block engine failing, as opposed to refusing this bundle: taken as not sent.
-        if status.is_server_error()
-            || status == reqwest::StatusCode::UNAUTHORIZED
+        // The block engine failing, as opposed to refusing this bundle. A server error (a gateway
+        // timing out, say) may come after the bundle reached it; an auth or path error means it
+        // didn't.
+        if status.is_server_error() {
+            self.jito.note_unavailable();
+            return Ok(BundleSend::Uncertain(format!("HTTP {status}")));
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED
             || status == reqwest::StatusCode::FORBIDDEN
             || status == reqwest::StatusCode::NOT_FOUND
         {
+            if status != reqwest::StatusCode::NOT_FOUND {
+                let mut last = AUTH_REJECTED_LOGGED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if last.is_none_or(|at| at.elapsed() >= AUTH_REJECTED_LOG_INTERVAL) {
+                    *last = Some(Instant::now());
+                    log::error!(
+                        "Jito: the block engine rejects the auth uuid (HTTP {status}); check JITO_API_KEY"
+                    );
+                }
+            }
             self.jito.note_unavailable();
             return Ok(BundleSend::Unavailable(format!("HTTP {status}")));
         }
@@ -181,9 +223,15 @@ impl JitoSlot<'_> {
         // Not the block engine's JSON-RPC (a proxy's page, a wrong endpoint): as good as down.
         let resp: Value = match resp.json() {
             Ok(resp) => resp,
+            // A 2xx it couldn't read still answered; anything else unreadable is as good as down.
             Err(e) => {
-                self.jito.note_unavailable();
-                return Ok(BundleSend::Unavailable(format!("unreadable answer: {e}")));
+                let message = format!("unreadable answer: {}", e.without_url());
+                return Ok(if status.is_success() {
+                    BundleSend::Uncertain(message)
+                } else {
+                    self.jito.note_unavailable();
+                    BundleSend::Unavailable(message)
+                });
             }
         };
         self.jito.note_reachable();
@@ -203,13 +251,18 @@ impl JitoSlot<'_> {
             "params": [[bundle_id]],
         });
         self.mark_sent();
+        // Errors without the URL, which carries the auth uuid.
         let resp: Value = self
             .jito
             .http
             .post(self.jito.url())
             .json(&body)
-            .send()?
-            .json()?;
+            // A status check is worth little if slow: the watch tries again.
+            .timeout(STATUS_TIMEOUT)
+            .send()
+            .map_err(|e| e.without_url())?
+            .json()
+            .map_err(|e| e.without_url())?;
         parse_inflight_status(&resp)
     }
 }
@@ -232,8 +285,9 @@ impl JitoClient {
         Self {
             http: Client::builder()
                 .timeout(REQUEST_TIMEOUT)
+                .connect_timeout(CONNECT_TIMEOUT)
                 .build()
-                .unwrap_or_else(|_| Client::new()),
+                .expect("the Jito HTTP client builds"),
             endpoint: endpoint.unwrap_or_else(|| DEFAULT_BUNDLE_ENDPOINT.to_string()),
             api_key,
             outage: Mutex::new(Outage::default()),
@@ -256,6 +310,13 @@ impl JitoClient {
     fn note_unavailable(&self) {
         let now = Instant::now();
         let mut outage = self.outage.lock().unwrap_or_else(|e| e.into_inner());
+        if outage
+            .failures
+            .back()
+            .is_some_and(|at| now.saturating_duration_since(*at) < OUTAGE_FAILURE_SPACING)
+        {
+            return;
+        }
         outage.failures.push_back(now);
         while outage
             .failures
@@ -291,7 +352,24 @@ impl JitoClient {
             return None;
         }
         state.held += 1;
-        Some(JitoSlot { jito: self })
+        Some(JitoSlot {
+            jito: self,
+            used: std::cell::Cell::new(false),
+        })
+    }
+
+    /// A request slot, waiting at most `max` for one to free up. Sleeps without the lock.
+    pub fn reserve_within(&self, max: Duration) -> Option<JitoSlot<'_>> {
+        let deadline = Instant::now() + max;
+        loop {
+            if let Some(slot) = self.try_reserve() {
+                return Some(slot);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(HELD_SLOT_RECHECK);
+        }
     }
 
     /// Requests admitted per window.
@@ -308,7 +386,10 @@ impl JitoClient {
             return None;
         }
         state.held += 1;
-        Some(JitoSlot { jito: self })
+        Some(JitoSlot {
+            jito: self,
+            used: std::cell::Cell::new(false),
+        })
     }
 
     /// Waits for a request slot and takes it, for a bundle that has no other way out. Sleeps
@@ -360,6 +441,9 @@ pub enum BundleSend {
     /// The block engine couldn't be reached or answered with an error: the bundle is taken as not
     /// sent, and repeated, as the block engine being down.
     Unavailable(String),
+    /// No usable answer after the request went out (a timeout, a dropped connection): it may
+    /// have arrived and may land.
+    Uncertain(String),
 }
 
 /// Serialize each transaction with bincode and base64-encode it for the bundle payload.
@@ -375,7 +459,7 @@ fn encode_transactions(txs: &[VersionedTransaction]) -> Result<Vec<String>> {
 
 /// Extract the bundle id from a `sendBundle` response, treating "already processed" as success.
 fn parse_send_bundle_result(resp: &Value) -> Result<String> {
-    if let Some(err) = resp.get("error") {
+    if let Some(err) = resp.get("error").filter(|err| !err.is_null()) {
         let msg = err
             .get("message")
             .and_then(|m| m.as_str())
@@ -396,7 +480,8 @@ fn parse_send_bundle_result(resp: &Value) -> Result<String> {
 pub enum InflightStatus {
     /// Still being auctioned; it may land.
     Pending,
-    Landed,
+    /// At this slot, when the block engine says.
+    Landed(Option<u64>),
     /// Every region gave up on it: it won't land.
     Failed,
     /// Unknown to the block engine, which forgets bundles after a few minutes: it won't land.
@@ -411,7 +496,7 @@ impl InflightStatus {
 }
 
 fn parse_inflight_status(resp: &Value) -> Result<Option<InflightStatus>> {
-    if let Some(err) = resp.get("error") {
+    if let Some(err) = resp.get("error").filter(|err| !err.is_null()) {
         return Err(anyhow!("Jito getInflightBundleStatuses error: {}", err));
     }
     Ok(
@@ -420,7 +505,10 @@ fn parse_inflight_status(resp: &Value) -> Result<Option<InflightStatus>> {
             .and_then(|s| s.as_str())
         {
             Some("Pending") => Some(InflightStatus::Pending),
-            Some("Landed") => Some(InflightStatus::Landed),
+            Some("Landed") => Some(InflightStatus::Landed(
+                resp.pointer("/result/value/0/landed_slot")
+                    .and_then(Value::as_u64),
+            )),
             Some("Failed") => Some(InflightStatus::Failed),
             Some("Invalid") => Some(InflightStatus::Invalid),
             _ => None,
@@ -579,6 +667,24 @@ mod tests {
             jito.try_reserve().is_none(),
             "used: the next one is a second away"
         );
+    }
+
+    #[test]
+    fn a_request_in_flight_counts_once() {
+        let jito = JitoClient::new(None, Some("uuid".to_string()));
+        let slot = jito.try_reserve().unwrap();
+        slot.mark_sent();
+        let counted = |jito: &JitoClient| {
+            let state = jito.slot.lock().unwrap();
+            (state.held, state.sent.len())
+        };
+        assert_eq!(counted(&jito), (0, 1), "sent, no longer held");
+        drop(slot);
+        assert_eq!(counted(&jito), (0, 1));
+        let unused = jito.try_reserve().unwrap();
+        assert_eq!(counted(&jito), (1, 1));
+        drop(unused);
+        assert_eq!(counted(&jito), (0, 1), "given back");
     }
 
     #[test]

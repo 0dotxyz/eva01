@@ -18,6 +18,7 @@ use crate::{
     tag_policy::{Balances, Candidate, TagPolicy},
     utils::{
         self,
+        helius_sender::HeliusSender,
         jito::{JitoClient, TipEstimator},
         log_genuine_error,
         pyth_push::{PythPusher, MAX_PUSHED_FEEDS},
@@ -186,9 +187,10 @@ impl ScanStats {
 /// cannot push the seizure over the cap.
 const PREMIUM_SAFETY_MARGIN: I80F48 = I80F48!(0.005);
 
-/// Liquidations are sized to this share of the most the program allows, leaving room for price
-/// moves between evaluation and landing; profit is judged on the same share.
-const LIQUIDATION_SIZE_HAIRCUT: I80F48 = I80F48!(0.90);
+/// Liquidations are sized to this share of the most the program allows, leaving room for what can
+/// still move before landing (feeds not pushed, interest, reserve rates; an oversized piece ends the
+/// account healthy, 6068); profit is judged on the same share.
+const LIQUIDATION_SIZE_HAIRCUT: I80F48 = I80F48!(0.95);
 
 /// Equity under this share of liabilities is close enough to bad debt that the program may judge
 /// the account insolvent on its prices: no tag premium is counted on.
@@ -751,6 +753,11 @@ impl Liquidator {
                     config.bundle_tip_profit_share,
                 ),
                 signer: Keypair::try_from(config.wallet_keypair.as_slice())?,
+                sender: config
+                    .helius_sender
+                    .as_ref()
+                    .map(|sender| HeliusSender::new(sender.url.clone(), sender.api_key.clone())),
+                cu_price_micro_lamports: config.compute_unit_price_micro_lamports,
             })
         } else {
             None

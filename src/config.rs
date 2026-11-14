@@ -59,6 +59,16 @@ pub struct Eva01Config {
     pub wallet_min_profit_share: f64,
     /// API key/uuid for `sendBundle`; `None` for the public (unauthenticated) path.
     pub bundle_api_key: Option<String>,
+    /// Helius Sender: bundles also go through it when `HELIUS_SENDER_API_KEY` or
+    /// `HELIUS_SENDER_URL` is set (keyless, one bundle a second).
+    pub helius_sender: Option<HeliusSenderConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HeliusSenderConfig {
+    /// `None` uses Sender's global endpoint.
+    pub url: Option<String>,
+    pub api_key: Option<String>,
 }
 
 impl Eva01Config {
@@ -161,6 +171,15 @@ impl Eva01Config {
             .ok()
             .filter(|key| !key.trim().is_empty());
 
+        let non_empty = |var: &str| std::env::var(var).ok().filter(|v| !v.trim().is_empty());
+        let helius_sender = match (
+            non_empty("HELIUS_SENDER_URL"),
+            non_empty("HELIUS_SENDER_API_KEY"),
+        ) {
+            (None, None) => None,
+            (url, api_key) => Some(HeliusSenderConfig { url, api_key }),
+        };
+
         Ok(Eva01Config {
             rpc_url,
             yellowstone_endpoint,
@@ -193,6 +212,7 @@ impl Eva01Config {
             bundle_tip_profit_share,
             wallet_min_profit_share,
             bundle_api_key,
+            helius_sender,
         })
     }
 }

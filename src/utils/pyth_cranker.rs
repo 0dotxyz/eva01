@@ -477,29 +477,34 @@ pub(crate) fn close_encoded_vaa_ix(
 }
 
 /// The Pyth-sponsored push feed account for `feed_id`. marginfi no longer sponsors a shard of its
-/// own, so shard 0 is the only one banks point at. Derived once per feed and remembered: the
-/// evaluation asks for it on every account near the threshold.
+/// own, so shard 0 is the only one banks point at.
 pub(crate) fn price_feed_address(feed_id: &[u8; 32]) -> Pubkey {
-    static ADDRESSES: std::sync::OnceLock<std::sync::RwLock<HashMap<[u8; 32], Pubkey>>> =
-        std::sync::OnceLock::new();
-    let addresses = ADDRESSES.get_or_init(Default::default);
-    if let Some(address) = addresses
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(feed_id)
-    {
-        return *address;
+    price_feed_pda(feed_id).0
+}
+
+/// The bump of `feed_id`'s push feed account. The push oracle derives the address again on every
+/// update, and each bump below 255 it tries first costs it ~1,500 compute units.
+pub(crate) fn price_feed_bump(feed_id: &[u8; 32]) -> u8 {
+    price_feed_pda(feed_id).1
+}
+
+/// Derived once per feed and remembered: the evaluation asks for it on every account near the
+/// threshold.
+fn price_feed_pda(feed_id: &[u8; 32]) -> (Pubkey, u8) {
+    type Pdas = std::sync::RwLock<HashMap<[u8; 32], (Pubkey, u8)>>;
+    static PDAS: std::sync::OnceLock<Pdas> = std::sync::OnceLock::new();
+    let pdas = PDAS.get_or_init(Default::default);
+    if let Some(pda) = pdas.read().unwrap_or_else(|e| e.into_inner()).get(feed_id) {
+        return *pda;
     }
-    let address = Pubkey::find_program_address(
+    let pda = Pubkey::find_program_address(
         &[&PYTH_SPONSORED_SHARD_ID.to_le_bytes(), feed_id],
         &PYTH_PUSH_ORACLE_ID,
-    )
-    .0;
-    addresses
-        .write()
+    );
+    pdas.write()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(*feed_id, address);
-    address
+        .insert(*feed_id, pda);
+    pda
 }
 
 /// Guardian set that signed the VAA: bytes 1..5 of the header, big-endian.
