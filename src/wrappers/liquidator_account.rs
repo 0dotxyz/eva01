@@ -45,6 +45,19 @@ use crate::transaction_limits::{
     bundle_cu_price, priority_fee_lamports, MAX_COMPUTE_UNIT_LIMIT, MAX_LOADED_ACCOUNTS_DATA,
     MAX_TX_ACCOUNT_LOCKS, MAX_V0_TX_SIZE, MAX_V1_TX_SIZE,
 };
+use crate::utils::quick_rpc::QuickRpc;
+
+/// The transaction ran in simulation and failed, as opposed to the simulation not running.
+#[derive(Debug)]
+pub struct SimulationFailed(pub String);
+
+impl std::fmt::Display for SimulationFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SimulationFailed {}
 
 /// Collateral tags `build_liquidate_tx` can withdraw. Staked banks hold a plain SPL LST, so they go
 /// through the standard withdraw like DEFAULT/SOL.
@@ -154,11 +167,15 @@ pub struct LiquidatorAccount {
     pub cache: Arc<Cache>,
     /// The swap venues' lookup tables, as last fetched. Routes keep reusing the same few.
     venue_luts: Mutex<HashMap<Pubkey, (AddressLookupTableAccount, Instant)>>,
+    /// Reads and simulations on the liquidation path: each fails within 2 s, never retried.
+    quick: Arc<QuickRpc>,
 }
 
 /// How long a venue's lookup table is used as fetched. Venues extend their tables now and then;
 /// a stale copy only leaves the new addresses outside it, in the transaction itself.
 const VENUE_LUT_TTL: Duration = Duration::from_secs(60);
+/// After a failed re-read, cached tables are asked about again this much later.
+const VENUE_LUT_RETRY: Duration = Duration::from_secs(5);
 
 impl LiquidatorAccount {
     pub fn new(config: &Eva01Config, marginfi_group_id: Pubkey, cache: Arc<Cache>) -> Result<Self> {
@@ -189,6 +206,7 @@ impl LiquidatorAccount {
             )),
             cache,
             venue_luts: Mutex::new(HashMap::new()),
+            quick: QuickRpc::shared(config.rpc_url.clone()),
         })
     }
 
@@ -569,17 +587,12 @@ impl LiquidatorAccount {
 
     /// Simulates `tx`. On failure returns the program error with the full simulation logs.
     pub fn simulate_tx(&self, tx: &VersionedTransaction) -> Result<()> {
-        let result = self.rpc_client.simulate_transaction(tx)?.value;
-        match result.err {
+        match self.quick.simulate(tx)? {
             None => Ok(()),
-            Some(err) => {
-                let logs = result.logs.unwrap_or_default();
-                Err(anyhow!(
-                    "simulation failed: {:?}; full_logs: {:?}",
-                    err,
-                    logs
-                ))
-            }
+            Some((err, logs)) => Err(SimulationFailed(format!(
+                "simulation failed: {err}; full_logs: {logs:?}"
+            ))
+            .into()),
         }
     }
 
@@ -598,9 +611,33 @@ impl LiquidatorAccount {
                 .collect()
         };
         if !missing.is_empty() {
-            let fetched = self
-                .rpc_client
-                .get_multiple_accounts(&missing)?
+            let accounts = match self.quick.multiple_accounts(&missing) {
+                Ok((_, accounts)) => accounts,
+                // A copy past its TTL serves while the RPC doesn't answer: a venue's table only
+                // grows, so a stale copy just leaves its newest addresses in the transaction.
+                Err(e) => {
+                    let mut cached = self.venue_luts.lock().unwrap_or_else(|e| e.into_inner());
+                    if missing.iter().all(|key| cached.contains_key(key)) {
+                        warn!("Lookup tables not re-read ({e}); using the cached copies");
+                        // Not asked again for a few seconds: every route build would pay the
+                        // failed read.
+                        let retry_at = now
+                            .checked_sub(VENUE_LUT_TTL.saturating_sub(VENUE_LUT_RETRY))
+                            .unwrap_or(now);
+                        for key in &missing {
+                            if let Some((_, at)) = cached.get_mut(key) {
+                                *at = retry_at;
+                            }
+                        }
+                        return Ok(keys
+                            .iter()
+                            .filter_map(|key| cached.get(key).map(|(table, _)| table.clone()))
+                            .collect());
+                    }
+                    return Err(e);
+                }
+            };
+            let fetched = accounts
                 .into_iter()
                 .zip(&missing)
                 .map(|(account, key)| {

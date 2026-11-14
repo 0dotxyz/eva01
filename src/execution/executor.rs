@@ -28,8 +28,7 @@ use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{debug, info, warn};
-use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_client::rpc_client::RpcClient;
 use solana_message::Hash;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -45,6 +44,7 @@ use crate::utils::{
     jito::{BundleSend, InflightStatus, JitoClient, JitoSlot, TipEstimator},
     pyth_cranker::price_feed_address,
     pyth_push::{PricePush, PythPusher},
+    quick_rpc::{QuickRpc, RpcRefused},
 };
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 use solana_keypair::Keypair;
@@ -59,13 +59,32 @@ const INFLIGHT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// The same, when the block engine admits one request a second: the checks would take most of
 /// the sends' windows.
 const INFLIGHT_CHECK_INTERVAL_UNAUTHENTICATED: Duration = Duration::from_secs(2);
+/// How long a bundle Sender refused waits for a Jito request slot (one rate window).
+const SENDER_REFUSED_JITO_WAIT: Duration = Duration::from_secs(1);
+
+/// How long a liquidation shown processed is waited for to confirm, from when it was first seen
+/// processed (confirmation takes about a second), before asking whether its fork was abandoned.
+const PROCESSED_WAIT: Duration = Duration::from_secs(8);
+/// Confirmed this many slots past a processed transaction's slot without it: its fork is gone.
+const ABANDONED_FORK_DEPTH: u64 = 32;
+
+/// An accepted Jito bundle the block engine was never asked about is taken as lost after this.
+const UNASKED_JITO_WINDOW: Duration = Duration::from_secs(5);
+/// Every relay given up and the RPC unreadable this long: taken as lost rather than held.
+const UNREADABLE_WHEN_LOST: Duration = Duration::from_secs(5);
+/// The blockhash is checked every this many polls.
+const BLOCKHASH_CHECK_EVERY: u32 = 4;
+
+/// The most a bundle is watched, whatever the RPC answers.
+const WATCH_MAX_WAIT: Duration = Duration::from_secs(45);
+
 /// Polls of the liquidation's signature, after an unconfirmed bundle, this far apart.
 const SIGNATURE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// How long a bundle sent through Helius Sender is given to land: about three slots (bundles were
-/// seen confirmed ~0.65 s after sending). Sender reports nothing about a bundle, so past this it
-/// counts as lost, unless the chain shows its liquidation processed.
-const SENDER_LANDING_WINDOW: Duration = Duration::from_millis(1_200);
+/// How long a bundle sent through Helius Sender is given to land: about seven slots (~215 ms each),
+/// against ~0.65 s seen from sending to confirmed. Sender reports nothing about a bundle, so
+/// past this it counts as lost, unless the chain shows its liquidation processed.
+const SENDER_LANDING_WINDOW: Duration = Duration::from_millis(1_600);
 
 /// Whether the RPC simulates a transaction before forwarding it. Every transaction is checked
 /// exactly once: one eva already simulated skips it.
@@ -86,6 +105,43 @@ impl std::fmt::Display for PushFailure {
 }
 
 impl std::error::Error for PushFailure {}
+
+/// No relay took the bundle while the block engine is down (Sender refused it or has no copy), so
+/// it never went out.
+#[derive(Debug)]
+struct NoRelay(String);
+
+impl std::fmt::Display for NoRelay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoRelay {}
+
+/// A bundle that couldn't be built (its tip transaction, say), before any relay saw it.
+#[derive(Debug)]
+struct BuildFailure(String);
+
+impl std::fmt::Display for BuildFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BuildFailure {}
+
+/// A bundle refused or never delivered, the block engine up: it spent nothing.
+#[derive(Debug)]
+struct NotSent(String);
+
+impl std::fmt::Display for NotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotSent {}
 
 /// A race lost: the bundle was accepted and didn't land, or the chain moved past a price the
 /// liquidation was sized on. Nothing changed, so the account may go again at once.
@@ -127,6 +183,8 @@ const SEND_MAX_WAIT: Duration = Duration::from_secs(90);
 /// a lagging RPC node and releasing the plan's claim on the last read.
 const SETTLE_ATTEMPTS: usize = 10;
 const SETTLE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+/// The most settling may take, whatever the RPC does.
+const SETTLE_MAX_WAIT: Duration = Duration::from_secs(3);
 
 /// Counts bundles built, to make each one's push, refresh and tip transactions unique.
 static NEXT_SEND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -184,6 +242,79 @@ struct SenderBundle {
     tip_tx: bool,
 }
 
+/// Whether `e` is a bundle no relay took: nothing went out, so another way may.
+fn nothing_sent(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<NotSent>().is_some() || e.downcast_ref::<NoRelay>().is_some()
+}
+
+/// What Sender answered, without its message.
+#[derive(Clone, Copy)]
+enum SenderSendKind {
+    Accepted,
+    Uncertain,
+    Refused,
+}
+
+/// What the watch knows at one poll, for [`should_settle`].
+#[derive(Clone, Copy, Debug, Default)]
+struct WatchFacts {
+    /// Seen processed, or reported landed by the block engine.
+    landing: bool,
+    /// Every relay's copy is given up (the block engine's failed or unheard of, Sender's window
+    /// passed).
+    relays_gave_up: bool,
+    blockhash_valid: bool,
+    /// This poll's status read failed.
+    rpc_unreadable: bool,
+    /// Status reads have failed for [`UNREADABLE_WHEN_LOST`].
+    rpc_unreadable_long: bool,
+    /// The block engine said its copy failed, and it was the only copy.
+    only_jito_dead: bool,
+    /// Seen processed for [`PROCESSED_WAIT`] while the chain confirmed well past its slot.
+    fork_abandoned: bool,
+    past_cap: bool,
+}
+
+/// Whether the watch stops to settle: at the cap; when the fork a processed liquidation was on is
+/// gone; or, for one not landing, once every relay gave up or the blockhash expired, provided the
+/// RPC can be read (or has failed long enough, or nothing it says could matter).
+fn should_settle(facts: WatchFacts) -> bool {
+    if facts.past_cap || facts.fork_abandoned {
+        return true;
+    }
+    if facts.landing {
+        return false;
+    }
+    (facts.relays_gave_up || !facts.blockhash_valid)
+        && (!facts.rpc_unreadable || facts.rpc_unreadable_long || facts.only_jito_dead)
+}
+
+/// What the final status read before settling found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Recheck {
+    Processed,
+    Unknown,
+    Unreadable,
+}
+
+/// Whether the final read means waiting on after all: a liquidation landing (seen processed, or
+/// reported landed) keeps waiting until its fork is gone; one not landing keeps waiting on an RPC
+/// that just failed, unless it has failed long enough or nothing it says could matter. Never past
+/// the cap.
+fn recheck_keeps_waiting(found: Recheck, facts: WatchFacts) -> bool {
+    if facts.past_cap {
+        return false;
+    }
+    match found {
+        Recheck::Processed => !facts.fork_abandoned,
+        Recheck::Unknown => facts.landing && !facts.fork_abandoned,
+        Recheck::Unreadable => {
+            !facts.fork_abandoned
+                && (facts.landing || (!facts.rpc_unreadable_long && !facts.only_jito_dead))
+        }
+    }
+}
+
 /// Which bundle landed the liquidation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Path {
@@ -203,19 +334,27 @@ impl std::fmt::Display for Path {
 /// A signature's state on chain.
 enum SignatureState {
     Confirmed(u64),
-    /// Processed, not yet confirmed: it may still land.
-    Processed,
+    /// Processed at this slot, not yet confirmed: it may still land.
+    Processed(u64),
     Reverted(anyhow::Error),
-    /// Not known, or the status couldn't be read.
+    /// Not known to the chain.
     Unknown,
+    /// The RPC didn't answer: nothing can be concluded.
+    Unreadable,
 }
 
 /// The bundles a liquidation went out in, as far as telling whether it landed goes.
 struct InFlight<'a> {
-    /// The block engine took it (or may have); with its id unless already processed.
+    /// The block engine took it; with its id unless already processed.
     jito: Option<Option<(&'a JitoClient, &'a str)>>,
+    /// The request to the block engine got no usable answer: the bundle may have arrived, with no
+    /// id to ask about, so it gets [`SENDER_LANDING_WINDOW`] like Sender's.
+    jito_uncertain: bool,
     /// Sender took it: its tip transaction's signature, which lands only with Sender's bundle.
     sender_tip: Option<Signature>,
+    /// Sender took it, or may have: watched for [`SENDER_LANDING_WINDOW`] even without a
+    /// Sender-only signature to tell its landing apart.
+    sender_in_flight: bool,
 }
 
 /// What became of a bundle sent to the block engine and Helius Sender.
@@ -246,7 +385,8 @@ fn wallet_goes_first(
 }
 
 pub struct Executor {
-    rpc_client: RpcClient,
+    /// The reads made while an account is in flight: each fails within 2 s, never retried.
+    quick: Arc<QuickRpc>,
     cache: Arc<Cache>,
     /// Liability-mint no-route quarantines and per-liquidatee transient backoffs.
     /// Accounts left alone until the instant given, after an attempt that found no plan or failed.
@@ -269,8 +409,9 @@ impl Executor {
         bundles: Option<BundleLanding>,
         wallet_min_profit_share: I80F48,
     ) -> Self {
+        let quick = QuickRpc::shared(rpc_client.url());
         Self {
-            rpc_client,
+            quick,
             cache,
             backoffs: Mutex::new(HashMap::new()),
             landed_slots: Mutex::new(HashMap::new()),
@@ -376,21 +517,39 @@ impl Executor {
             return self.execute_over_rpc(strategy, intent, liab_mint);
         };
         // While the block engine is down, what needs no push goes over RPC. A push never goes out
-        // without its bundle, so a liquidation that needs one goes through Sender alone, or, with
-        // no Sender, waits.
+        // without its bundle, so a liquidation that needs one goes through Sender alone when Sender
+        // takes it (its tip meets the minimum, the push fits), and otherwise gives way to the
+        // smaller liquidation the chain's prices allow, or waits.
         if bundles.jito.is_down() {
+            // Over RPC: Sender relays bundles partly through the block engine, so alone it may not
+            // land them while that is down.
             if !must_push {
                 return self.execute_over_rpc(strategy, intent, liab_mint);
             }
-            if bundles.sender.is_none() {
-                if let Some(unpushed) = intent.without_push.as_deref() {
-                    let liab_mint = self.intent_liab_mint(unpushed)?;
-                    return self.execute_over_rpc(strategy, unpushed, liab_mint);
+            if bundles
+                .sender
+                .as_ref()
+                .is_some_and(|sender| !sender.is_down())
+            {
+                let result = self.execute_as_bundle(strategy, intent, liab_mint, push);
+                // Nothing went out (`NotSent` too: the block engine came back up mid-attempt and
+                // refused it).
+                let no_relay = result.as_ref().is_err_and(|e| {
+                    e.downcast_ref::<NoRelay>().is_some()
+                        || e.downcast_ref::<NotSent>().is_some()
+                        || e.downcast_ref::<PushFailure>().is_some()
+                });
+                if !no_relay {
+                    return result;
                 }
-                return Err(anyhow!(
-                    "the block engine is down and the liquidation needs a price push"
-                ));
             }
+            if let Some(unpushed) = intent.without_push.as_deref() {
+                let liab_mint = self.intent_liab_mint(unpushed)?;
+                return self.execute_over_rpc(strategy, unpushed, liab_mint);
+            }
+            return Err(anyhow!(
+                "the block engine is down and the liquidation needs a price push"
+            ));
         }
         // Every liquidation goes as a bundle. A slot is all but always free at the key's rate,
         // and a wait for one is a few milliseconds.
@@ -400,12 +559,27 @@ impl Executor {
             let result = self.execute_as_bundle(strategy, intent, liab_mint, Some(push));
             if let (Err(e), Some(unpushed)) = (&result, intent.without_push.as_deref()) {
                 if e.downcast_ref::<PushFailure>().is_some() {
-                    return self.execute_without_push(strategy, unpushed);
+                    let result = self.execute_without_push(strategy, unpushed);
+                    if result.as_ref().is_err_and(nothing_sent) {
+                        let liab_mint = self.intent_liab_mint(unpushed)?;
+                        return self.execute_over_rpc(strategy, unpushed, liab_mint);
+                    }
+                    return result;
+                }
+                // No relay took it (the block engine refusing, as when congested, and no Sender
+                // copy): the unpushed liquidation goes over RPC rather than nowhere.
+                if nothing_sent(e) {
+                    let liab_mint = self.intent_liab_mint(unpushed)?;
+                    return self.execute_over_rpc(strategy, unpushed, liab_mint);
                 }
             }
             return result;
         }
-        self.execute_as_bundle(strategy, intent, liab_mint, None)
+        let result = self.execute_as_bundle(strategy, intent, liab_mint, None);
+        if result.as_ref().is_err_and(nothing_sent) {
+            return self.execute_over_rpc(strategy, intent, liab_mint);
+        }
+        result
     }
 
     /// Whether a wallet-funded plan goes before the sandwich (`wallet_goes_first`).
@@ -581,10 +755,8 @@ impl Executor {
     /// cache never lets an older read replace a newer one, so once this returns, the tokens the
     /// caller spent can no longer look free, and its claim on them can be released.
     pub fn refresh_wallet_balances(&self) {
-        let settled_at = match self
-            .rpc_client
-            .get_slot_with_commitment(CommitmentConfig::processed())
-        {
+        let started = Instant::now();
+        let settled_at = match self.quick.processed_slot() {
             Ok(slot) => slot,
             Err(e) => {
                 warn!("Failed to read the slot before refreshing the wallet balances: {e}");
@@ -592,7 +764,17 @@ impl Executor {
             }
         };
         for _ in 0..SETTLE_ATTEMPTS {
-            match self.cache.refresh_wallet_tokens(&self.rpc_client) {
+            // The account and its claim wait on this: `SETTLE_MAX_WAIT`, plus one read at most.
+            if started.elapsed() >= SETTLE_MAX_WAIT {
+                break;
+            }
+            // Every read checks the deadline, so it holds within one call's timeout.
+            match self.cache.refresh_wallet_tokens_with(|chunk| {
+                if started.elapsed() >= SETTLE_MAX_WAIT {
+                    return Err(anyhow!("out of time"));
+                }
+                self.quick.multiple_accounts(chunk)
+            }) {
                 Ok(read_at) if read_at >= settled_at => return,
                 Ok(read_at) => debug!(
                     "Wallet balances read at slot {read_at}, short of {settled_at}; reading again"
@@ -631,13 +813,9 @@ impl Executor {
 
     /// Simulates `tx` against the chain's current state; a failure carries the program's last logs.
     fn simulate(&self, tx: &VersionedTransaction) -> Result<()> {
-        let simulation = self.rpc_client.simulate_transaction(tx)?.value;
-        match simulation.err {
+        match self.quick.simulate(tx)? {
             None => Ok(()),
-            Some(err) => {
-                let logs = simulation.logs.unwrap_or_default();
-                Err(anyhow!("simulation failed: {err:?}; full_logs: {logs:?}"))
-            }
+            Some((err, logs)) => Err(anyhow!("simulation failed: {err}; full_logs: {logs:?}")),
         }
     }
 
@@ -830,7 +1008,10 @@ impl Executor {
         // liquidation, behind the push built again with Sender's tip inside, or followed by a
         // tip transaction.
         let sender_bundle = match (&bundles.sender, push) {
-            (Some(_), _) if tip < helius_sender::MIN_TIP_LAMPORTS => None,
+            (Some(sender), _) if tip < helius_sender::MIN_TIP_LAMPORTS || sender.is_down() => None,
+            // Without the block engine, a bundle with no push goes over RPC instead (the caller's
+            // fallback for a bundle nothing took): Sender alone may not land it then.
+            (Some(_), None) if bundles.jito.is_down() => None,
             (Some(_), Some(push)) => self.sender_push(bundles, push, tip, send).and_then(|txs| {
                 let mut txs = txs;
                 txs.extend(refresh_tx.clone());
@@ -865,8 +1046,10 @@ impl Executor {
         );
 
         // The request slot is taken only now, everything built, so none is held while quoting.
-        // With Sender taking the bundle too, it never waits for one.
-        let slot = if bundles.jito.is_down() {
+        // With Sender taking the bundle too, it doesn't wait for one (unless Sender refuses).
+        // Whether the block engine was skipped as down, decided once, for what a refusal means.
+        let jito_down = bundles.jito.is_down();
+        let slot = if jito_down {
             None
         } else if sender_bundle.is_some() {
             bundles.jito.try_reserve()
@@ -880,6 +1063,7 @@ impl Executor {
             sender_bundle.as_ref(),
             tip,
             slot,
+            jito_down,
         ) {
             Ok(BundleOutcome::Landed(slot)) => {
                 self.landed_slots
@@ -888,13 +1072,36 @@ impl Executor {
                     .insert(liquidatee, slot);
                 Ok(())
             }
-            Ok(BundleOutcome::NotLanded) => Err(LostRace(format!(
+            // Why is asked after the claim is released, below: it costs a simulation.
+            Ok(BundleOutcome::NotLanded) => Err(LostRace(String::new()).into()),
+            Ok(BundleOutcome::Refused) if jito_down => Err(NoRelay(format!(
+                "the bundle for {liquidatee} wasn't sent: the block engine is down and Sender didn't take it"
+            ))
+            .into()),
+            Ok(BundleOutcome::Refused) => {
+                Err(NotSent(format!("the bundle for {liquidatee} wasn't sent")).into())
+            }
+            Err(e) if e.downcast_ref::<BuildFailure>().is_some() => {
+                Err(NotSent(format!("the bundle for {liquidatee} wasn't sent: {e}")).into())
+            }
+            Err(e) => Err(e),
+        };
+        // A sandwich claims no wallet tokens, and a bundle that never went out spent none: nothing
+        // waits for the balances to be re-read.
+        let sent = !result.as_ref().is_err_and(|e| {
+            e.downcast_ref::<NoRelay>().is_some() || e.downcast_ref::<NotSent>().is_some()
+        });
+        if claim.is_some() && sent {
+            self.refresh_wallet_balances();
+        }
+        drop(claim);
+        let result = match result {
+            Err(e) if e.downcast_ref::<LostRace>().is_some() => Err(LostRace(format!(
                 "the bundle for {liquidatee} didn't land: {}",
                 self.why_not_landed(&bundle, push.is_some() || behind_refresh)
             ))
             .into()),
-            Ok(BundleOutcome::Refused) => Err(anyhow!("the bundle for {liquidatee} wasn't sent")),
-            Err(e) => Err(e),
+            result => result,
         };
         // A bundle that didn't land costs nothing and holds nothing back: the account is evaluated
         // afresh. Only the premium cap holds it, as retrying the same sizing fails the same way.
@@ -906,11 +1113,6 @@ impl Executor {
             }
             Err(_) => {}
         }
-        // A sandwich claims no wallet tokens, so nothing waits for the balances to be re-read.
-        if claim.is_some() {
-            self.refresh_wallet_balances();
-        }
-        drop(claim);
         result
     }
 
@@ -945,44 +1147,46 @@ impl Executor {
         sender_bundle: Option<&SenderBundle>,
         tip: u64,
         slot: Option<JitoSlot<'_>>,
+        jito_down: bool,
     ) -> Result<BundleOutcome> {
-        let liquidation = bundle.last().ok_or_else(|| anyhow!("empty bundle"))?;
+        let built = |e: anyhow::Error| anyhow::Error::from(BuildFailure(e.to_string()));
+        let liquidation = bundle
+            .last()
+            .ok_or_else(|| built(anyhow!("empty bundle")))?;
         let liquidation_sig = *liquidation
             .signatures
             .first()
-            .ok_or_else(|| anyhow!("unsigned liquidation"))?;
+            .ok_or_else(|| built(anyhow!("unsigned liquidation")))?;
         // The tips go out with the liquidation's blockhash, so they expire with it.
         let blockhash = *liquidation.message.recent_blockhash();
-        let jito_txs = match slot {
-            Some(slot) => {
-                let mut txs = bundle.to_vec();
-                txs.push(bundles.tip_estimator.build_tip_transaction(
-                    &bundles.signer,
-                    blockhash,
-                    tip,
-                )?);
-                Some((slot, txs))
-            }
-            None => None,
-        };
+        let mut jito_txs = bundle.to_vec();
+        jito_txs.push(
+            bundles
+                .tip_estimator
+                .build_tip_transaction(&bundles.signer, blockhash, tip)
+                .map_err(built)?,
+        );
         let sender_txs = match (&bundles.sender, sender_bundle) {
             (Some(sender), Some(sender_bundle)) => {
                 let mut txs = sender_bundle.txs.clone();
                 if sender_bundle.tip_tx {
-                    txs.push(helius_sender::build_tip_transaction(
-                        &bundles.signer,
-                        blockhash,
-                        tip,
-                        bundles.cu_price_micro_lamports,
-                    )?);
+                    txs.push(
+                        helius_sender::build_tip_transaction(
+                            &bundles.signer,
+                            blockhash,
+                            tip,
+                            bundles.cu_price_micro_lamports,
+                        )
+                        .map_err(built)?,
+                    );
                 }
                 Some((sender, txs))
             }
             _ => None,
         };
-        if jito_txs.is_none() && sender_txs.is_none() {
+        if slot.is_none() && sender_txs.is_none() {
             warn!(
-                "LIQUIDATION_BUNDLE_REJECTED attempt_id={attempt_id} liquidation_signature={liquidation_sig} reason=no free Jito request slot and no Sender bundle"
+                "LIQUIDATION_BUNDLE_REJECTED attempt_id={attempt_id} liquidation_signature={liquidation_sig} reason=no Jito request (down or no free slot) and no Sender bundle"
             );
             return Ok(BundleOutcome::Refused);
         }
@@ -990,7 +1194,7 @@ impl Executor {
             let sender_send = sender_txs
                 .as_ref()
                 .map(|(sender, txs)| scope.spawn(|| sender.send_bundle(txs)));
-            let jito_send = jito_txs.map(|(slot, txs)| slot.send_bundle(&txs));
+            let jito_send = slot.map(|slot| slot.send_bundle(&jito_txs));
             (
                 jito_send,
                 sender_send.map(|handle| {
@@ -1001,11 +1205,29 @@ impl Executor {
             )
         });
 
+        // Sender refused and no Jito request slot was free: wait for one after all.
+        let sender_refused = matches!(sender_send, Some(SenderSend::Refused(_)));
+        let jito_send = match jito_send {
+            None if sender_refused && !jito_down => bundles
+                .jito
+                .reserve_within(SENDER_REFUSED_JITO_WAIT)
+                .map(|slot| slot.send_bundle(&jito_txs)),
+            jito_send => jito_send,
+        };
+        // "0x0" (already processed) has no id to ask about: watched like an uncertain answer.
+        let jito_uncertain = matches!(&jito_send, Some(Ok(BundleSend::Uncertain(_))))
+            || matches!(&jito_send, Some(Ok(BundleSend::Accepted(id))) if id == "0x0");
         let jito_id = match jito_send {
             Some(Ok(BundleSend::Accepted(id))) => Some(id),
             Some(Ok(BundleSend::Rejected(reason))) => {
                 warn!(
                     "LIQUIDATION_BUNDLE_REJECTED attempt_id={attempt_id} liquidation_signature={liquidation_sig} reason={reason}"
+                );
+                None
+            }
+            Some(Ok(BundleSend::Uncertain(reason))) => {
+                warn!(
+                    "LIQUIDATION_BUNDLE_UNCERTAIN attempt_id={attempt_id} liquidation_signature={liquidation_sig} reason={reason}"
                 );
                 None
             }
@@ -1026,11 +1248,25 @@ impl Executor {
             None => None,
         };
         // A transaction only Sender's bundle has tells which copy landed.
-        let sender_tip = match (sender_send, &sender_txs) {
-            (Some(SenderSend::Accepted), Some((_, txs))) => txs
-                .iter()
+        let sender_only = |txs: &[VersionedTransaction]| {
+            txs.iter()
                 .filter_map(|tx| tx.signatures.first().copied())
-                .find(|sig| !bundle.iter().any(|tx| tx.signatures.first() == Some(sig))),
+                .find(|sig| !bundle.iter().any(|tx| tx.signatures.first() == Some(sig)))
+        };
+        let sender_send_kind = sender_send.as_ref().map(|send| match send {
+            SenderSend::Accepted => SenderSendKind::Accepted,
+            SenderSend::Uncertain(_) => SenderSendKind::Uncertain,
+            SenderSend::Refused(_) => SenderSendKind::Refused,
+        });
+        let sender_tip = match (sender_send, &sender_txs) {
+            (Some(SenderSend::Accepted), Some((_, txs))) => sender_only(txs),
+            // It may have arrived: watched like an accepted one.
+            (Some(SenderSend::Uncertain(reason)), Some((_, txs))) => {
+                warn!(
+                    "LIQUIDATION_SENDER_UNCERTAIN attempt_id={attempt_id} liquidation_signature={liquidation_sig} reason={reason}"
+                );
+                sender_only(txs)
+            }
             (Some(SenderSend::Refused(reason)), _) => {
                 warn!(
                     "LIQUIDATION_SENDER_REJECTED attempt_id={attempt_id} liquidation_signature={liquidation_sig} reason={reason}"
@@ -1039,14 +1275,18 @@ impl Executor {
             }
             _ => None,
         };
-        if jito_id.is_none() && sender_tip.is_none() {
+        let sender_in_flight = matches!(
+            &sender_send_kind,
+            Some(SenderSendKind::Accepted | SenderSendKind::Uncertain)
+        );
+        if jito_id.is_none() && !jito_uncertain && !sender_in_flight {
             return Ok(BundleOutcome::Refused);
         }
         info!(
             "LIQUIDATION_BUNDLE_ACCEPTED attempt_id={} bundle_id={} sender={} liquidation_signature={} txs_before_liquidation={}",
             attempt_id,
             jito_id.as_deref().unwrap_or("-"),
-            sender_tip.is_some(),
+            sender_in_flight,
             liquidation_sig,
             bundle.len().saturating_sub(1)
         );
@@ -1056,7 +1296,9 @@ impl Executor {
             jito: jito_id
                 .as_deref()
                 .map(|id| (id != "0x0").then_some((&bundles.jito, id))),
+            jito_uncertain,
             sender_tip,
+            sender_in_flight,
         };
         Ok(
             match self.landed_before_expiry(attempt_id, &liquidation_sig, &blockhash, in_flight)? {
@@ -1085,55 +1327,151 @@ impl Executor {
             _ => INFLIGHT_CHECK_INTERVAL,
         };
         // The block engine's copy can't land: never sent, or reported failed.
-        let mut jito_lost = in_flight.jito.is_none();
+        let mut jito_lost = in_flight.jito.is_none() && !in_flight.jito_uncertain;
+        // When the liquidation was first seen processed, and at which slot last: once seen, it is
+        // landing until its fork is shown gone, whatever a lagging node answers next.
+        let mut seen_processed: Option<(Instant, u64)> = None;
+        let mut jito_reported_dead = false;
+        let mut jito_landed: Option<Option<u64>> = None;
+        let mut jito_landed_at: Option<Instant> = None;
+        let mut last_jito_answer = started;
+        let mut unreadable_since: Option<Instant> = None;
+        let mut polls: u32 = 0;
+        let mut valid = true;
         let mut watched = vec![*sig];
         watched.extend(in_flight.sender_tip);
+        let landed = |slot: u64, via_sender: bool| {
+            let via = if via_sender { Path::Sender } else { Path::Jito };
+            info!(
+                "LIQUIDATION_BUNDLE_LANDED attempt_id={attempt_id} liquidation_signature={sig} slot={slot} via={via} elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            Some(slot)
+        };
         loop {
             let (state, via_sender) = self.signature_states(&watched);
-            let processed = match state {
-                SignatureState::Confirmed(slot) => {
-                    let via = if via_sender { Path::Sender } else { Path::Jito };
-                    info!(
-                        "LIQUIDATION_BUNDLE_LANDED attempt_id={attempt_id} liquidation_signature={sig} slot={slot} via={via} elapsed_ms={}",
-                        started.elapsed().as_millis()
-                    );
-                    return Ok(Some(slot));
-                }
+            match state {
+                SignatureState::Confirmed(slot) => return Ok(landed(slot, via_sender)),
                 SignatureState::Reverted(reverted) => return Err(reverted),
-                SignatureState::Processed => true,
-                SignatureState::Unknown => false,
-            };
+                SignatureState::Processed(slot) => {
+                    let since = seen_processed.map_or_else(Instant::now, |(at, _)| at);
+                    seen_processed = Some((since, slot));
+                }
+                SignatureState::Unknown | SignatureState::Unreadable => {}
+            }
+            let rpc_unreadable = matches!(state, SignatureState::Unreadable);
+            if !rpc_unreadable {
+                unreadable_since = None;
+            } else if unreadable_since.is_none() {
+                unreadable_since = Some(Instant::now());
+            }
             if let Some(Some((jito, id))) = in_flight.jito {
-                if !jito_lost && last_inflight_check.elapsed() >= check_interval {
+                // A block engine taken as down isn't asked: it would only cost the timeout.
+                if !jito_lost
+                    && !jito.is_down()
+                    && last_inflight_check.elapsed() >= check_interval
+                    && started.elapsed() < WATCH_MAX_WAIT
+                {
                     last_inflight_check = Instant::now();
                     // Only in a spare slot: sends need them more.
-                    jito_lost = jito.try_reserve_spare().is_some_and(|slot| {
-                        slot.inflight_bundle_status(id)
-                            .ok()
-                            .flatten()
-                            .is_some_and(InflightStatus::is_dead)
-                    });
+                    if let Some(status) = jito
+                        .try_reserve_spare()
+                        .and_then(|slot| slot.inflight_bundle_status(id).ok().flatten())
+                    {
+                        last_jito_answer = Instant::now();
+                        jito_lost = status.is_dead();
+                        jito_reported_dead = status.is_dead();
+                        if let InflightStatus::Landed(slot) = status {
+                            jito_landed = Some(slot);
+                            jito_landed_at.get_or_insert_with(Instant::now);
+                        }
+                    }
+                }
+                // Not heard about for a while (down, failing, or no spare request slot): taken as
+                // lost once it would most likely have landed, unless it was reported landed.
+                if jito_landed.is_none() && last_jito_answer.elapsed() >= UNASKED_JITO_WINDOW {
+                    jito_lost = true;
                 }
             }
+            if in_flight.jito_uncertain && started.elapsed() >= SENDER_LANDING_WINDOW {
+                jito_lost = true;
+            }
             let sender_lost =
-                in_flight.sender_tip.is_none() || started.elapsed() >= SENDER_LANDING_WINDOW;
-            let valid = self
-                .rpc_client
-                .is_blockhash_valid(blockhash, CommitmentConfig::processed())
-                .unwrap_or(true);
-            let lost = (jito_lost && sender_lost) || !valid;
-            if (lost && !processed) || started.elapsed() > SEND_MAX_WAIT {
-                // It may have been processed in the meantime.
-                if let (SignatureState::Confirmed(slot), _) = self.signature_states(&watched) {
-                    return Ok(Some(slot));
+                !in_flight.sender_in_flight || started.elapsed() >= SENDER_LANDING_WINDOW;
+            // The blockhash is checked every few polls (it lives ~32 s), not before every one.
+            polls += 1;
+            if polls.is_multiple_of(BLOCKHASH_CHECK_EVERY) && started.elapsed() < WATCH_MAX_WAIT {
+                valid = self
+                    .quick
+                    .is_blockhash_valid(blockhash)
+                    .unwrap_or_else(|_| !self.cache.blockhash.assumed_expired(blockhash, started));
+            }
+            let mut facts = WatchFacts {
+                landing: seen_processed.is_some() || jito_landed.is_some(),
+                relays_gave_up: jito_lost && sender_lost,
+                blockhash_valid: valid,
+                rpc_unreadable,
+                rpc_unreadable_long: unreadable_since
+                    .is_some_and(|at| at.elapsed() >= UNREADABLE_WHEN_LOST),
+                only_jito_dead: jito_reported_dead
+                    && !in_flight.sender_in_flight
+                    && !in_flight.jito_uncertain,
+                // The fork of what the chain showed processed, or else of the slot the block
+                // engine reported it landed at.
+                fork_abandoned: match (seen_processed, jito_landed, jito_landed_at) {
+                    (Some((at, slot)), _, _) => {
+                        at.elapsed() >= PROCESSED_WAIT && self.fork_abandoned(slot)
+                    }
+                    (None, Some(Some(slot)), Some(at)) => {
+                        at.elapsed() >= PROCESSED_WAIT && self.fork_abandoned(slot)
+                    }
+                    _ => false,
+                },
+                past_cap: started.elapsed() > WATCH_MAX_WAIT,
+            };
+            if should_settle(facts) {
+                // It may have been confirmed in the meantime.
+                let found = match self.signature_states(&watched) {
+                    (SignatureState::Confirmed(slot), via_sender) => {
+                        return Ok(landed(slot, via_sender))
+                    }
+                    (SignatureState::Reverted(reverted), _) => return Err(reverted),
+                    (SignatureState::Processed(slot), _) => {
+                        // Processed at another slot than the one whose fork was judged gone (a
+                        // node behind, or the other copy on the fork that won): judged afresh.
+                        if facts.fork_abandoned
+                            && seen_processed.is_some_and(|(_, checked)| checked != slot)
+                        {
+                            facts.fork_abandoned = self.fork_abandoned(slot);
+                        }
+                        let since = seen_processed.map_or_else(Instant::now, |(at, _)| at);
+                        seen_processed = Some((since, slot));
+                        facts.landing = true;
+                        Recheck::Processed
+                    }
+                    (SignatureState::Unknown, _) => Recheck::Unknown,
+                    (SignatureState::Unreadable, _) => Recheck::Unreadable,
+                };
+                if recheck_keeps_waiting(found, facts) {
+                    thread::sleep(SIGNATURE_POLL_INTERVAL);
+                    continue;
+                }
+                // At the cap with the RPC unable to say, the block engine's word that it landed
+                // stands.
+                if found == Recheck::Unreadable && !facts.fork_abandoned {
+                    if let Some(Some(slot)) = jito_landed {
+                        return Ok(landed(slot, false));
+                    }
                 }
                 warn!(
                     "LIQUIDATION_BUNDLE_LOST attempt_id={attempt_id} liquidation_signature={sig} elapsed_ms={} reason={}",
                     started.elapsed().as_millis(),
-                    if !valid {
-                        "blockhash expired"
-                    } else if started.elapsed() > SEND_MAX_WAIT {
+                    if facts.fork_abandoned {
+                        "processed on an abandoned fork"
+                    } else if facts.past_cap {
                         "timed out"
+                    } else if !valid {
+                        "blockhash expired"
                     } else {
                         "every relay gave up"
                     }
@@ -1144,22 +1482,28 @@ impl Executor {
         }
     }
 
+    /// Whether the chain confirmed well past `slot`, so a transaction processed there and still
+    /// unconfirmed was on an abandoned fork. Not when the RPC can't say.
+    fn fork_abandoned(&self, slot: u64) -> bool {
+        self.quick
+            .confirmed_slot()
+            .is_ok_and(|confirmed| confirmed > slot + ABANDONED_FORK_DEPTH)
+    }
+
     /// The state of `sigs[0]`, and whether `sigs[1]`, when given, is on chain too.
     fn signature_states(&self, sigs: &[Signature]) -> (SignatureState, bool) {
-        let Ok(statuses) = self.rpc_client.get_signature_statuses(sigs) else {
-            return (SignatureState::Unknown, false);
+        let Ok(statuses) = self.quick.signature_statuses(sigs) else {
+            return (SignatureState::Unreadable, false);
         };
-        let mut statuses = statuses.value.into_iter();
+        let mut statuses = statuses.into_iter();
         let state = match statuses.next().flatten() {
             None => SignatureState::Unknown,
             Some(status) => match status.err {
                 Some(err) => {
-                    SignatureState::Reverted(anyhow!("{} reverted on-chain: {err:?}", sigs[0]))
+                    SignatureState::Reverted(anyhow!("{} reverted on-chain: {err}", sigs[0]))
                 }
-                None if status.satisfies_commitment(CommitmentConfig::confirmed()) => {
-                    SignatureState::Confirmed(status.slot)
-                }
-                None => SignatureState::Processed,
+                None if status.confirmed => SignatureState::Confirmed(status.slot),
+                None => SignatureState::Processed(status.slot),
             },
         };
         (state, statuses.next().flatten().is_some())
@@ -1219,24 +1563,6 @@ impl Executor {
         Ok(())
     }
 
-    /// Whether `sig` is on chain: `Some(Ok)` once confirmed, `Some(Err)` if it reverted, `None`
-    /// if it isn't known or the status can't be read.
-    fn landed_status(&self, sig: &Signature) -> Option<Result<u64>> {
-        let status = self
-            .rpc_client
-            .get_signature_statuses(&[*sig])
-            .ok()?
-            .value
-            .into_iter()
-            .next()??;
-        if let Some(err) = status.err {
-            return Some(Err(anyhow!("{sig} reverted on-chain: {err:?}")));
-        }
-        status
-            .satisfies_commitment(CommitmentConfig::confirmed())
-            .then_some(Ok(status.slot))
-    }
-
     /// Sends `tx`, with the RPC's preflight simulation unless eva already simulated it, then
     /// re-sends it every [`RESEND_INTERVAL`] (without preflight) while polling its status, until it
     /// is confirmed, reverts, or its blockhash expires. Only this one transaction is waited on:
@@ -1247,44 +1573,62 @@ impl Executor {
         preflight: Preflight,
     ) -> Result<Signature> {
         let blockhash = *tx.message.recent_blockhash();
-        let sig = match self.rpc_client.send_transaction_with_config(
-            tx,
-            RpcSendTransactionConfig {
-                skip_preflight: preflight == Preflight::Skip,
-                preflight_commitment: Some(CommitmentLevel::Processed),
-                ..Default::default()
-            },
-        ) {
+        let sig = match self
+            .quick
+            .send_transaction(tx, preflight == Preflight::Skip)
+        {
             Ok(sig) => sig,
-            Err(e) => {
-                // A transaction that already landed, from a bundle that landed late for instance,
-                // is rejected by preflight; the chain says whether that is a success.
+            // The node refused it (a failed preflight, or one that already landed, from a bundle
+            // that landed late for instance): the chain says whether that is a success.
+            // Processed but not yet confirmed (or the status unreadable) is watched below.
+            Err(e) if e.downcast_ref::<RpcRefused>().is_some() => {
                 let sig = tx
                     .signatures
                     .first()
                     .copied()
                     .ok_or_else(|| anyhow!("unsigned transaction"))?;
-                return match self.landed_status(&sig) {
-                    Some(Ok(_)) => Ok(sig),
-                    Some(Err(reverted)) => Err(reverted),
-                    None => Err(e.into()),
-                };
+                let already_processed = e.to_string().contains("AlreadyProcessed")
+                    || e.to_string().contains("already been processed");
+                match self.quick.signature_statuses(&[sig]).as_deref() {
+                    Ok([Some(status)]) if status.err.is_some() => {
+                        return Err(anyhow!(
+                            "{sig} reverted on-chain: {}",
+                            status.err.as_deref().unwrap_or_default()
+                        ))
+                    }
+                    Ok([Some(status)]) if status.confirmed => return Ok(sig),
+                    // A node behind the one that refused it may not know it yet.
+                    Ok([None]) if !already_processed => return Err(e),
+                    _ => sig,
+                }
+            }
+            // No answer (a slow preflight, a dropped connection): it may have gone out, so it is
+            // watched and re-sent like a sent one.
+            Err(e) => {
+                debug!("send got no answer ({e}); watching the signature");
+                tx.signatures
+                    .first()
+                    .copied()
+                    .ok_or_else(|| anyhow!("unsigned transaction"))?
             }
         };
 
         let started = Instant::now();
         let mut last_sent = Instant::now();
         let mut resends = 0u32;
+        let mut preflight_failures = 0u32;
+        let mut seen_processed: Option<u64> = None;
         loop {
             thread::sleep(STATUS_POLL_INTERVAL);
 
-            match self.rpc_client.get_signature_statuses(&[sig]) {
-                Ok(resp) => {
-                    if let Some(Some(status)) = resp.value.into_iter().next() {
+            match self.quick.signature_statuses(&[sig]) {
+                Ok(statuses) => {
+                    if let Some(Some(status)) = statuses.into_iter().next() {
                         if let Some(err) = status.err {
-                            return Err(anyhow!("{sig} reverted on-chain: {err:?}"));
+                            return Err(anyhow!("{sig} reverted on-chain: {err}"));
                         }
-                        if status.satisfies_commitment(CommitmentConfig::confirmed()) {
+                        seen_processed = Some(status.slot);
+                        if status.confirmed {
                             if resends > 0 {
                                 debug!("{sig} confirmed after {resends} re-send(s)");
                             }
@@ -1296,13 +1640,36 @@ impl Executor {
             }
 
             let blockhash_valid = self
-                .rpc_client
-                .is_blockhash_valid(&blockhash, CommitmentConfig::processed())
-                .unwrap_or(true);
+                .quick
+                .is_blockhash_valid(&blockhash)
+                .unwrap_or_else(|_| !self.cache.blockhash.assumed_expired(&blockhash, started));
             if !blockhash_valid || started.elapsed() > SEND_MAX_WAIT {
-                // Processed in the blockhash's last slots, it confirms after the hash expired.
-                if let Some(landed) = self.landed_status(&sig) {
-                    return landed.map(|_| sig);
+                // Processed in the blockhash's last slots, it confirms after the hash expired:
+                // waited for, within the cap, unless its fork is gone.
+                match self.quick.signature_statuses(&[sig]).as_deref() {
+                    Ok([Some(status)]) if status.err.is_some() => {
+                        return Err(anyhow!(
+                            "{sig} reverted on-chain: {}",
+                            status.err.as_deref().unwrap_or_default()
+                        ))
+                    }
+                    Ok([Some(status)]) if status.confirmed => return Ok(sig),
+                    Ok([Some(status)])
+                        if started.elapsed() <= SEND_MAX_WAIT
+                            && !self.fork_abandoned(status.slot) =>
+                    {
+                        continue;
+                    }
+                    // Seen processed before: an empty or failed read from a node behind doesn't
+                    // undo that; only its fork being gone, or the cap, does.
+                    Ok([None]) | Err(_)
+                        if seen_processed.is_some_and(|slot| {
+                            started.elapsed() <= SEND_MAX_WAIT && !self.fork_abandoned(slot)
+                        }) =>
+                    {
+                        continue;
+                    }
+                    _ => {}
                 }
                 return Err(anyhow!(
                     "{sig} not confirmed after {}s and {resends} re-send(s) (blockhash valid: {blockhash_valid})",
@@ -1311,16 +1678,35 @@ impl Executor {
             }
 
             if last_sent.elapsed() >= RESEND_INTERVAL {
-                // Already-processed and similar rejections mean it landed or is landing; the
-                // status poll above settles it either way.
-                if let Err(e) = self.rpc_client.send_transaction_with_config(
-                    tx,
-                    RpcSendTransactionConfig {
-                        skip_preflight: true,
-                        ..Default::default()
-                    },
-                ) {
+                // With the preflight it was meant to have: a re-send never skips the only check a
+                // wallet-funded plan gets. Already-processed and similar rejections mean it landed
+                // or is landing, which the status poll settles; a preflight that fails while the
+                // chain doesn't know it means it won't land.
+                if let Err(e) = self
+                    .quick
+                    .send_transaction(tx, preflight == Preflight::Skip)
+                {
+                    // A failed preflight while the chain answers that it doesn't know the
+                    // transaction at all means it won't land. Processed (its own effects fail the
+                    // re-run), or a status that can't be read, keeps it watched.
+                    // Twice in a row, so one transient state (a price at processed commitment)
+                    // doesn't abandon a copy still in flight.
+                    let preflight_failed = e
+                        .downcast_ref::<RpcRefused>()
+                        .is_some_and(RpcRefused::is_preflight_failure);
+                    preflight_failures = if preflight_failed {
+                        preflight_failures + 1
+                    } else {
+                        0
+                    };
+                    if preflight_failures >= 2
+                        && matches!(self.quick.signature_statuses(&[sig]).as_deref(), Ok([None]))
+                    {
+                        return Err(e);
+                    }
                     debug!("re-send of {sig} rejected: {e}");
+                } else {
+                    preflight_failures = 0;
                 }
                 last_sent = Instant::now();
                 resends += 1;
@@ -1456,6 +1842,109 @@ mod tests {
         executor.note_result(&account, &Err(anyhow!("custom program error: 0x17ca")));
         let until = executor.backoffs.lock().unwrap()[&account];
         assert!(until.saturating_duration_since(Instant::now()) <= RPC_FAILURE_HOLD);
+    }
+
+    #[test]
+    fn the_watch_settles_only_when_nothing_can_still_land() {
+        let base = WatchFacts {
+            blockhash_valid: true,
+            ..WatchFacts::default()
+        };
+        // Relays still out: keep watching.
+        assert!(!should_settle(base));
+        // Every relay gave up, the RPC readable: lost.
+        let gave_up = WatchFacts {
+            relays_gave_up: true,
+            ..base
+        };
+        assert!(should_settle(gave_up));
+        // ... but the RPC just failed to answer: not yet; after long enough, yes.
+        let unreadable = WatchFacts {
+            rpc_unreadable: true,
+            ..gave_up
+        };
+        assert!(!should_settle(unreadable));
+        assert!(should_settle(WatchFacts {
+            rpc_unreadable_long: true,
+            ..unreadable
+        }));
+        assert!(should_settle(WatchFacts {
+            only_jito_dead: true,
+            ..unreadable
+        }));
+        // An expired blockhash ends it too.
+        assert!(should_settle(WatchFacts {
+            blockhash_valid: false,
+            ..base
+        }));
+        // Seen processed (or reported landed): the relays and the blockhash no longer decide.
+        let landing = WatchFacts {
+            landing: true,
+            relays_gave_up: true,
+            blockhash_valid: false,
+            ..base
+        };
+        assert!(!should_settle(landing));
+        // Only its fork being gone, or the cap, does.
+        assert!(should_settle(WatchFacts {
+            fork_abandoned: true,
+            ..landing
+        }));
+        assert!(should_settle(WatchFacts {
+            past_cap: true,
+            ..landing
+        }));
+    }
+
+    #[test]
+    fn a_final_read_keeps_a_landing_liquidation_watched() {
+        let landing = WatchFacts {
+            landing: true,
+            relays_gave_up: true,
+            blockhash_valid: true,
+            ..WatchFacts::default()
+        };
+        // A lagging node answering "unknown" after it was seen processed: keep waiting.
+        assert!(recheck_keeps_waiting(Recheck::Unknown, landing));
+        assert!(recheck_keeps_waiting(Recheck::Processed, landing));
+        assert!(recheck_keeps_waiting(Recheck::Unreadable, landing));
+        // Its fork gone, or the cap: stop.
+        let gone = WatchFacts {
+            fork_abandoned: true,
+            ..landing
+        };
+        for found in [Recheck::Unknown, Recheck::Processed, Recheck::Unreadable] {
+            assert!(!recheck_keeps_waiting(found, gone), "{found:?}");
+            assert!(!recheck_keeps_waiting(
+                found,
+                WatchFacts {
+                    past_cap: true,
+                    ..landing
+                }
+            ));
+        }
+        // Not landing: unknown means lost; processed now means landing after all.
+        let lost = WatchFacts {
+            landing: false,
+            ..landing
+        };
+        assert!(!recheck_keeps_waiting(Recheck::Unknown, lost));
+        assert!(recheck_keeps_waiting(
+            Recheck::Processed,
+            WatchFacts {
+                landing: true,
+                ..lost
+            }
+        ));
+        // An RPC that just failed is given time, unless it has failed long enough.
+        assert!(recheck_keeps_waiting(Recheck::Unreadable, lost));
+        assert!(!recheck_keeps_waiting(
+            Recheck::Unreadable,
+            WatchFacts {
+                rpc_unreadable_long: true,
+                ..lost
+            }
+        ));
     }
 
     #[test]

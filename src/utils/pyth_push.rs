@@ -32,8 +32,9 @@ use crate::transaction_limits::{
     bundle_cu_price, MAX_BUNDLE_TXS, MAX_COMPUTE_UNIT_LIMIT, MAX_V0_TX_SIZE,
 };
 use crate::utils::pyth_cranker::{
-    close_encoded_vaa_ix, guardian_set_index, init_encoded_vaa_ix, update_price_feed_ix,
-    verify_encoded_vaa_ix, write_encoded_vaa_ix, VAA_HEADER_SIZE, VAA_SPLIT_INDEX,
+    close_encoded_vaa_ix, guardian_set_index, init_encoded_vaa_ix, price_feed_bump,
+    update_price_feed_ix, verify_encoded_vaa_ix, write_encoded_vaa_ix, VAA_HEADER_SIZE,
+    VAA_SPLIT_INDEX,
 };
 
 /// The push transactions a bundle has room for: the liquidation and the tip take two. The tip
@@ -61,14 +62,40 @@ const ATTEMPT_CU_JITTER: u64 = 10_000;
 const CU_CREATE_ACCOUNT: u32 = 1_000; // (150)
 const CU_INIT_VAA: u32 = 2_000; // (1,363)
 const CU_WRITE_VAA: u32 = 2_000; // (1,375)
-const CU_VERIFY_VAA: u32 = 110_000; // (83,598: thirteen guardian signatures)
-const CU_UPDATE_FEED: u32 = 36_000; // (27,422 writing a newer price, 7,709 when not newer)
+/// Verifying a VAA, per guardian signature it carries (83,598 measured for Hermes's three).
+const CU_VERIFY_VAA_BASE: u32 = 5_000;
+const CU_VERIFY_VAA_PER_SIGNATURE: u32 = 33_000;
+/// Updating a feed whose account's bump is 255: 27,406–27,422 writing a newer price, 7,709 when
+/// not newer. The push oracle derives the address on every call, each bump below 255 adding ~1,500
+/// (USDT's, bump 250, measured 34,923).
+const CU_UPDATE_FEED: u32 = 36_000;
+const CU_UPDATE_FEED_PER_BUMP: u32 = 2_000;
 const CU_CLOSE_VAA: u32 = 2_000; // (1,265)
 const CU_TRANSFER: u32 = 1_000; // (150)
-/// A Kamino or JupLend refresh: up to ~90k when Scope or Switchboard prices the reserve.
-const CU_REFRESH: u32 = 150_000;
+/// Venue refreshes, measured on every Kamino reserve and obligation and JupLend lending state of
+/// the prod group (worst in parentheses) with about 30% over it. A reserve's cost grows ~5k per
+/// link of its Scope chain (1 link ~24k, 2 links 29,209), so a chain of four (Kamino's most) is
+/// ~39k; this keeps ~28% over that.
+const CU_KAMINO_REFRESH_RESERVE: u32 = 50_000;
+/// One deposit, no borrows, its reserve as the only remaining account: marginfi's shape (19,753).
+const CU_KAMINO_REFRESH_OBLIGATION: u32 = 26_000;
+/// JupLend `UpdateRate` (15,515).
+const CU_JUPLEND_UPDATE_RATE: u32 = 20_000;
+/// Any other instruction among the refreshes: unmeasured, so generous.
+const CU_REFRESH_UNKNOWN: u32 = 150_000;
 /// The compute-budget instructions and what else a transaction is charged around its own.
 const CU_TX_OVERHEAD: u32 = 1_000;
+
+/// The compute verifying `vaa` takes: its signature count is its sixth byte.
+fn verify_cu(vaa: &[u8]) -> u32 {
+    let signatures = u32::from(vaa.get(5).copied().unwrap_or(19)).max(1);
+    CU_VERIFY_VAA_BASE + CU_VERIFY_VAA_PER_SIGNATURE * signatures
+}
+
+/// The compute updating `feed_id`'s push feed takes.
+fn update_cu(feed_id: &[u8; 32]) -> u32 {
+    CU_UPDATE_FEED + CU_UPDATE_FEED_PER_BUMP * u32::from(255 - price_feed_bump(feed_id))
+}
 
 /// An instruction and the compute it is given.
 type Budgeted = (Instruction, u32);
@@ -84,7 +111,27 @@ fn cu_limit(ixs: &[Budgeted], attempt: u64) -> u32 {
 }
 
 fn refreshes(ixs: &[Instruction]) -> Vec<Budgeted> {
-    ixs.iter().map(|ix| (ix.clone(), CU_REFRESH)).collect()
+    ixs.iter().map(|ix| (ix.clone(), refresh_cu(ix))).collect()
+}
+
+/// The compute a venue refresh takes, by what it is.
+fn refresh_cu(ix: &Instruction) -> u32 {
+    use crate::juplend_earn::{client as juplend, program::Lending};
+    use crate::kamino_lending::{client as kamino, program::KaminoLending};
+    use anchor_lang::{Id, InstructionData};
+    if ix.program_id == KaminoLending::id() {
+        if ix.data == kamino::args::RefreshReserve.data() {
+            return CU_KAMINO_REFRESH_RESERVE;
+        }
+        // Lending market, obligation, and its one deposit's reserve.
+        if ix.data == kamino::args::RefreshObligation.data() && ix.accounts.len() <= 3 {
+            return CU_KAMINO_REFRESH_OBLIGATION;
+        }
+    }
+    if ix.program_id == Lending::id() && ix.data == juplend::args::UpdateRate.data() {
+        return CU_JUPLEND_UPDATE_RATE;
+    }
+    CU_REFRESH_UNKNOWN
 }
 
 pub struct PythPusher {
@@ -299,7 +346,7 @@ impl PythPusher {
                 vaa_account,
                 guardian_set_index(push.vaa.as_slice())?,
             ),
-            CU_VERIFY_VAA,
+            verify_cu(push.vaa.as_slice()),
         )];
         for (_, signed) in &push.feeds {
             ixs.push((
@@ -309,7 +356,7 @@ impl PythPusher {
                     signed.message.feed_id,
                     signed.update.clone(),
                 )?,
-                CU_UPDATE_FEED,
+                update_cu(&signed.message.feed_id),
             ));
         }
         ixs.push((
@@ -437,6 +484,42 @@ mod tests {
     }
 
     #[test]
+    fn each_refresh_is_budgeted_by_its_kind() {
+        use crate::juplend_earn::{client as juplend, program::Lending};
+        use crate::kamino_lending::{client as kamino, program::KaminoLending};
+        use anchor_lang::{Id, InstructionData};
+        let ix = |program_id, data: Vec<u8>, accounts: usize| Instruction {
+            program_id,
+            accounts: (0..accounts)
+                .map(|_| AccountMeta::new(Pubkey::new_unique(), false))
+                .collect(),
+            data,
+        };
+        let kamino = KaminoLending::id();
+        assert_eq!(
+            refresh_cu(&ix(kamino, kamino::args::RefreshReserve.data(), 6)),
+            CU_KAMINO_REFRESH_RESERVE
+        );
+        assert_eq!(
+            refresh_cu(&ix(kamino, kamino::args::RefreshObligation.data(), 3)),
+            CU_KAMINO_REFRESH_OBLIGATION
+        );
+        assert_eq!(
+            refresh_cu(&ix(kamino, kamino::args::RefreshObligation.data(), 5)),
+            CU_REFRESH_UNKNOWN,
+            "more positions than marginfi's obligations hold"
+        );
+        assert_eq!(
+            refresh_cu(&ix(Lending::id(), juplend::args::UpdateRate.data(), 5)),
+            CU_JUPLEND_UPDATE_RATE
+        );
+        assert_eq!(
+            refresh_cu(&ix(Pubkey::new_unique(), vec![1], 1)),
+            CU_REFRESH_UNKNOWN
+        );
+    }
+
+    #[test]
     fn a_push_asks_for_the_compute_it_uses() {
         let ix = |cu| {
             (
@@ -449,13 +532,28 @@ mod tests {
             )
         };
         // Verifying the VAA and two updates.
-        let ixs = [ix(CU_VERIFY_VAA), ix(CU_UPDATE_FEED), ix(CU_UPDATE_FEED)];
-        let base = CU_TX_OVERHEAD + CU_VERIFY_VAA + 2 * CU_UPDATE_FEED;
+        let verify = verify_cu(&[1, 0, 0, 0, 1, 3]);
+        assert_eq!(verify, 104_000, "83,598 measured for three signatures");
+        assert_eq!(verify_cu(&[1, 0, 0, 0, 4, 13]), 434_000);
+        let ixs = [ix(verify), ix(CU_UPDATE_FEED), ix(CU_UPDATE_FEED)];
+        let base = CU_TX_OVERHEAD + verify + 2 * CU_UPDATE_FEED;
         assert_eq!(cu_limit(&ixs, 0), base);
         assert_eq!(cu_limit(&ixs, 7), base + 7, "unique to its attempt");
         assert_eq!(cu_limit(&ixs, ATTEMPT_CU_JITTER), base);
         assert!(base < 200_000);
-        let heavy: Vec<Budgeted> = (0..20).map(|_| ix(CU_REFRESH)).collect();
+        // USDT's feed (bump 250) measured 34,923.
+        let usdt: [u8; 32] = [
+            0x2b, 0x89, 0xb9, 0xdc, 0x8f, 0xdf, 0x9f, 0x34, 0x70, 0x9a, 0x5b, 0x10, 0x6b, 0x47,
+            0x2f, 0x0f, 0x39, 0xbb, 0x6c, 0xa9, 0xce, 0x04, 0xb0, 0xfd, 0x7f, 0x2e, 0x97, 0x16,
+            0x88, 0xe2, 0xe5, 0x3b,
+        ];
+        assert_eq!(crate::utils::pyth_cranker::price_feed_bump(&usdt), 250);
+        assert_eq!(update_cu(&usdt), 46_000);
+        assert!(
+            verify_cu(&[1, 0, 0, 0, 4, 19]) < MAX_COMPUTE_UNIT_LIMIT,
+            "a full guardian set still fits"
+        );
+        let heavy: Vec<Budgeted> = (0..20).map(|_| ix(CU_REFRESH_UNKNOWN)).collect();
         assert_eq!(
             cu_limit(&heavy, 5),
             MAX_COMPUTE_UNIT_LIMIT,
