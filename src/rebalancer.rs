@@ -183,6 +183,15 @@ const WSOL: Pubkey = spl_token::native_mint::ID;
 /// The size of an SPL token account, whose rent a recreated wSOL account costs.
 const TOKEN_ACCOUNT_SIZE: usize = 165;
 
+/// Native SOL pays every transaction fee, bundle tip and flat liquidation fee; below this the
+/// wallet is topped up to [`SOL_REFILL_TO`].
+const SOL_REFILL_BELOW: u64 = 500_000_000;
+const SOL_REFILL_TO: u64 = 1_000_000_000;
+/// SOL bought for a refill is this much more than the shortfall, for the swap's slippage.
+const SOL_BUY_MARGIN: I80F48 = I80F48!(1.02);
+/// What the unwrap transaction's fee may take, besides the temporary account's rent.
+const UNWRAP_FEE_ALLOWANCE: u64 = 20_000;
+
 impl Rebalancer {
     pub fn new(
         config: Eva01Config,
@@ -563,6 +572,152 @@ impl Rebalancer {
         Ok(prepared.min_out_amount)
     }
 
+    /// Tops the wallet's native SOL up to [`SOL_REFILL_TO`] once it is below
+    /// [`SOL_REFILL_BELOW`]: from its own wrapped SOL (what no liquidation in flight has claimed),
+    /// buying SOL with the swap mint for whatever that lacks. Checked often and regardless of
+    /// liquidations: a wallet out of SOL lands nothing.
+    pub fn refill_native_sol(&mut self) -> anyhow::Result<()> {
+        let owner = self.signer.pubkey();
+        let native = self.rpc_client.get_balance(&owner)?;
+        if native >= SOL_REFILL_BELOW {
+            return Ok(());
+        }
+        let needed = SOL_REFILL_TO - native;
+        warn!(
+            "Native SOL is down to {} lamports; topping it up by {} to {}",
+            native, needed, SOL_REFILL_TO
+        );
+        if self.wsol_account_closed() {
+            self.recreate_wsol_account(0)?;
+        }
+        let wsol_account = associated_wsol_account(&owner);
+        let mut claim = self.reservations.new_claim();
+        let wrapped = self.wsol_balance(&wsol_account)?;
+        let free = self.reservations.unclaimed(&WSOL, wrapped);
+        if free < needed {
+            self.buy_sol(&mut claim, needed - free)?;
+        }
+        // What the buy left wrapped (a route that closed the account was wrapped back).
+        let native = self.rpc_client.get_balance(&owner)?;
+        let needed = SOL_REFILL_TO.saturating_sub(native);
+        if needed == 0 {
+            return Ok(());
+        }
+        let wrapped = self.wsol_balance(&wsol_account)?;
+        // Too little SOL even for the temporary account's rent: close the wSOL account instead,
+        // which pays out all of it, and wrap back what is over the target.
+        let rent = self
+            .rpc_client
+            .get_minimum_balance_for_rent_exemption(TOKEN_ACCOUNT_SIZE)?;
+        if native < rent + UNWRAP_FEE_ALLOWANCE {
+            return self.unwrap_all_and_rewrap(&wsol_account);
+        }
+        let units = self
+            .reservations
+            .claim_available(&mut claim, WSOL, needed, wrapped);
+        if units == 0 {
+            return Err(anyhow::anyhow!(
+                "no unclaimed wrapped SOL to unwrap ({} wrapped)",
+                wrapped
+            ));
+        }
+        self.unwrap_sol(&wsol_account, units)
+    }
+
+    /// Closes the wallet's wSOL account (all of it and its rent paid out natively), then recreates
+    /// it with whatever is over [`SOL_REFILL_TO`] wrapped back. Needs no SOL up front.
+    fn unwrap_all_and_rewrap(&self, wsol_account: &Pubkey) -> anyhow::Result<()> {
+        let owner = self.signer.pubkey();
+        let close = spl_token::instruction::close_account(
+            &spl_token::ID,
+            wsol_account,
+            &owner,
+            &owner,
+            &[],
+        )?;
+        let blockhash = self.cache.blockhash.get(&self.rpc_client)?;
+        let tx = solana_transaction::Transaction::new_signed_with_payer(
+            &[close],
+            Some(&owner),
+            &[&self.signer],
+            blockhash,
+        );
+        let signature = self.rpc_client.send_and_confirm_transaction(&tx)?;
+        let native = self.rpc_client.get_balance(&owner)?;
+        warn!(
+            "Closed the wSOL account to refill the native SOL ({} lamports now): {}",
+            native, signature
+        );
+        // `recreate_wsol_account` keeps the new account's rent out of what it wraps.
+        self.recreate_wsol_account(native.saturating_sub(SOL_REFILL_TO))
+    }
+
+    /// The wallet's wrapped SOL, read from the chain (the cache may trail a swap just made).
+    fn wsol_balance(&self, wsol_account: &Pubkey) -> anyhow::Result<u64> {
+        Ok(self
+            .rpc_client
+            .get_token_account_balance(wsol_account)?
+            .amount
+            .parse()?)
+    }
+
+    /// Buys about `lamports` of SOL (wrapped) with the unclaimed swap mint.
+    fn buy_sol(&mut self, claim: &mut Claim, lamports: u64) -> anyhow::Result<()> {
+        let wsol_token = self.cache.tokens.try_get_token_for_mint(&WSOL)?;
+        let value = self
+            .cache
+            .try_get_token_wrapper_lenient(&WSOL, &wsol_token)?
+            .get_value_for_amount(I80F48::from_num(lamports))?
+            * SOL_BUY_MARGIN;
+        let reserve_token = self.cache.tokens.try_get_token_for_mint(&self.swap_mint)?;
+        let reserve = self
+            .cache
+            .try_get_token_wrapper_lenient(&self.swap_mint, &reserve_token)?;
+        let wanted = reserve.get_amount_from_value(value)?.to_num::<u64>();
+        let units =
+            self.reservations
+                .claim_available(claim, self.swap_mint, wanted, reserve.balance);
+        if units == 0 {
+            return Err(anyhow::anyhow!(
+                "no unclaimed {} to buy SOL with",
+                self.swap_mint
+            ));
+        }
+        let spent = reserve.get_value_for_amount(I80F48::from_num(units))?;
+        info!(
+            "Buying ~${} of SOL with {} of the swap mint to refill the native balance",
+            spent.to_num::<f64>(),
+            units
+        );
+        self.swap(units, self.swap_mint, WSOL, spent)?;
+        Ok(())
+    }
+
+    /// Unwraps `lamports` of the wallet's wrapped SOL: they go to a token account of their own,
+    /// which closing pays out natively (an account's wrapped SOL can't be unwrapped in part).
+    fn unwrap_sol(&self, wsol_account: &Pubkey, lamports: u64) -> anyhow::Result<()> {
+        let owner = self.signer.pubkey();
+        let temporary = Keypair::new();
+        let rent = self
+            .rpc_client
+            .get_minimum_balance_for_rent_exemption(TOKEN_ACCOUNT_SIZE)?;
+        let instructions =
+            unwrap_instructions(&owner, &temporary.pubkey(), wsol_account, rent, lamports)?;
+        let blockhash = self.cache.blockhash.get(&self.rpc_client)?;
+        let tx = solana_transaction::Transaction::new_signed_with_payer(
+            &instructions,
+            Some(&owner),
+            &[&self.signer, &temporary],
+            blockhash,
+        );
+        let signature = self.rpc_client.send_and_confirm_transaction(&tx)?;
+        info!(
+            "Unwrapped {} lamports of SOL to the native balance: {}",
+            lamports, signature
+        );
+        Ok(())
+    }
+
     /// Whether the cache shows the wallet's wSOL account closed (Geyser reports a closed account
     /// with no data).
     fn wsol_account_closed(&self) -> bool {
@@ -656,6 +811,36 @@ impl Rebalancer {
     }
 }
 
+/// Moves `lamports` of `owner`'s wrapped SOL from `wsol_account` into a new token account at
+/// `temporary` (funded with `rent`) and closes it, paying both out natively.
+fn unwrap_instructions(
+    owner: &Pubkey,
+    temporary: &Pubkey,
+    wsol_account: &Pubkey,
+    rent: u64,
+    lamports: u64,
+) -> anyhow::Result<Vec<solana_instruction::Instruction>> {
+    Ok(vec![
+        solana_system_interface::instruction::create_account(
+            owner,
+            temporary,
+            rent,
+            TOKEN_ACCOUNT_SIZE as u64,
+            &spl_token::ID,
+        ),
+        spl_token::instruction::initialize_account3(&spl_token::ID, temporary, &WSOL, owner)?,
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            wsol_account,
+            temporary,
+            owner,
+            &[],
+            lamports,
+        )?,
+        spl_token::instruction::close_account(&spl_token::ID, temporary, owner, owner, &[])?,
+    ])
+}
+
 /// The mints in a fixed order, starting from `resume_at` when it is still one of them.
 fn pass_order(mut mints: Vec<Pubkey>, resume_at: Option<Pubkey>) -> Vec<Pubkey> {
     mints.sort();
@@ -742,5 +927,72 @@ mod tests {
             }
             value += I80F48!(0.25);
         }
+    }
+
+    /// Simulates unwrapping one lamport of wrapped SOL on mainnet; nothing is sent.
+    /// `WALLET_KEYPAIR`: a wallet with a wSOL account.
+    #[test]
+    #[ignore = "simulates on mainnet"]
+    fn an_unwrap_passes_simulation_on_mainnet() {
+        use solana_client::rpc_config::RpcSimulateTransactionConfig;
+        let rpc = RpcClient::new("https://api.mainnet-beta.solana.com".to_string());
+        // `UNWRAP_SIM_OWNER`: simulate as that wallet, unsigned; else sign as `WALLET_KEYPAIR`.
+        let signer = std::env::var("WALLET_KEYPAIR")
+            .ok()
+            .map(|key| {
+                let keypair: Vec<u8> = serde_json::from_str(&key).unwrap();
+                Keypair::try_from(keypair.as_slice()).unwrap()
+            })
+            .unwrap_or_else(Keypair::new);
+        let unsigned_owner = std::env::var("UNWRAP_SIM_OWNER")
+            .ok()
+            .map(|owner| owner.parse::<Pubkey>().unwrap());
+        let owner = unsigned_owner.unwrap_or_else(|| signer.pubkey());
+        let wsol_account = associated_wsol_account(&owner);
+        let wrapped = rpc.get_token_account_balance(&wsol_account).unwrap().amount;
+        let native_before = rpc.get_balance(&owner).unwrap();
+        let temporary = Keypair::new();
+        let rent = rpc
+            .get_minimum_balance_for_rent_exemption(TOKEN_ACCOUNT_SIZE)
+            .unwrap();
+        let ixs = unwrap_instructions(&owner, &temporary.pubkey(), &wsol_account, rent, 1).unwrap();
+        let blockhash = rpc.get_latest_blockhash().unwrap();
+        let tx = match unsigned_owner {
+            Some(_) => {
+                let message =
+                    solana_message::Message::new_with_blockhash(&ixs, Some(&owner), &blockhash);
+                solana_transaction::Transaction::new_unsigned(message)
+            }
+            None => solana_transaction::Transaction::new_signed_with_payer(
+                &ixs,
+                Some(&owner),
+                &[&signer, &temporary],
+                blockhash,
+            ),
+        };
+        let sim = rpc
+            .simulate_transaction_with_config(
+                &tx,
+                RpcSimulateTransactionConfig {
+                    sig_verify: unsigned_owner.is_none(),
+                    accounts: Some(
+                        solana_client::rpc_config::RpcSimulateTransactionAccountsConfig {
+                            encoding: None,
+                            addresses: vec![owner.to_string(), wsol_account.to_string()],
+                        },
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .value;
+        println!(
+            "wrapped {wrapped}, native {native_before}, err {:?}",
+            sim.err
+        );
+        for line in sim.logs.unwrap_or_default() {
+            println!("{line}");
+        }
+        assert!(sim.err.is_none());
     }
 }
