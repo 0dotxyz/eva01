@@ -809,6 +809,9 @@ impl Liquidator {
             .rebalancer
             .take()
             .ok_or_else(|| anyhow!("the Liquidator was already started"))?;
+        if let Err(e) = rebalancer.refill_native_sol() {
+            error!("Refilling the native SOL failed: {:?}", e);
+        }
         if rebalancer.run()?.trades > 0 {
             self.executor.refresh_wallet_balances();
         }
@@ -1348,6 +1351,12 @@ fn run_rebalancer(
     // The startup pass just ran.
     let mut last_pass = Instant::now();
     while let Err(RecvTimeoutError::Timeout) = workers_gone.recv_timeout(REBALANCE_CHECK_INTERVAL) {
+        // Whatever the liquidations are doing: out of SOL, none of them lands.
+        match panic::catch_unwind(AssertUnwindSafe(|| rebalancer.refill_native_sol())) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => error!("Refilling the native SOL failed: {:?}", error),
+            Err(_) => error!("Refilling the native SOL panicked"),
+        }
         if !activity.rebalance_due(last_pass, Instant::now()) {
             continue;
         }
