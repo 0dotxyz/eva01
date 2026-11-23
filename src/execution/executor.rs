@@ -68,8 +68,9 @@ const PROCESSED_WAIT: Duration = Duration::from_secs(8);
 /// Confirmed this many slots past a processed transaction's slot without it: its fork is gone.
 const ABANDONED_FORK_DEPTH: u64 = 32;
 
-/// An accepted Jito bundle the block engine was never asked about is taken as lost after this.
-const UNASKED_JITO_WINDOW: Duration = Duration::from_secs(5);
+/// The block engine's copy of a bundle not reported landed by now is taken as lost, whatever it
+/// answers ("pending" included): landed bundles confirm within 3 s of the watch starting.
+const JITO_LANDING_WINDOW: Duration = Duration::from_secs(4);
 /// Every relay given up and the RPC unreadable this long: taken as lost rather than held.
 const UNREADABLE_WHEN_LOST: Duration = Duration::from_secs(5);
 /// The blockhash is checked every this many polls.
@@ -267,8 +268,8 @@ enum SenderSendKind {
 struct WatchFacts {
     /// Seen processed, or reported landed by the block engine.
     landing: bool,
-    /// Every relay's copy is given up (the block engine's failed or unheard of, Sender's window
-    /// passed).
+    /// Every relay's copy is given up (the block engine's failed, unknown or not landed within
+    /// [`JITO_LANDING_WINDOW`]; Sender's window passed).
     relays_gave_up: bool,
     blockhash_valid: bool,
     /// This poll's status read failed.
@@ -1342,8 +1343,9 @@ impl Executor {
     /// The slot `sig` lands at while its `blockhash` is valid, if it does. Until settled, the caller
     /// keeps its claim and reports no failure, since the bundle may still land. It is lost early
     /// once every bundle carrying it is: the block engine reports its copy failed or unknown, as
-    /// most lost auctions are, and Sender's had [`SENDER_LANDING_WINDOW`]. A liquidation the chain
-    /// shows processed is waited for until it confirms.
+    /// most lost auctions are, or hasn't reported it landed within [`JITO_LANDING_WINDOW`], and
+    /// Sender's had [`SENDER_LANDING_WINDOW`]. A liquidation the chain shows processed is waited
+    /// for until it confirms.
     fn landed_before_expiry(
         &self,
         attempt_id: u64,
@@ -1365,7 +1367,9 @@ impl Executor {
         let mut jito_reported_dead = false;
         let mut jito_landed: Option<Option<u64>> = None;
         let mut jito_landed_at: Option<Instant> = None;
-        let mut last_jito_answer = started;
+        // The chain's confirmed slot once the block engine reported a landing with no slot: the
+        // point its fork is judged from.
+        let mut slotless_landing_from: Option<u64> = None;
         let mut unreadable_since: Option<Instant> = None;
         let mut polls: u32 = 0;
         let mut valid = true;
@@ -1409,7 +1413,6 @@ impl Executor {
                         .try_reserve_spare()
                         .and_then(|slot| slot.inflight_bundle_status(id).ok().flatten())
                     {
-                        last_jito_answer = Instant::now();
                         jito_lost = status.is_dead();
                         jito_reported_dead = status.is_dead();
                         if let InflightStatus::Landed(slot) = status {
@@ -1418,9 +1421,8 @@ impl Executor {
                         }
                     }
                 }
-                // Not heard about for a while (down, failing, or no spare request slot): taken as
-                // lost once it would most likely have landed, unless it was reported landed.
-                if jito_landed.is_none() && last_jito_answer.elapsed() >= UNASKED_JITO_WINDOW {
+                // Not reported landed in time (pending, unasked, or the block engine down).
+                if jito_landed.is_none() && started.elapsed() >= JITO_LANDING_WINDOW {
                     jito_lost = true;
                 }
             }
@@ -1436,6 +1438,9 @@ impl Executor {
                     .quick
                     .is_blockhash_valid(blockhash)
                     .unwrap_or_else(|_| !self.cache.blockhash.assumed_expired(blockhash, started));
+            }
+            if matches!(jito_landed, Some(None)) && slotless_landing_from.is_none() {
+                slotless_landing_from = self.quick.confirmed_slot().ok();
             }
             let mut facts = WatchFacts {
                 landing: seen_processed.is_some() || jito_landed.is_some(),
@@ -1456,6 +1461,12 @@ impl Executor {
                     (None, Some(Some(slot)), Some(at)) => {
                         at.elapsed() >= PROCESSED_WAIT && self.fork_abandoned(slot)
                     }
+                    // Reported landed at no slot and never seen on chain since, while the chain
+                    // confirmed well past the report.
+                    (None, Some(None), Some(at)) => {
+                        at.elapsed() >= PROCESSED_WAIT
+                            && slotless_landing_from.is_some_and(|from| self.fork_abandoned(from))
+                    }
                     _ => false,
                 },
                 past_cap: started.elapsed() > WATCH_MAX_WAIT,
@@ -1470,7 +1481,10 @@ impl Executor {
                     (SignatureState::Processed(slot), _) => {
                         // Processed at another slot than the one whose fork was judged gone (a
                         // node behind, or the other copy on the fork that won): judged afresh.
-                        if facts.fork_abandoned
+                        // First seen now: waited for afresh.
+                        if seen_processed.is_none() {
+                            facts.fork_abandoned = false;
+                        } else if facts.fork_abandoned
                             && seen_processed.is_some_and(|(_, checked)| checked != slot)
                         {
                             facts.fork_abandoned = self.fork_abandoned(slot);
@@ -1497,7 +1511,14 @@ impl Executor {
                 warn!(
                     "LIQUIDATION_BUNDLE_LOST attempt_id={attempt_id} liquidation_signature={sig} elapsed_ms={} reason={}",
                     started.elapsed().as_millis(),
-                    if facts.fork_abandoned {
+                    if facts.fork_abandoned
+                        && seen_processed.is_none()
+                        && matches!(jito_landed, Some(None))
+                    {
+                        "reported landed with no slot, never seen on chain"
+                    } else if facts.fork_abandoned && seen_processed.is_none() {
+                        "reported landed on an abandoned fork, never seen on chain"
+                    } else if facts.fork_abandoned {
                         "processed on an abandoned fork"
                     } else if facts.past_cap {
                         "timed out"
