@@ -1,6 +1,6 @@
 use crate::{
     cache::{
-        pyth_prices::{Pricing, PushedPrices},
+        pyth_prices::{price_update, Pricing, PushedPrices},
         Cache,
     },
     clock_manager,
@@ -69,7 +69,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, AtomicU64},
-        Arc,
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -443,6 +443,8 @@ struct Evaluator {
     min_profit: f64,
     /// Liquidations earning more than this are left to another instance (a dust instance's cap).
     max_profit: Option<f64>,
+    /// The last decision logged per account, so each is logged once.
+    decisions_logged: Mutex<HashMap<(Pubkey, &'static str), LoggedDecision>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -510,6 +512,83 @@ struct Sizing {
     push: Option<PushedPrices>,
     /// The liquidation the chain's prices already allow, when a push lets this one earn more.
     without_push: Option<Box<Sizing>>,
+}
+
+/// Accounts owing at least this much (USD, maintenance-weighted) have their sizing decisions
+/// logged.
+const DECISION_LOG_MIN_DEBT_USD: f64 = 100.0;
+/// Accounts whose last logged decision is remembered; the memory restarts past this.
+const DECISIONS_LOGGED_MAX: usize = 10_000;
+/// An unhealthy account with nothing worth taking is logged at most this often per outcome.
+const NOT_WORTH_LOG_INTERVAL: Duration = Duration::from_secs(5);
+/// Any other unhealthy account is logged at most this often per outcome, however often its
+/// feeds tick.
+const DECISION_LOG_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A logged decision's key and when it was logged.
+type LoggedDecision = ((&'static str, u64), Instant);
+
+/// How the sizing of an account near the threshold was decided, for `LIQUIDATION_DECISION`.
+#[derive(Default)]
+struct DecisionTrace {
+    /// Only filled for accounts whose decisions are logged.
+    enabled: bool,
+    /// The evaluation loop's or a worker's re-evaluation.
+    source: &'static str,
+    /// The account's maintenance-weighted debt (USD), which a liquidation changes.
+    debt_usd: f64,
+    outcome: &'static str,
+    /// Maintenance health on eva's newest prices (USD), when unhealthy on them.
+    newest_health: Option<f64>,
+    /// The margin on eva's newest prices, when healthy on them.
+    newest_margin: Option<f64>,
+    /// Maintenance health on the chain's prices (USD).
+    chain_health: Option<f64>,
+    /// Each sizing's profit after the haircut, and whether it is worth liquidating.
+    newest_profit: Option<(f64, bool)>,
+    unpushed_profit: Option<(f64, bool)>,
+    pushed_profit: Option<(f64, bool)>,
+    push_feeds: usize,
+    /// Each Pyth oracle the account reads: eva's newest publish time and the chain's.
+    feeds: Vec<(Pubkey, i64, Option<i64>)>,
+}
+
+impl DecisionTrace {
+    fn profit(sizing: &Sizing) -> Option<(f64, bool)> {
+        Some((
+            (sizing.amounts.liquidator_profit * LIQUIDATION_SIZE_HAIRCUT).to_num(),
+            sizing.amounts.is_liquidatable(),
+        ))
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.outcome.ends_with("_healthy")
+    }
+
+    /// What tells one decision from the next: the outcome and, unless healthy, every feed's
+    /// publish times and the account's debt to the cent.
+    fn key(&self) -> (&'static str, u64) {
+        use std::hash::{Hash, Hasher};
+        if self.is_healthy() {
+            return (self.outcome, 0);
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.feeds.hash(&mut hasher);
+        ((self.debt_usd * 100.0).round() as i64).hash(&mut hasher);
+        (self.outcome, hasher.finish())
+    }
+}
+
+fn fmt_profit(profit: Option<(f64, bool)>) -> String {
+    match profit {
+        Some((profit, true)) => format!("{profit:.4}"),
+        Some((profit, false)) => format!("{profit:.4}/not_worth"),
+        None => "-".to_string(),
+    }
+}
+
+fn fmt_usd(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_string(), |v| format!("{v:.4}"))
 }
 
 /// A bank's maintenance price over its equity price on one side.
@@ -787,6 +866,7 @@ impl Liquidator {
                 pusher,
                 min_profit: config.min_profit,
                 max_profit: config.max_profit,
+                decisions_logged: Mutex::default(),
             }),
             queue: Arc::new(ExecutionQueue::new(ATTEMPT_COOLDOWN)),
             activity,
@@ -1265,27 +1345,41 @@ fn run_worker(
             attempt_liquidation(queued, queue, evaluator, executor, strategy, activity)
         }));
         // A panic cools down too, so it can't repeat in a tight loop.
-        let lost_race = attempt.unwrap_or_else(|_| {
+        let ended = attempt.unwrap_or_else(|_| {
             error!("The liquidation attempt on {} panicked.", liquidatee);
-            false
+            AttemptEnd::Failed
         });
-        match executor.landed_slot(attempt_id) {
-            Some(slot) => queue.release_after_landing(liquidatee, slot),
-            None if lost_race => queue.release_after_lost_race(liquidatee),
-            None => queue.release(liquidatee, true),
+        match (executor.landed_slot(attempt_id), ended) {
+            (Some(slot), _) => queue.release_after_landing(liquidatee, slot),
+            (None, AttemptEnd::LostRace) => queue.release_after_lost_race(liquidatee),
+            // Nothing was sent and nothing failed: the next evaluation that finds a piece goes.
+            (None, AttemptEnd::NothingToDo) => queue.release(liquidatee, false),
+            (None, AttemptEnd::Failed) => queue.release(liquidatee, true),
         }
     }
 }
 
-/// Whether the attempt lost a race (`LostRace`), which leaves nothing to wait for.
+/// How an attempt that didn't land ended, for how its account is released.
+enum AttemptEnd {
+    /// Lost a race (`LostRace`), which leaves nothing to wait for.
+    LostRace,
+    /// No longer liquidatable when re-sized: nothing was sent.
+    NothingToDo,
+    Failed,
+}
+
 fn attempt_liquidation(
-    QueuedIntent { intent, queued_at }: QueuedIntent,
+    QueuedIntent {
+        intent,
+        queued_at,
+        pending_since,
+    }: QueuedIntent,
     queue: &ExecutionQueue,
     evaluator: &Evaluator,
     executor: &Executor,
     strategy: &InventoryStrategy,
     activity: &LiquidationActivity,
-) -> bool {
+) -> AttemptEnd {
     let liquidatee = intent.liquidatee_account.address;
     // The intent was sized on the state at evaluation time. By now another liquidator may have
     // taken a chunk of the account or prices may have moved, so it is re-sized on the current
@@ -1315,8 +1409,8 @@ fn attempt_liquidation(
                     )
                 },
             );
-            info!("LIQUIDATION_QUEUE attempt_id={} account={} queue_delay_ms={} asset_bank={} liab_bank={} estimated_repay_usd={:.4} estimated_profit_usd={:.4} binding_cap={} push_feed_count={} sandwich_pair={}",
-                fresh.attempt_id, liquidatee, queued_at.elapsed().as_millis(), fresh.asset_bank,
+            info!("LIQUIDATION_QUEUE attempt_id={} account={} queue_delay_ms={} pending_ms={} asset_bank={} liab_bank={} estimated_repay_usd={:.4} estimated_profit_usd={:.4} binding_cap={} push_feed_count={} sandwich_pair={}",
+                fresh.attempt_id, liquidatee, queued_at.elapsed().as_millis(), pending_since.elapsed().as_millis(), fresh.asset_bank,
                 fresh.liab_bank, fresh.estimated_repay_usd, fresh.profit.to_num::<f64>(), fresh.binding_cap, fresh.push.as_ref().map_or(0, |push| push.feeds.len()), sandwich);
             queue.resized(&liquidatee, fresh.profit);
             let mut attempt = activity.attempt(liquidatee);
@@ -1327,20 +1421,25 @@ fn attempt_liquidation(
                         "LIQUIDATION_EXECUTION_FAILURE attempt_id={} account={} error={:#}",
                         fresh.attempt_id, liquidatee, e
                     );
-                    return e.downcast_ref::<LostRace>().is_some();
+                    if e.downcast_ref::<LostRace>().is_some() {
+                        return AttemptEnd::LostRace;
+                    }
                 }
             }
         }
-        Ok(None) => info!(
-            "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=no_longer_liquidatable elapsed_since_queue_ms={}",
-            intent.attempt_id, liquidatee, queued_at.elapsed().as_millis()
-        ),
+        Ok(None) => {
+            info!(
+                "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=no_longer_liquidatable elapsed_since_queue_ms={}",
+                intent.attempt_id, liquidatee, queued_at.elapsed().as_millis()
+            );
+            return AttemptEnd::NothingToDo;
+        }
         Err(e) => error!(
             "LIQUIDATION_REEVALUATION_FAILURE attempt_id={} account={} error={:#}",
             intent.attempt_id, liquidatee, e
         ),
     }
-    false
+    AttemptEnd::Failed
 }
 
 /// Sells leftover tokens back to the swap mint and refills the inventory whenever a pass is due
@@ -1388,6 +1487,68 @@ fn run_rebalancer(
 }
 
 impl Evaluator {
+    /// Logs how the sizing of an account near the threshold was decided, once per outcome and
+    /// prices.
+    fn log_decision(
+        &self,
+        address: &Pubkey,
+        debt_usd: f64,
+        liquidatable: bool,
+        trace: &DecisionTrace,
+    ) {
+        if trace.outcome.is_empty() {
+            return;
+        }
+        {
+            let mut logged = self
+                .decisions_logged
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let key = trace.key();
+            let now = Instant::now();
+            if let Some((last, at)) = logged.get(&(*address, trace.source)) {
+                let interval = if liquidatable {
+                    DECISION_LOG_INTERVAL
+                } else {
+                    NOT_WORTH_LOG_INTERVAL
+                };
+                let throttled = !trace.is_healthy()
+                    && last.0 == key.0
+                    && now.saturating_duration_since(*at) < interval;
+                if *last == key || throttled {
+                    return;
+                }
+            }
+            if logged.len() >= DECISIONS_LOGGED_MAX {
+                logged.clear();
+            }
+            logged.insert((*address, trace.source), (key, now));
+        }
+        let feeds: Vec<String> = trace
+            .feeds
+            .iter()
+            .map(|(oracle, newest, chain)| match chain {
+                Some(chain) => format!("{oracle}:{newest}/{chain}"),
+                None => format!("{oracle}:{newest}/-"),
+            })
+            .collect();
+        info!(
+            "LIQUIDATION_DECISION account={address} source={} outcome={} liquidatable={liquidatable} weighted_debt_usd={debt_usd:.2} newest_health_usd={} newest_margin={} chain_health_usd={} newest_profit_usd={} unpushed_profit_usd={} pushed_profit_usd={} evaluated_push_feed_count={} feeds_newest_over_chain={}",
+            trace.source,
+            trace.outcome,
+            fmt_usd(trace.newest_health),
+            trace
+                .newest_margin
+                .map_or_else(|| "-".to_string(), |m| format!("{m:.6}")),
+            fmt_usd(trace.chain_health),
+            fmt_profit(trace.newest_profit),
+            fmt_profit(trace.unpushed_profit),
+            fmt_profit(trace.pushed_profit),
+            trace.push_feeds,
+            feeds.join(","),
+        );
+    }
+
     /// A healthy account's watch: its margin and its positions' unit values now. `None` when a
     /// unit value can't be priced, so every update of its banks evaluates it.
     fn watch_for(
@@ -1427,7 +1588,7 @@ impl Evaluator {
                     .try_get_account(account_address)
                     .ok()?;
 
-                match self.process_account(&account, clock.clone(), &unit_values) {
+                match self.process_account(&account, clock.clone(), &unit_values, "cycle") {
                     Ok(acc_opt) => acc_opt,
                     Err(err) => {
                         debug!("Failed to process account {:?}: {:?}", account.address, err);
@@ -1457,7 +1618,7 @@ impl Evaluator {
         let clock = clock_manager::get_clock(&self.cache.clock)?;
         let unit_values = UnitValues::new(&self.cache, &clock);
         Ok(
-            match self.process_account(&account, clock.clone(), &unit_values)? {
+            match self.process_account(&account, clock.clone(), &unit_values, "attempt")? {
                 Some(Evaluation::Liquidate(intent)) => Some(intent),
                 _ => None,
             },
@@ -1469,6 +1630,7 @@ impl Evaluator {
         account: &MarginfiAccountWrapper,
         clock: Clock,
         unit_values: &UnitValues,
+        source: &'static str,
     ) -> Result<Option<Evaluation>> {
         let (deposit_shares, liab_shares) = account.get_deposits_and_liabilities_shares();
         if deposit_shares.is_empty() || liab_shares.is_empty() {
@@ -1499,6 +1661,10 @@ impl Evaluator {
             RequirementType::Maintenance,
         )?;
 
+        let debt_usd: f64 = liab_values
+            .iter()
+            .map(|(value, _)| value.to_num::<f64>())
+            .sum();
         let (asset_banks, liab_banks) =
             match self.find_liquidation_bank_candidates(deposit_values, liab_values)? {
                 Some(banks) => banks,
@@ -1516,7 +1682,13 @@ impl Evaluator {
         )?;
 
         // Calculated max liquidatable amount is the defining factor for liquidation.
-        let sizing = match self.compute_max_liquidatable_amounts_with_banks(
+        let mut trace = DecisionTrace {
+            enabled: debt_usd >= DECISION_LOG_MIN_DEBT_USD,
+            source,
+            debt_usd,
+            ..DecisionTrace::default()
+        };
+        let search = self.compute_max_liquidatable_amounts_with_banks(
             &self.cache,
             clock.clone(),
             account,
@@ -1524,7 +1696,13 @@ impl Evaluator {
             observation_accounts.observation_accounts.as_slice(),
             &asset_banks,
             &liab_banks,
-        )? {
+            &mut trace,
+        );
+        if trace.enabled {
+            let liquidatable = matches!(&search, Ok(PairSearch::Sized(sizing)) if sizing.amounts.is_liquidatable());
+            self.log_decision(&account.address, debt_usd, liquidatable, &trace);
+        }
+        let sizing = match search? {
             PairSearch::Sized(sizing) => sizing,
             PairSearch::Healthy(margin) => {
                 let watch = self.watch_for(account, unit_values, margin);
@@ -1708,6 +1886,7 @@ impl Evaluator {
         banks_and_oracles: &[Pubkey],
         asset_banks: &[Pubkey],
         liab_banks: &[Pubkey],
+        trace: &mut DecisionTrace,
     ) -> Result<PairSearch> {
         let size = |pricing: Pricing| {
             self.size_on_accounts(
@@ -1730,6 +1909,29 @@ impl Evaluator {
         if !near_threshold {
             return Ok(search);
         }
+        match &search {
+            PairSearch::Healthy(margin) => trace.newest_margin = Some(*margin),
+            PairSearch::Sized(sizing) => {
+                trace.newest_health = Some(sizing.maintenance_health.to_num());
+                trace.newest_profit = DecisionTrace::profit(sizing);
+            }
+            PairSearch::None => {}
+        }
+        for oracle in banks_and_oracles.iter().filter(|_| trace.enabled) {
+            if let Some(update) = cache
+                .oracles
+                .try_get_account(oracle)
+                .ok()
+                .as_ref()
+                .and_then(price_update)
+            {
+                trace.feeds.push((
+                    *oracle,
+                    update.price_message.publish_time,
+                    cache.pyth_prices.onchain(oracle),
+                ));
+            }
+        }
         let mut behind: Vec<(Pubkey, [u8; 32])> = Vec::new();
         for oracle in banks_and_oracles {
             if let Some(feed_id) = pushable_feed(cache, oracle) {
@@ -1739,6 +1941,11 @@ impl Evaluator {
             }
         }
         if behind.is_empty() {
+            trace.outcome = match &search {
+                PairSearch::Sized(sizing) if sizing.amounts.is_liquidatable() => "chain_current",
+                PairSearch::Sized(_) => "chain_current_not_worth",
+                _ => "chain_current_healthy",
+            };
             return Ok(search);
         }
         match search {
@@ -1746,12 +1953,26 @@ impl Evaluator {
             // Not liquidatable on eva's prices, but the chain may still hold older ones the
             // account fails on: a price that recovered on Hermes before the chain caught up.
             search => {
-                return Ok(match size(Pricing::Chain) {
+                let on_chain = size(Pricing::Chain);
+                if let Ok(PairSearch::Sized(sizing)) = &on_chain {
+                    trace.chain_health = Some(sizing.maintenance_health.to_num());
+                    trace.unpushed_profit = DecisionTrace::profit(sizing);
+                }
+                return Ok(match on_chain {
                     Ok(PairSearch::Sized(on_chain)) if on_chain.amounts.is_liquidatable() => {
+                        trace.outcome = "chain_only";
                         PairSearch::Sized(on_chain)
                     }
-                    _ => search,
-                })
+                    on_chain => {
+                        trace.outcome = match (&search, &on_chain) {
+                            (_, Err(_)) => "newest_not_liquidatable_chain_unpriceable",
+                            (PairSearch::Sized(_), _) => "newest_not_worth",
+                            (_, Ok(PairSearch::Sized(_))) => "newest_fine_chain_not_worth",
+                            (_, Ok(_)) => "newest_healthy",
+                        };
+                        search
+                    }
+                });
             }
         }
 
@@ -1788,19 +2009,37 @@ impl Evaluator {
                     }
                 );
                 let Some(push) = push else {
+                    trace.outcome = if !trace.enabled {
+                        "chain_unpriceable_no_push"
+                    } else if self.pusher.is_none() {
+                        "chain_unpriceable_no_pusher"
+                    } else if cache.pyth_prices.push_of(&behind).is_none() {
+                        "chain_unpriceable_no_signed_update"
+                    } else {
+                        "chain_unpriceable_push_too_big"
+                    };
                     return Ok(PairSearch::None);
                 };
+                trace.push_feeds = push.feeds.len();
                 return Ok(
                     match size(Pricing::Pushed(&push)).unwrap_or(PairSearch::None) {
-                        PairSearch::Sized(sizing) => PairSearch::Sized(Sizing {
-                            push: Some(push),
-                            ..sizing
-                        }),
-                        _ => PairSearch::None,
+                        PairSearch::Sized(sizing) => {
+                            trace.outcome = "chain_unpriceable_push_all";
+                            trace.pushed_profit = DecisionTrace::profit(&sizing);
+                            PairSearch::Sized(Sizing {
+                                push: Some(push),
+                                ..sizing
+                            })
+                        }
+                        _ => {
+                            trace.outcome = "chain_unpriceable_push_unsized";
+                            PairSearch::None
+                        }
                     },
                 );
             }
         };
+        trace.chain_health = Some(on_chain.to_num());
 
         // On the chain's prices as they stand, when those already find the account unhealthy.
         let unpushed = if on_chain < I80F48::ZERO {
@@ -1812,11 +2051,13 @@ impl Evaluator {
             None
         };
         // Behind a push of the feeds that lower its health the most, as many as a bundle carries.
-        let pushed = self
-            .strongest_fitting_push(cache, on_chain, &behind, |push| {
-                health(Pricing::Pushed(push)).ok()
-            })
-            .and_then(
+        let push = self.strongest_fitting_push(cache, on_chain, &behind, |push| {
+            health(Pricing::Pushed(push)).ok()
+        });
+        trace.push_feeds = push.as_ref().map_or(0, |push| push.feeds.len());
+        let push_found = push.is_some();
+        let pushed =
+            push.and_then(
                 |push| match size(Pricing::Pushed(&push)).unwrap_or(PairSearch::None) {
                     PairSearch::Sized(sizing) => Some(Sizing {
                         push: Some(push),
@@ -1833,19 +2074,48 @@ impl Evaluator {
                 I80F48::ZERO
             }
         };
+        trace.unpushed_profit = unpushed.as_ref().and_then(DecisionTrace::profit);
+        trace.pushed_profit = pushed.as_ref().and_then(DecisionTrace::profit);
         Ok(match (unpushed, pushed) {
             // Kept, to take at once when no bundle can carry the push right away.
             (Some(unpushed), Some(pushed))
                 if earned(&pushed) > earned(&unpushed) * PUSH_PROFIT_GAIN =>
             {
+                trace.outcome = "pushed_with_fallback";
                 PairSearch::Sized(Sizing {
                     without_push: Some(Box::new(unpushed)),
                     ..pushed
                 })
             }
-            (Some(unpushed), _) => PairSearch::Sized(unpushed),
-            (None, Some(pushed)) => PairSearch::Sized(pushed),
+            (Some(unpushed), pushed) => {
+                trace.outcome = if pushed.is_some() {
+                    "unpushed_preferred"
+                } else {
+                    "unpushed_no_push"
+                };
+                PairSearch::Sized(unpushed)
+            }
+            (None, Some(pushed)) => {
+                trace.outcome = "pushed";
+                PairSearch::Sized(pushed)
+            }
             (None, None) => {
+                trace.outcome = if push_found {
+                    "push_unsized"
+                } else if !trace.enabled {
+                    "no_push"
+                } else if self.pusher.is_none() {
+                    "no_pusher"
+                } else if behind.iter().all(|feed| {
+                    cache
+                        .pyth_prices
+                        .push_of(std::slice::from_ref(feed))
+                        .is_none()
+                }) {
+                    "no_signed_update"
+                } else {
+                    "no_push_lowers_health_and_fits"
+                };
                 debug!(
                     "Account {}: liquidatable only on Pyth prices one bundle can't push",
                     account.address
@@ -2589,5 +2859,34 @@ mod push_choice_tests {
         };
         let sol_pushed = program_accounts(&cache, &oracles, Pricing::Pushed(&push)).unwrap();
         assert_eq!(sol_pushed.iter().map(price).collect::<Vec<_>>(), vec![3, 1]);
+    }
+}
+
+#[cfg(test)]
+mod decision_trace_tests {
+    use super::*;
+
+    #[test]
+    fn a_decision_is_logged_again_only_when_it_or_a_price_changes() {
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let trace = |outcome, feeds: Vec<(Pubkey, i64, Option<i64>)>| DecisionTrace {
+            outcome,
+            feeds,
+            ..DecisionTrace::default()
+        };
+        let feeds = vec![(a, 10, Some(9)), (b, 20, Some(20))];
+        let base = trace("pushed", feeds.clone());
+        // A slower feed's newer price shows, though it isn't the newest.
+        assert_ne!(
+            base.key(),
+            trace("pushed", vec![(a, 11, Some(9)), (b, 20, Some(20))]).key()
+        );
+        assert_ne!(base.key(), trace("unpushed_preferred", feeds.clone()).key());
+        assert_eq!(base.key(), trace("pushed", feeds).key());
+        // A healthy account is logged on a change of outcome only.
+        assert_eq!(
+            trace("newest_healthy", vec![(a, 10, Some(9))]).key(),
+            trace("newest_healthy", vec![(a, 12, Some(12))]).key()
+        );
     }
 }

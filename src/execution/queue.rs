@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use log::info;
 use solana_pubkey::Pubkey;
 
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
@@ -36,6 +37,9 @@ const LOST_RACE_WINDOW: Duration = Duration::from_secs(30);
 const MAX_ATTEMPTS_PER_ACCOUNT: u32 = 2;
 const SUPERSEDING_GAIN: f64 = 1.1;
 
+/// An intent held back for the same reason is logged at most this often.
+const WAIT_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The attempts in flight on an account, and the profit of the newest.
 #[derive(Clone, Copy)]
 struct InFlight {
@@ -46,6 +50,8 @@ struct InFlight {
 pub struct QueuedIntent {
     pub intent: PreparedLiquidatableAccount,
     pub queued_at: Instant,
+    /// Since when the account has had an intent waiting without a break, across re-evaluations.
+    pub pending_since: Instant,
 }
 
 pub struct ExecutionQueue {
@@ -70,6 +76,8 @@ struct State {
     /// Lost races in a row per account, when the last was, and the slot Geyser had delivered the
     /// account at then.
     lost_races: HashMap<Pubkey, (u32, Instant, Option<u64>)>,
+    /// Why each held-back intent was last logged as waiting, and when.
+    wait_logged: HashMap<Pubkey, (&'static str, Instant)>,
     stopped: bool,
 }
 
@@ -92,18 +100,39 @@ impl ExecutionQueue {
     /// and is no longer liquidatable leaves the queue.
     pub fn offer(&self, checked: &[Pubkey], intents: Vec<PreparedLiquidatableAccount>) {
         let mut state = self.lock();
+        let mut since = HashMap::new();
         for address in checked {
-            state.pending.remove(address);
+            if let Some(queued) = state.pending.remove(address) {
+                since.insert(*address, queued.pending_since);
+            }
         }
         let queued_at = Instant::now();
+        let mut waits = Vec::new();
         for intent in intents {
+            let address = intent.liquidatee_account.address;
+            if let Some(wait) = state.wait_reason(&address, &intent, queued_at) {
+                waits.push(wait);
+            }
             state.pending.insert(
-                intent.liquidatee_account.address,
-                QueuedIntent { intent, queued_at },
+                address,
+                QueuedIntent {
+                    intent,
+                    queued_at,
+                    pending_since: since.get(&address).copied().unwrap_or(queued_at),
+                },
             );
         }
+        let State {
+            pending,
+            wait_logged,
+            ..
+        } = &mut *state;
+        wait_logged.retain(|address, _| pending.contains_key(address));
         drop(state);
         self.ready.notify_all();
+        for wait in waits {
+            info!("{wait}");
+        }
     }
 
     /// Blocks until an intent is ready and hands it out; `None` once the queue is stopped.
@@ -240,6 +269,63 @@ impl ExecutionQueue {
 }
 
 impl State {
+    /// Why `intent` can't be taken now, as a `LIQUIDATION_QUEUE_WAIT` line, unless the same
+    /// reason was logged for its account within [`WAIT_LOG_INTERVAL`].
+    fn wait_reason(
+        &mut self,
+        address: &Pubkey,
+        intent: &PreparedLiquidatableAccount,
+        now: Instant,
+    ) -> Option<String> {
+        let profit = intent.profit.to_num::<f64>();
+        let (reason, detail) =
+            if let Some(until) = self.cooldowns.get(address).filter(|until| **until > now) {
+                let left = until.saturating_duration_since(now).as_millis();
+                match self.awaiting.get(address) {
+                    Some(slot) => (
+                        "awaiting_landed_state",
+                        format!("cooldown_left_ms={left} landed_slot={slot}"),
+                    ),
+                    None => {
+                        let lost = self
+                            .lost_races
+                            .get(address)
+                            .map_or(0, |(count, _, _)| *count);
+                        (
+                            "cooldown",
+                            format!("cooldown_left_ms={left} lost_races_in_a_row={lost}"),
+                        )
+                    }
+                }
+            } else if let Some(flight) = self.in_flight.get(address) {
+                let in_flight_profit = flight.profit.to_num::<f64>();
+                if flight.attempts < MAX_ATTEMPTS_PER_ACCOUNT
+                    && profit > in_flight_profit * SUPERSEDING_GAIN
+                {
+                    return None;
+                }
+                (
+                    "in_flight",
+                    format!(
+                        "attempts={} in_flight_profit_usd={in_flight_profit:.4}",
+                        flight.attempts
+                    ),
+                )
+            } else {
+                return None;
+            };
+        if self.wait_logged.get(address).is_some_and(|(logged, at)| {
+            *logged == reason && now.saturating_duration_since(*at) < WAIT_LOG_INTERVAL
+        }) {
+            return None;
+        }
+        self.wait_logged.insert(*address, (reason, now));
+        Some(format!(
+            "LIQUIDATION_QUEUE_WAIT account={address} reason={reason} profit_usd={profit:.4} estimated_repay_usd={:.4} {detail}",
+            intent.estimated_repay_usd
+        ))
+    }
+
     /// The most profitable intent not cooling down whose account is free, or has an attempt in
     /// flight that this one supersedes; now marked in flight.
     fn take_ready(&mut self, now: Instant) -> Option<QueuedIntent> {
@@ -391,6 +477,83 @@ mod tests {
         queue.release(a, false);
         queue.release(a, false);
         assert!(queue.lock().in_flight.is_empty(), "every attempt finished");
+    }
+
+    #[test]
+    fn a_held_back_intent_says_why_and_mirrors_what_take_allows() {
+        let queue = ExecutionQueue::new(Duration::from_secs(3));
+        let a = Pubkey::new_unique();
+        let reason = |queue: &ExecutionQueue, profit: i32| {
+            let mut state = queue.lock();
+            state.wait_logged.clear();
+            state.wait_reason(&a, &intent(a, profit), Instant::now())
+        };
+        assert!(reason(&queue, 10).is_none(), "free to take");
+
+        queue.offer(&[a], vec![intent(a, 10)]);
+        assert!(take_now(&queue).is_some());
+        let in_flight = reason(&queue, 10).expect("not bigger than the piece in flight");
+        assert!(in_flight.contains("reason=in_flight"), "{in_flight}");
+        queue.offer(&[a], vec![intent(a, 10)]);
+        assert!(take_now(&queue).is_none(), "take refuses it too");
+        assert!(reason(&queue, 12).is_none(), "a superseding piece may go");
+        queue.offer(&[a], vec![intent(a, 12)]);
+        assert!(take_now(&queue).is_some(), "and take hands it out");
+        queue.release(a, false);
+
+        queue.release(a, true);
+        let cooling = reason(&queue, 10).expect("cooling down");
+        assert!(cooling.contains("reason=cooldown"), "{cooling}");
+
+        queue.offer(&[a], vec![intent(a, 10)]);
+        assert!(take_now(&queue).is_none(), "the gate it reported holds");
+
+        // After a landing, until Geyser delivers the account at that slot.
+        let b = Pubkey::new_unique();
+        queue.offer(&[b], vec![intent(b, 10)]);
+        assert!(take_now(&queue).is_some());
+        queue.release_after_landing(b, 100);
+        let mut state = queue.lock();
+        let awaiting = state
+            .wait_reason(&b, &intent(b, 10), Instant::now())
+            .expect("waiting for the landed state");
+        assert!(
+            awaiting.contains("reason=awaiting_landed_state"),
+            "{awaiting}"
+        );
+        drop(state);
+        queue.account_updated(b, 100);
+        queue.offer(&[b], vec![intent(b, 10)]);
+        assert!(take_now(&queue).is_some(), "free once the state arrived");
+    }
+
+    #[test]
+    fn a_wait_is_logged_once_a_second_and_keeps_its_pending_since() {
+        let queue = ExecutionQueue::new(Duration::from_secs(3));
+        let a = Pubkey::new_unique();
+        queue.offer(&[a], vec![intent(a, 10)]);
+        let first = queue.lock().pending[&a].pending_since;
+        queue
+            .lock()
+            .cooldowns
+            .insert(a, Instant::now() + Duration::from_secs(3));
+        let now = Instant::now();
+        let mut state = queue.lock();
+        assert!(state.wait_reason(&a, &intent(a, 10), now).is_some());
+        assert!(
+            state.wait_reason(&a, &intent(a, 10), now).is_none(),
+            "throttled"
+        );
+        assert!(state
+            .wait_reason(&a, &intent(a, 10), now + WAIT_LOG_INTERVAL)
+            .is_some());
+        drop(state);
+        queue.offer(&[a], vec![intent(a, 11)]);
+        assert_eq!(
+            queue.lock().pending[&a].pending_since,
+            first,
+            "re-offers keep it"
+        );
     }
 
     #[test]
