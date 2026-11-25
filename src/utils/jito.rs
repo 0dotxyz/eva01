@@ -50,9 +50,9 @@ const RATE_WINDOW: Duration = Duration::from_secs(1);
 /// Requests per window without an auth uuid.
 const UNAUTHENTICATED_REQUESTS: usize = 1;
 
-/// Requests per window with an auth uuid. Ours admits about 37 a second; this leaves room for
+/// Requests per window with an auth uuid. Ours is granted 50 a second; this leaves room for
 /// bursts the window doesn't count evenly.
-const AUTHENTICATED_REQUESTS: usize = 20;
+const AUTHENTICATED_REQUESTS: usize = 40;
 
 pub struct JitoClient {
     http: Client,
