@@ -168,8 +168,6 @@ pub struct BundleLanding {
     /// Also sends each bundle whose tip meets its minimum, with the same liquidation, so at most
     /// one of the two lands.
     pub sender: Option<HeliusSender>,
-    /// For the Sender tip transaction's priority fee.
-    pub cu_price_micro_lamports: u64,
 }
 
 /// A transaction sent over RPC is re-sent this often until it confirms or its blockhash expires:
@@ -356,7 +354,7 @@ struct InFlight<'a> {
     /// The block engine took it; with its id unless already processed.
     jito: Option<Option<(&'a JitoClient, &'a str)>>,
     /// The request to the block engine got no usable answer: the bundle may have arrived, with no
-    /// id to ask about, so it gets [`SENDER_LANDING_WINDOW`] like Sender's.
+    /// id to ask about, so it gets the [`JITO_LANDING_WINDOW`] an accepted one gets.
     jito_uncertain: bool,
     /// Sender took it: its tip transaction's signature, which lands only with Sender's bundle.
     sender_tip: Option<Signature>,
@@ -854,7 +852,8 @@ impl Executor {
         }
     }
 
-    /// Lands the liquidation as an unsimulated Jito bundle, behind `push` when it was sized on one:
+    /// Lands the liquidation as an unsimulated bundle (Jito, and Sender when it takes it), behind
+    /// `push` when it was sized on one:
     /// the wallet-funded plan when it earns enough, otherwise the sandwich.
     fn execute_as_bundle(
         &self,
@@ -1024,9 +1023,8 @@ impl Executor {
         // A few lamports off or on per send, so two bundles' tip transactions are never the same,
         // within the cap.
         let tip = bundles.tip_estimator.tip_for(profit_lamports, send % 1_000);
-        // Sender's copy, at most four transactions (it can't decode v1): the same refresh and
-        // liquidation, behind the push built again with Sender's tip inside, or followed by a
-        // tip transaction.
+        // Sender's copy, at most four transactions: the same refresh and liquidation, behind the
+        // push built again with Sender's tip inside, or followed by a tip transaction.
         let sender_bundle = match (&bundles.sender, push) {
             (Some(sender), _) if tip < helius_sender::MIN_TIP_LAMPORTS || sender.is_down() => None,
             // Without the block engine, a bundle with no push goes over RPC instead (the caller's
@@ -1203,13 +1201,8 @@ impl Executor {
                 let mut txs = sender_bundle.txs.clone();
                 if sender_bundle.tip_tx {
                     txs.push(
-                        helius_sender::build_tip_transaction(
-                            &bundles.signer,
-                            blockhash,
-                            tip,
-                            bundles.cu_price_micro_lamports,
-                        )
-                        .map_err(built)?,
+                        helius_sender::build_tip_transaction(&bundles.signer, blockhash, tip)
+                            .map_err(built)?,
                     );
                 }
                 Some((sender, txs))
@@ -1401,24 +1394,31 @@ impl Executor {
                 unreadable_since = Some(Instant::now());
             }
             if let Some(Some((jito, id))) = in_flight.jito {
-                // A block engine taken as down isn't asked: it would only cost the timeout.
-                if !jito_lost
-                    && !jito.is_down()
-                    && last_inflight_check.elapsed() >= check_interval
-                    && started.elapsed() < WATCH_MAX_WAIT
-                {
-                    last_inflight_check = Instant::now();
-                    // Only in a spare slot: sends need them more.
-                    if let Some(status) = jito
-                        .try_reserve_spare()
-                        .and_then(|slot| slot.inflight_bundle_status(id).ok().flatten())
+                // Sent over gRPC: its stream's word alone, as JSON-RPC may not know the bundle.
+                // Otherwise the block engine is asked over JSON-RPC, in a spare slot (sends need
+                // them more), and not while taken as down, which would only cost the timeout.
+                let status = match jito.streamed_status(id) {
+                    Some(streamed) => streamed,
+                    None if !jito_lost
+                        && !jito.json_rpc_down()
+                        && last_inflight_check.elapsed() >= check_interval
+                        && started.elapsed() < WATCH_MAX_WAIT =>
                     {
-                        jito_lost = status.is_dead();
-                        jito_reported_dead = status.is_dead();
-                        if let InflightStatus::Landed(slot) = status {
-                            jito_landed = Some(slot);
-                            jito_landed_at.get_or_insert_with(Instant::now);
-                        }
+                        last_inflight_check = Instant::now();
+                        jito.try_reserve_spare()
+                            .and_then(|slot| slot.inflight_bundle_status(id).ok().flatten())
+                    }
+                    None => None,
+                };
+                // A landing counts whenever it is told; anything else only while the copy is live.
+                if let Some(status) = status
+                    .filter(|status| !jito_lost || matches!(status, InflightStatus::Landed(_)))
+                {
+                    jito_lost = status.is_dead();
+                    jito_reported_dead = status.is_dead();
+                    if let InflightStatus::Landed(slot) = status {
+                        jito_landed = Some(slot);
+                        jito_landed_at.get_or_insert_with(Instant::now);
                     }
                 }
                 // Not reported landed in time (pending, unasked, or the block engine down).
@@ -1426,7 +1426,7 @@ impl Executor {
                     jito_lost = true;
                 }
             }
-            if in_flight.jito_uncertain && started.elapsed() >= SENDER_LANDING_WINDOW {
+            if in_flight.jito_uncertain && started.elapsed() >= JITO_LANDING_WINDOW {
                 jito_lost = true;
             }
             let sender_lost =

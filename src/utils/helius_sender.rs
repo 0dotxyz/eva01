@@ -1,9 +1,9 @@
 //! Minimal Helius Sender bundle client.
 //!
-//! Sender takes up to four signed legacy or v0 transactions as an atomic bundle (`sendBundle`; it
-//! can't decode v1) and routes it across several block-building paths, Jito among them, paying
-//! their tips itself out of the one tip the bundle carries to a Sender tip account. It has no bundle
-//! status: whether a bundle landed is read from the chain, by its liquidation's signature.
+//! Sender takes up to four signed transactions as an atomic bundle (`sendBundle`) and routes it
+//! across several block-building paths, Jito among them, paying their tips itself out of the one
+//! tip the bundle carries to a Sender tip account. It has no bundle status: whether a bundle
+//! landed is read from the chain, by its liquidation's signature.
 
 use std::{
     collections::VecDeque,
@@ -19,15 +19,16 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use log::{info, warn};
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
-use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_keypair::Keypair;
-use solana_message::{v0, Hash, VersionedMessage};
+use solana_message::Hash;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_system_interface::instruction::transfer;
 use solana_transaction::versioned::VersionedTransaction;
 
-use crate::transaction_limits::{bundle_cu_price, MAX_SENDER_BUNDLE_TXS};
+use crate::transaction_limits::{
+    v1_transaction, wire_bytes, MAX_SENDER_BUNDLE_TXS, MIN_PRIORITY_FEE_LAMPORTS, TIP_TX_CU_LIMIT,
+};
 
 const DEFAULT_ENDPOINT: &str = "https://sender.helius-rpc.com/fast";
 
@@ -77,9 +78,6 @@ const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often the connection is kept warm, so a bundle never waits for a TLS handshake (Helius
 /// recommends warming it when gaps exceed 5 s). Pings don't count against the rate limit.
 const PING_INTERVAL: Duration = Duration::from_secs(5);
-
-/// The tip transaction's compute limit: a transfer and the budget instructions take well under it.
-const TIP_TX_CU_LIMIT: u32 = 1_000;
 
 pub struct HeliusSender {
     http: Client,
@@ -200,7 +198,7 @@ impl HeliusSender {
         }
         let encoded: Result<Vec<String>> = txs
             .iter()
-            .map(|tx| Ok(BASE64.encode(bincode::serialize(tx)?)))
+            .map(|tx| Ok(BASE64.encode(wire_bytes(tx)?)))
             .collect();
         let encoded = match encoded {
             Ok(encoded) => encoded,
@@ -381,18 +379,14 @@ pub fn build_tip_transaction(
     signer: &Keypair,
     blockhash: Hash,
     lamports: u64,
-    cu_price_micro_lamports: u64,
 ) -> Result<VersionedTransaction> {
-    let ixs = [
-        ComputeBudgetInstruction::set_compute_unit_limit(TIP_TX_CU_LIMIT),
-        ComputeBudgetInstruction::set_compute_unit_price(bundle_cu_price(
-            TIP_TX_CU_LIMIT,
-            cu_price_micro_lamports,
-        )),
-        tip_instruction(&signer.pubkey(), lamports)?,
-    ];
-    let msg = v0::Message::try_compile(&signer.pubkey(), &ixs, &[], blockhash)?;
-    VersionedTransaction::try_new(VersionedMessage::V0(msg), &[signer]).map_err(Into::into)
+    v1_transaction(
+        &[signer],
+        &[tip_instruction(&signer.pubkey(), lamports)?],
+        blockhash,
+        TIP_TX_CU_LIMIT,
+        MIN_PRIORITY_FEE_LAMPORTS,
+    )
 }
 
 /// A transfer of `lamports` from `payer` to one of Sender's tip accounts.
@@ -487,11 +481,11 @@ mod tests {
     #[test]
     fn the_tip_transaction_pays_the_minimum_priority_fee() {
         let signer = Keypair::new();
-        let tx = build_tip_transaction(&signer, Hash::new_unique(), MIN_TIP_LAMPORTS, 1).unwrap();
-        assert_eq!(tx.message.instructions().len(), 3);
-        assert!(
-            u64::from(TIP_TX_CU_LIMIT) * bundle_cu_price(TIP_TX_CU_LIMIT, 1)
-                >= crate::transaction_limits::MIN_BUNDLE_PRIORITY_FEE_LAMPORTS * 1_000_000
-        );
+        let tx = build_tip_transaction(&signer, Hash::new_unique(), MIN_TIP_LAMPORTS).unwrap();
+        let solana_message::VersionedMessage::V1(message) = &tx.message else {
+            panic!("not v1");
+        };
+        assert_eq!(message.instructions.len(), 1, "the transfer alone");
+        assert_eq!(message.config.priority_fee, Some(MIN_PRIORITY_FEE_LAMPORTS));
     }
 }

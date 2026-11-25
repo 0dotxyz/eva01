@@ -22,9 +22,6 @@ pub struct Eva01Config {
     pub wallet_keypair: Vec<u8>,
     pub compute_unit_price_micro_lamports: u64,
     pub marginfi_group_key: Pubkey,
-    pub luts_group1: Vec<Pubkey>,
-    pub luts_group2: Vec<Pubkey>,
-    pub luts_group3: Vec<Pubkey>,
     pub excluded_liquidation_mints: Vec<Pubkey>,
     pub min_profit: f64,
     /// Accounts whose liquidation would earn more than this are left to another instance: set on
@@ -59,6 +56,13 @@ pub struct Eva01Config {
     pub wallet_min_profit_share: f64,
     /// API key/uuid for `sendBundle`; `None` for the public (unauthenticated) path.
     pub bundle_api_key: Option<String>,
+    /// The keypair Jito whitelisted for its gRPC searcher API (`JITO_AUTH_KEYPAIR`, a JSON byte
+    /// array like `WALLET_KEYPAIR`): bundles go over gRPC, and their results stream back.
+    /// `None` keeps them on JSON-RPC. One key per instance: the stream reports every bundle sent
+    /// with it.
+    pub jito_auth_keypair: Option<Vec<u8>>,
+    /// The block engine's gRPC endpoint (`JITO_GRPC_URL`); `None` uses the global one.
+    pub jito_grpc_url: Option<String>,
     /// Helius Sender: bundles also go through it when `HELIUS_SENDER_API_KEY` or
     /// `HELIUS_SENDER_URL` is set (keyless, one bundle a second).
     pub helius_sender: Option<HeliusSenderConfig>,
@@ -96,10 +100,6 @@ impl Eva01Config {
                 .expect("MARGINFI_GROUP_KEY environment variable is not set"),
         )
         .expect("Invalid MARGINFI_GROUP_KEY Pubkey");
-
-        let luts_group1 = parse_pubkey_list("ADDRESS_LOOKUP_TABLES_GROUP1").unwrap_or_default();
-        let luts_group2 = parse_pubkey_list("ADDRESS_LOOKUP_TABLES_GROUP2").unwrap_or_default();
-        let luts_group3 = parse_pubkey_list("ADDRESS_LOOKUP_TABLES_GROUP3").unwrap_or_default();
 
         let excluded_liquidation_mints = parse_pubkey_list("EXCLUDED_LIQUIDATION_MINTS")?;
 
@@ -172,6 +172,10 @@ impl Eva01Config {
             .filter(|key| !key.trim().is_empty());
 
         let non_empty = |var: &str| std::env::var(var).ok().filter(|v| !v.trim().is_empty());
+        let jito_auth_keypair: Option<Vec<u8>> = non_empty("JITO_AUTH_KEYPAIR").map(|json| {
+            serde_json::from_str(&json).expect("Invalid JITO_AUTH_KEYPAIR JSON format")
+        });
+        let jito_grpc_url = non_empty("JITO_GRPC_URL");
         let helius_sender = match (
             non_empty("HELIUS_SENDER_URL"),
             non_empty("HELIUS_SENDER_API_KEY"),
@@ -187,9 +191,6 @@ impl Eva01Config {
             wallet_keypair,
             compute_unit_price_micro_lamports,
             marginfi_group_key,
-            luts_group1,
-            luts_group2,
-            luts_group3,
             excluded_liquidation_mints,
             min_profit,
             max_profit,
@@ -212,6 +213,8 @@ impl Eva01Config {
             bundle_tip_profit_share,
             wallet_min_profit_share,
             bundle_api_key,
+            jito_auth_keypair,
+            jito_grpc_url,
             helius_sender,
         })
     }
@@ -280,9 +283,6 @@ mod tests {
         let yellowstone_x_token = "token";
         let compute_unit_price_micro_lamports = "1000";
         let marginfi_group_key = Pubkey::new_unique().to_string();
-        let lut_group1 = Pubkey::new_unique().to_string();
-        let lut_group2 = Pubkey::new_unique().to_string();
-        let lut_group3 = Pubkey::new_unique().to_string();
         let min_profit = "0.01";
         let healthcheck_port = "3000";
 
@@ -294,9 +294,6 @@ mod tests {
             compute_unit_price_micro_lamports,
         );
         jail.set_env("MARGINFI_GROUP_KEY", &marginfi_group_key);
-        jail.set_env("ADDRESS_LOOKUP_TABLES_GROUP1", &lut_group1);
-        jail.set_env("ADDRESS_LOOKUP_TABLES_GROUP2", &lut_group2);
-        jail.set_env("ADDRESS_LOOKUP_TABLES_GROUP3", &lut_group3);
         jail.set_env("MIN_PROFIT", min_profit);
         jail.set_env("PORT", healthcheck_port);
     }

@@ -20,6 +20,7 @@ use crate::{
         self,
         helius_sender::HeliusSender,
         jito::{JitoClient, TipEstimator},
+        jito_grpc::{JitoGrpc, DEFAULT_GRPC_URL},
         log_genuine_error,
         pyth_push::{PythPusher, MAX_PUSHED_FEEDS},
         rate_limiter::RateLimiter,
@@ -418,7 +419,6 @@ pub struct Liquidator {
     /// The liquidation attempts the rebalancer stays out of the way of.
     activity: Arc<LiquidationActivity>,
     threads: Vec<JoinHandle<()>>,
-    liquidator_account: Arc<LiquidatorAccount>,
     tag_policy: TagPolicy,
     /// Tags due, sent from a thread of their own so the scan never waits on the RPC.
     tags: Sender<DueTag>,
@@ -826,6 +826,16 @@ impl Liquidator {
                 jito: JitoClient::new(
                     config.jito_block_engine_url.clone(),
                     config.bundle_api_key.clone(),
+                    match &config.jito_auth_keypair {
+                        Some(keypair) => Some(JitoGrpc::new(
+                            config
+                                .jito_grpc_url
+                                .clone()
+                                .unwrap_or_else(|| DEFAULT_GRPC_URL.to_string()),
+                            Keypair::try_from(keypair.as_slice())?,
+                        )?),
+                        None => None,
+                    },
                 ),
                 tip_estimator: TipEstimator::new(
                     config.jito_tip_max_lamports,
@@ -836,7 +846,6 @@ impl Liquidator {
                     .helius_sender
                     .as_ref()
                     .map(|sender| HeliusSender::new(sender.url.clone(), sender.api_key.clone())),
-                cu_price_micro_lamports: config.compute_unit_price_micro_lamports,
             })
         } else {
             None
@@ -872,7 +881,6 @@ impl Liquidator {
             activity,
             threads: Vec::new(),
             tags: spawn_tagger(liquidator_account.clone())?,
-            liquidator_account,
             tag_policy: TagPolicy::new(),
             skip_reports: RateLimiter::new(SKIP_REPORT_INTERVAL),
             health_watch: HealthWatch::default(),
@@ -1237,9 +1245,6 @@ impl Liquidator {
                     previous.bank.config != bank.config || previous.bank.emode != bank.emode
                 });
                 self.cache.banks.try_insert(address, bank, account)?;
-                if previous.is_none() {
-                    self.liquidator_account.cover_bank_in_background(&address);
-                }
 
                 // Only the share values move on most updates, which the health watch measures; a
                 // new weight, limit or oracle can change any holder's health.

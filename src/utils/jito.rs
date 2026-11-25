@@ -1,10 +1,10 @@
 //! Minimal Jito block-engine bundle client.
 //!
-//! Submits an ordered set of transactions as an atomic bundle via the public block-engine
-//! JSON-RPC (`sendBundle`). Whether the bundle landed is read from the chain, by its last
-//! transaction's signature, so landing it costs one block-engine request; the block engine is
-//! asked about it again only to learn early that it won't land. No extra crates: plain `reqwest`
-//! + `serde_json`.
+//! Submits an ordered set of transactions as an atomic bundle: over gRPC while its authenticated
+//! session is up (`jito_grpc`), which streams back what became of each bundle, and otherwise over
+//! the block engine's JSON-RPC (`sendBundle`). Whether the bundle landed is read from the chain,
+//! by its liquidation's signature. To learn early that it won't land, a bundle sent over gRPC is
+//! judged by its stream alone; one sent over JSON-RPC is asked about there.
 
 use std::{
     str::FromStr,
@@ -13,6 +13,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use super::jito_grpc::{GrpcSend, JitoGrpc};
+use crate::transaction_limits::{v1_transaction, wire_bytes, TIP_TX_CU_LIMIT};
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use log::{info, warn};
@@ -21,7 +23,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
-use solana_message::{v0, Hash, VersionedMessage};
+use solana_message::Hash;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_system_interface::instruction::transfer;
@@ -56,6 +58,8 @@ pub struct JitoClient {
     http: Client,
     endpoint: String,
     api_key: Option<String>,
+    /// Sends bundles while its session is up, and reports their results.
+    grpc: Option<JitoGrpc>,
     slot: Mutex<SlotState>,
     outage: Mutex<Outage>,
 }
@@ -133,11 +137,14 @@ pub struct JitoSlot<'a> {
     jito: &'a JitoClient,
     /// Its request went out: it counts in `sent`, no longer as held.
     used: std::cell::Cell<bool>,
+    /// Held against the JSON-RPC limit. Not while a gRPC session is up, which has its own limit:
+    /// such a slot counts only if its bundle goes over JSON-RPC after all.
+    counted: bool,
 }
 
 impl Drop for JitoSlot<'_> {
     fn drop(&mut self) {
-        if !self.used.get() {
+        if self.counted && !self.used.get() {
             let mut state = self.jito.slot.lock().unwrap_or_else(|e| e.into_inner());
             state.held = state.held.saturating_sub(1);
         }
@@ -150,95 +157,60 @@ impl JitoSlot<'_> {
     fn mark_sent(&self) {
         let mut state = self.jito.slot.lock().unwrap_or_else(|e| e.into_inner());
         state.sent.push_back(Instant::now());
-        if !self.used.replace(true) {
+        if !self.used.replace(true) && self.counted {
             state.held = state.held.saturating_sub(1);
         }
     }
 
-    /// Submits a bundle in this slot. An `Err` is a bundle that couldn't be encoded, never sent. A
-    /// request that couldn't connect, or was refused for auth, is `Unavailable`: not sent. One that
-    /// timed out, dropped, or met a server error after going out is `Uncertain`: it may land.
+    /// Submits a bundle in this slot: over gRPC while its session is up, and over JSON-RPC when
+    /// gRPC didn't take it or can't say. An `Err` is a bundle that couldn't be encoded, never sent.
+    /// A request that couldn't connect, or was refused for auth, is `Unavailable`: not sent. One
+    /// that timed out, dropped, or met a server error after going out is `Uncertain`: it may land.
     pub fn send_bundle(self, txs: &[VersionedTransaction]) -> Result<BundleSend> {
         if txs.is_empty() {
             return Err(anyhow!("Cannot send an empty bundle"));
         }
-        let encoded = encode_transactions(txs)?;
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendBundle",
-            "params": [encoded, { "encoding": "base64" }],
-        });
-        self.mark_sent();
-        let resp = match self.jito.http.post(self.jito.url()).json(&body).send() {
-            Ok(resp) => resp,
-            // Unreachable: not sent. No answer in time, or the connection dropped after the
-            // request went out: it may have arrived. Without the URL, which carries the auth uuid.
-            // Counts toward an outage, a hang included. A merely slow block engine still answers
-            // some requests in a burst, and any answer clears the count.
-            Err(e) => {
-                self.jito.note_unavailable();
-                let connect = e.is_connect();
-                let message = e.without_url().to_string();
-                return Ok(if connect {
-                    BundleSend::Unavailable(message)
-                } else {
-                    BundleSend::Uncertain(message)
-                });
-            }
-        };
-        // Refused before the auction, so nothing waits for it. Not an outage: the block engine
-        // answers 429 when congested, in exactly the bursts that matter, and answers fast.
-        let status = resp.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Ok(BundleSend::Rejected("rate limited (HTTP 429)".to_string()));
-        }
-        // The block engine failing, as opposed to refusing this bundle. A server error (a gateway
-        // timing out, say) may come after the bundle reached it; an auth or path error means it
-        // didn't.
-        if status.is_server_error() {
-            self.jito.note_unavailable();
-            return Ok(BundleSend::Uncertain(format!("HTTP {status}")));
-        }
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-            || status == reqwest::StatusCode::NOT_FOUND
-        {
-            if status != reqwest::StatusCode::NOT_FOUND {
-                let mut last = AUTH_REJECTED_LOGGED
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                if last.is_none_or(|at| at.elapsed() >= AUTH_REJECTED_LOG_INTERVAL) {
-                    *last = Some(Instant::now());
-                    log::error!(
-                        "Jito: the block engine rejects the auth uuid (HTTP {status}); check JITO_API_KEY"
-                    );
+        let wire = txs.iter().map(wire_bytes).collect::<Result<Vec<_>>>()?;
+        // What gRPC answered when it went out and didn't take the bundle.
+        let mut grpc_tried = None;
+        let mut grpc_uncertain = None;
+        if let Some(grpc) = &self.jito.grpc {
+            match grpc.send_bundle(wire.clone()) {
+                // JSON-RPC's outage state is its own: gRPC's answers don't clear it.
+                GrpcSend::Accepted(id) => return Ok(BundleSend::Accepted(id)),
+                GrpcSend::Rejected(reason) => return Ok(BundleSend::Rejected(reason)),
+                // It may have arrived, or certainly didn't: either way it goes over JSON-RPC too,
+                // as the same transactions land at most once.
+                GrpcSend::Uncertain(reason) => {
+                    grpc_tried = Some(format!("gRPC: {reason}"));
+                    grpc_uncertain = Some(reason);
                 }
+                GrpcSend::NotSent(reason) => grpc_tried = Some(format!("gRPC: {reason}")),
+                GrpcSend::NoSession => {}
             }
-            self.jito.note_unavailable();
-            return Ok(BundleSend::Unavailable(format!("HTTP {status}")));
         }
-        // Anything else carries the block engine's JSON-RPC answer, an error included (HTTP 400):
-        // an invalid bundle, or one already processed, which means it landed.
-        // Not the block engine's JSON-RPC (a proxy's page, a wrong endpoint): as good as down.
-        let resp: Value = match resp.json() {
-            Ok(resp) => resp,
-            // A 2xx it couldn't read still answered; anything else unreadable is as good as down.
-            Err(e) => {
-                let message = format!("unreadable answer: {}", e.without_url());
-                return Ok(if status.is_success() {
-                    BundleSend::Uncertain(message)
-                } else {
-                    self.jito.note_unavailable();
-                    BundleSend::Unavailable(message)
-                });
-            }
-        };
-        self.jito.note_reachable();
-        Ok(match parse_send_bundle_result(&resp) {
-            Ok(id) => BundleSend::Accepted(id),
-            Err(e) => BundleSend::Rejected(e.to_string()),
-        })
+        // Known down: asking would only cost its timeout.
+        if self.jito.json_rpc_down() {
+            return Ok(match grpc_uncertain {
+                Some(reason) => BundleSend::Uncertain(format!("gRPC: {reason}")),
+                None => BundleSend::Unavailable(format!(
+                    "JSON-RPC down; {}",
+                    grpc_tried.as_deref().unwrap_or("no gRPC session")
+                )),
+            });
+        }
+        // A JSON-RPC request, counted as it goes out. A slot taken while gRPC was up, held against
+        // nothing, goes once the window has room, within one window.
+        if self.counted {
+            self.mark_sent();
+        } else if !self.jito.admit_within(RATE_WINDOW) {
+            return Ok(combine(
+                grpc_uncertain,
+                BundleSend::Rejected("over the JSON-RPC request rate".to_string()),
+            ));
+        }
+        self.used.set(true);
+        Ok(combine(grpc_uncertain, self.jito.send_json_rpc(&wire)))
     }
 
     /// The block engine's view of a bundle sent in the last few minutes, asked in this slot.
@@ -250,7 +222,12 @@ impl JitoSlot<'_> {
             "method": "getInflightBundleStatuses",
             "params": [[bundle_id]],
         });
-        self.mark_sent();
+        // A JSON-RPC request either way; one held against nothing goes only if the window has room.
+        if self.counted {
+            self.mark_sent();
+        } else if !self.jito.admit_within(Duration::ZERO) {
+            return Ok(None);
+        }
         // Errors without the URL, which carries the auth uuid.
         let resp: Value = self
             .jito
@@ -268,7 +245,7 @@ impl JitoSlot<'_> {
 }
 
 impl JitoClient {
-    pub fn new(endpoint: Option<String>, api_key: Option<String>) -> Self {
+    pub fn new(endpoint: Option<String>, api_key: Option<String>, grpc: Option<JitoGrpc>) -> Self {
         let capacity = if api_key.is_some() {
             AUTHENTICATED_REQUESTS
         } else {
@@ -290,6 +267,7 @@ impl JitoClient {
                 .expect("the Jito HTTP client builds"),
             endpoint: endpoint.unwrap_or_else(|| DEFAULT_BUNDLE_ENDPOINT.to_string()),
             api_key,
+            grpc,
             outage: Mutex::new(Outage::default()),
             slot: Mutex::new(SlotState {
                 capacity,
@@ -299,8 +277,14 @@ impl JitoClient {
         }
     }
 
-    /// Whether the block engine is taken as down: several requests failed lately.
+    /// Whether the block engine is taken as down: JSON-RPC failed several requests lately, and no
+    /// gRPC session is up to send over instead.
     pub fn is_down(&self) -> bool {
+        self.json_rpc_down() && !self.grpc.as_ref().is_some_and(JitoGrpc::is_up)
+    }
+
+    /// Whether JSON-RPC is taken as down: several requests failed lately.
+    pub fn json_rpc_down(&self) -> bool {
         let outage = self.outage.lock().unwrap_or_else(|e| e.into_inner());
         outage
             .down_until
@@ -343,9 +327,17 @@ impl JitoClient {
     }
 
     /// A request slot, if one is free now, without waiting: a liquidation that finds none goes
-    /// out another way instead of queueing behind the other workers. The lock is held only to
+    /// out another way instead of queueing behind the other workers. While a gRPC session is up
+    /// there always is one, held against nothing (see [`JitoSlot`]). The lock is held only to
     /// read and update the state, never across a wait.
     pub fn try_reserve(&self) -> Option<JitoSlot<'_>> {
+        if self.grpc.as_ref().is_some_and(JitoGrpc::is_up) {
+            return Some(JitoSlot {
+                jito: self,
+                used: std::cell::Cell::new(false),
+                counted: false,
+            });
+        }
         let mut state = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         state.prune(Instant::now());
         if state.is_full() {
@@ -355,6 +347,7 @@ impl JitoClient {
         Some(JitoSlot {
             jito: self,
             used: std::cell::Cell::new(false),
+            counted: true,
         })
     }
 
@@ -370,6 +363,112 @@ impl JitoClient {
             }
             thread::sleep(HELD_SLOT_RECHECK);
         }
+    }
+
+    /// Counts a JSON-RPC request going out now, waiting at most `max` for the window to have room
+    /// for it. Sleeps without the lock.
+    fn admit_within(&self, max: Duration) -> bool {
+        let deadline = Instant::now() + max;
+        loop {
+            {
+                let mut state = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+                state.prune(Instant::now());
+                if !state.is_full() {
+                    state.sent.push_back(Instant::now());
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(HELD_SLOT_RECHECK);
+        }
+    }
+
+    /// Sends the bundle's `wire` transactions over JSON-RPC (see [`JitoSlot::send_bundle`]).
+    fn send_json_rpc(&self, wire: &[Vec<u8>]) -> BundleSend {
+        let encoded: Vec<String> = wire.iter().map(|tx| BASE64.encode(tx)).collect();
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": [encoded, { "encoding": "base64" }],
+        });
+        let resp = match self.http.post(self.url()).json(&body).send() {
+            Ok(resp) => resp,
+            // Unreachable: not sent. No answer in time, or the connection dropped after the
+            // request went out: it may have arrived. Without the URL, which carries the auth uuid.
+            // Counts toward an outage, a hang included. A merely slow block engine still answers
+            // some requests in a burst, and any answer clears the count.
+            Err(e) => {
+                self.note_unavailable();
+                let connect = e.is_connect();
+                let message = e.without_url().to_string();
+                return if connect {
+                    BundleSend::Unavailable(message)
+                } else {
+                    BundleSend::Uncertain(message)
+                };
+            }
+        };
+        // Refused before the auction, so nothing waits for it. Not an outage: the block engine
+        // answers 429 when congested, in exactly the bursts that matter, and answers fast.
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return BundleSend::Rejected("rate limited (HTTP 429)".to_string());
+        }
+        // The block engine failing, as opposed to refusing this bundle. A server error (a gateway
+        // timing out, say) may come after the bundle reached it; an auth or path error means it
+        // didn't.
+        if status.is_server_error() {
+            self.note_unavailable();
+            return BundleSend::Uncertain(format!("HTTP {status}"));
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::NOT_FOUND
+        {
+            if status != reqwest::StatusCode::NOT_FOUND {
+                let mut last = AUTH_REJECTED_LOGGED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if last.is_none_or(|at| at.elapsed() >= AUTH_REJECTED_LOG_INTERVAL) {
+                    *last = Some(Instant::now());
+                    log::error!(
+                        "Jito: the block engine rejects the auth uuid (HTTP {status}); check JITO_API_KEY"
+                    );
+                }
+            }
+            self.note_unavailable();
+            return BundleSend::Unavailable(format!("HTTP {status}"));
+        }
+        // Anything else carries the block engine's JSON-RPC answer, an error included (HTTP 400):
+        // an invalid bundle, or one already processed, which means it landed.
+        // Not the block engine's JSON-RPC (a proxy's page, a wrong endpoint): as good as down.
+        let resp: Value = match resp.json() {
+            Ok(resp) => resp,
+            // A 2xx it couldn't read still answered; anything else unreadable is as good as down.
+            Err(e) => {
+                let message = format!("unreadable answer: {}", e.without_url());
+                return if status.is_success() {
+                    BundleSend::Uncertain(message)
+                } else {
+                    self.note_unavailable();
+                    BundleSend::Unavailable(message)
+                };
+            }
+        };
+        self.note_reachable();
+        match parse_send_bundle_result(&resp) {
+            Ok(id) => BundleSend::Accepted(id),
+            Err(e) => BundleSend::Rejected(e.to_string()),
+        }
+    }
+
+    /// `None` when the gRPC stream knows nothing of bundle `id`; otherwise what it said, if anything
+    /// decisive.
+    pub fn streamed_status(&self, id: &str) -> Option<Option<InflightStatus>> {
+        self.grpc.as_ref()?.status(id)
     }
 
     /// Requests admitted per window.
@@ -389,6 +488,7 @@ impl JitoClient {
         Some(JitoSlot {
             jito: self,
             used: std::cell::Cell::new(false),
+            counted: true,
         })
     }
 
@@ -396,6 +496,12 @@ impl JitoClient {
     /// without the lock, so others' `try_reserve` never waits behind it.
     pub fn reserve(&self) -> JitoSlot<'_> {
         loop {
+            // With a gRPC session up, at once (`try_reserve`).
+            if self.grpc.as_ref().is_some_and(JitoGrpc::is_up) {
+                if let Some(slot) = self.try_reserve() {
+                    return slot;
+                }
+            }
             let wait = {
                 let mut state = self.slot.lock().unwrap_or_else(|e| e.into_inner());
                 let now = Instant::now();
@@ -431,6 +537,18 @@ impl JitoClient {
     }
 }
 
+/// What a bundle sent over JSON-RPC came to, after gRPC answered `grpc_uncertain` (it may have
+/// arrived) or nothing usable: JSON-RPC refusing a copy that may be in over gRPC doesn't stop that
+/// one.
+fn combine(grpc_uncertain: Option<String>, json_rpc: BundleSend) -> BundleSend {
+    match (grpc_uncertain, json_rpc) {
+        (Some(reason), BundleSend::Rejected(json_rpc) | BundleSend::Unavailable(json_rpc)) => {
+            BundleSend::Uncertain(format!("gRPC: {reason}; JSON-RPC: {json_rpc}"))
+        }
+        (_, sent) => sent,
+    }
+}
+
 /// The block engine's answer to `sendBundle`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BundleSend {
@@ -446,17 +564,6 @@ pub enum BundleSend {
     Uncertain(String),
 }
 
-/// Serialize each transaction with bincode and base64-encode it for the bundle payload.
-fn encode_transactions(txs: &[VersionedTransaction]) -> Result<Vec<String>> {
-    txs.iter()
-        .map(|tx| {
-            let bytes =
-                bincode::serialize(tx).map_err(|e| anyhow!("Failed to serialize tx: {e}"))?;
-            Ok(BASE64.encode(bytes))
-        })
-        .collect()
-}
-
 /// Extract the bundle id from a `sendBundle` response, treating "already processed" as success.
 fn parse_send_bundle_result(resp: &Value) -> Result<String> {
     if let Some(err) = resp.get("error").filter(|err| !err.is_null()) {
@@ -464,7 +571,7 @@ fn parse_send_bundle_result(resp: &Value) -> Result<String> {
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or_default();
-        if msg.contains("already processed") {
+        if msg.to_lowercase().contains("already processed") {
             return Ok("0x0".to_string());
         }
         return Err(anyhow!("Jito sendBundle error: {}", err));
@@ -578,9 +685,15 @@ impl TipEstimator {
         blockhash: Hash,
         lamports: u64,
     ) -> Result<VersionedTransaction> {
-        let ix = tip_instruction(&signer.pubkey(), lamports)?;
-        let msg = v0::Message::try_compile(&signer.pubkey(), &[ix], &[], blockhash)?;
-        VersionedTransaction::try_new(VersionedMessage::V0(msg), &[signer]).map_err(Into::into)
+        v1_transaction(
+            &[signer],
+            &[tip_instruction(&signer.pubkey(), lamports)?],
+            blockhash,
+            TIP_TX_CU_LIMIT,
+            // The block engine asks for none. Never for a Sender bundle, whose transactions
+            // must each pay its minimum (`helius_sender::build_tip_transaction`).
+            0,
+        )
     }
 }
 
@@ -656,7 +769,7 @@ mod tests {
 
     #[test]
     fn a_request_slot_is_held_until_used_and_then_spaced_out() {
-        let jito = JitoClient::new(None, None);
+        let jito = JitoClient::new(None, None, None);
         let slot = jito.try_reserve().expect("free at start");
         assert!(jito.try_reserve().is_none(), "held by the first caller");
         drop(slot);
@@ -671,7 +784,7 @@ mod tests {
 
     #[test]
     fn a_request_in_flight_counts_once() {
-        let jito = JitoClient::new(None, Some("uuid".to_string()));
+        let jito = JitoClient::new(None, Some("uuid".to_string()), None);
         let slot = jito.try_reserve().unwrap();
         slot.mark_sent();
         let counted = |jito: &JitoClient| {
@@ -689,7 +802,7 @@ mod tests {
 
     #[test]
     fn status_checks_leave_sends_half_the_window() {
-        let jito = JitoClient::new(None, Some("uuid".to_string()));
+        let jito = JitoClient::new(None, Some("uuid".to_string()), None);
         let half = AUTHENTICATED_REQUESTS / 2;
         let sends: Vec<_> = (0..half - 1)
             .map(|_| jito.try_reserve().expect("within the limit"))
@@ -702,7 +815,7 @@ mod tests {
 
     #[test]
     fn an_auth_uuid_admits_more_requests_per_window() {
-        let jito = JitoClient::new(None, Some("uuid".to_string()));
+        let jito = JitoClient::new(None, Some("uuid".to_string()), None);
         let slots: Vec<_> = (0..AUTHENTICATED_REQUESTS)
             .map(|_| jito.try_reserve().expect("within the limit"))
             .collect();
@@ -719,7 +832,7 @@ mod tests {
 
     #[test]
     fn waiting_for_the_slot_never_makes_a_try_wait() {
-        let jito = std::sync::Arc::new(JitoClient::new(None, None));
+        let jito = std::sync::Arc::new(JitoClient::new(None, None, None));
         let held = jito.try_reserve().unwrap();
         let waiter = {
             let jito = std::sync::Arc::clone(&jito);
@@ -786,6 +899,88 @@ mod tests {
     fn test_parse_send_bundle_result_missing() {
         let resp = json!({ "jsonrpc": "2.0", "id": 1 });
         assert!(parse_send_bundle_result(&resp).is_err());
+    }
+
+    /// A client whose gRPC session is up, on a connection nothing listens to, and whose JSON-RPC
+    /// endpoint is unreachable too.
+    fn with_grpc_up() -> JitoClient {
+        JitoClient::new(
+            Some("http://127.0.0.1:1".to_string()),
+            None,
+            Some(JitoGrpc::up_for_test()),
+        )
+    }
+
+    #[test]
+    fn with_grpc_up_a_slot_is_held_against_nothing() {
+        let jito = with_grpc_up();
+        let held = jito.slot.lock().unwrap().held;
+        let slots: Vec<_> = (0..3).map(|_| jito.try_reserve().expect("free")).collect();
+        assert!(slots.iter().all(|slot| !slot.counted));
+        assert_eq!(jito.slot.lock().unwrap().held, held);
+        // `reserve` doesn't wait either, the JSON-RPC window full or not.
+        jito.slot.lock().unwrap().sent.push_back(Instant::now());
+        let started = Instant::now();
+        drop(jito.reserve());
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn a_bundle_grpc_did_not_take_goes_over_json_rpc_only_within_its_limit() {
+        let jito = with_grpc_up();
+        let payer = Keypair::new();
+        let tx = v1_transaction(
+            &[&payer],
+            &[tip_instruction(&payer.pubkey(), 1).unwrap()],
+            Hash::new_unique(),
+            TIP_TX_CU_LIMIT,
+            0,
+        )
+        .unwrap();
+        // JSON-RPC's one request a second just used: gRPC can't connect, so the bundle goes over
+        // JSON-RPC once the window has room for it, not over the limit (and the endpoint is
+        // unreachable here).
+        let used = Instant::now();
+        jito.slot.lock().unwrap().sent.push_back(used);
+        let send = jito
+            .try_reserve()
+            .unwrap()
+            .send_bundle(std::slice::from_ref(&tx))
+            .unwrap();
+        assert!(matches!(send, BundleSend::Unavailable(_)), "{send:?}");
+        assert!(used.elapsed() >= RATE_WINDOW, "waited for room");
+        // The earlier request left the window before this one was counted in it.
+        assert_eq!(jito.slot.lock().unwrap().sent.len(), 1);
+        // JSON-RPC taken as down: not asked at all.
+        jito.outage.lock().unwrap().down_until = Some(Instant::now() + OUTAGE_PAUSE);
+        let started = Instant::now();
+        let send = jito.try_reserve().unwrap().send_bundle(&[tx]).unwrap();
+        assert!(matches!(send, BundleSend::Unavailable(_)), "{send:?}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        // Two sends that couldn't connect ended the gRPC session: with JSON-RPC down too, the
+        // block engine is taken as down.
+        assert!(!jito.grpc.as_ref().unwrap().is_up());
+        assert!(jito.is_down());
+    }
+
+    #[test]
+    fn a_copy_that_may_be_in_over_grpc_stays_watched() {
+        let maybe = || Some("Internal: reset".to_string());
+        let refused = || BundleSend::Rejected("duplicate".to_string());
+        assert!(matches!(
+            combine(maybe(), refused()),
+            BundleSend::Uncertain(_)
+        ));
+        assert!(matches!(
+            combine(maybe(), BundleSend::Unavailable("HTTP 503".to_string())),
+            BundleSend::Uncertain(_)
+        ));
+        assert_eq!(
+            combine(maybe(), BundleSend::Accepted("id".to_string())),
+            BundleSend::Accepted("id".to_string())
+        );
+        // gRPC certainly didn't take it: JSON-RPC's answer stands.
+        assert_eq!(combine(None, refused()), refused());
     }
 
     #[test]
