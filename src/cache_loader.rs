@@ -6,7 +6,6 @@ use log::{debug, error, info, warn};
 use marginfi_type_crate::types::{Bank, FeeState, MarginfiAccount, MarginfiGroup};
 use solana_account::Account;
 use solana_account_decoder_client_types::{UiAccountEncoding, UiDataSliceConfig};
-use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_client::{
     rpc_client::RpcClient,
     rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSendTransactionConfig},
@@ -15,7 +14,6 @@ use solana_client::{
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
-use solana_message::AddressLookupTableAccount;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 
@@ -50,29 +48,14 @@ const MAX_INIT_TA_IXS: usize = 10;
 pub struct CacheLoader {
     signer: Keypair,
     rpc_client: RpcClient,
-    lut_addresses_group1: Vec<Pubkey>,
-    lut_addresses_group2: Vec<Pubkey>,
-    lut_addresses_group3: Vec<Pubkey>,
 }
 
 impl CacheLoader {
-    pub fn new(
-        wallet_keypair: &[u8],
-        rpc_url: String,
-        lut_addresses_group1: Vec<Pubkey>,
-        lut_addresses_group2: Vec<Pubkey>,
-        lut_addresses_group3: Vec<Pubkey>,
-    ) -> Result<Self> {
+    pub fn new(wallet_keypair: &[u8], rpc_url: String) -> Result<Self> {
         let signer = Keypair::try_from(wallet_keypair)?;
         let rpc_client = RpcClient::new(&rpc_url);
 
-        Ok(Self {
-            signer,
-            rpc_client,
-            lut_addresses_group1,
-            lut_addresses_group2,
-            lut_addresses_group3,
-        })
+        Ok(Self { signer, rpc_client })
     }
 
     pub fn load_cache(&self, cache: &mut Cache) -> anyhow::Result<()> {
@@ -86,7 +69,6 @@ impl CacheLoader {
         cache.set_liquidation_max_fee(fee);
         info!("Liquidation max fee (FeeState): {}", fee);
 
-        self.load_luts(cache)?;
         self.load_marginfi_accounts(cache)?;
         self.load_banks(cache)?;
         self.load_mints(cache)?;
@@ -94,61 +76,6 @@ impl CacheLoader {
         self.load_tokens(cache)?;
 
         Ok(())
-    }
-
-    fn load_luts(&self, cache: &mut Cache) -> anyhow::Result<()> {
-        info!("Loading LUTs.");
-
-        let group1 = self.load_lut_vec(&self.lut_addresses_group1, "group1")?;
-        let group2 = self.load_lut_vec(&self.lut_addresses_group2, "group2")?;
-        let group3 = self.load_lut_vec(&self.lut_addresses_group3, "group3")?;
-
-        info!(
-            "Loaded LUTs: group1={}, group2={}, group3={}",
-            group1.len(),
-            group2.len(),
-            group3.len()
-        );
-
-        let mut extra = group1;
-        extra.extend(group2);
-        extra.extend(group3);
-        cache.luts.set_extra(extra)?;
-
-        Ok(())
-    }
-
-    fn load_lut_vec(
-        &self,
-        addresses: &[Pubkey],
-        label: &str,
-    ) -> anyhow::Result<Vec<AddressLookupTableAccount>> {
-        if addresses.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let lut_accounts = self.rpc_client.get_multiple_accounts(addresses)?;
-
-        addresses
-            .iter()
-            .zip(lut_accounts)
-            .map(|(lut_address, lut_account_opt)| {
-                let lut_account = lut_account_opt
-                    .ok_or_else(|| anyhow!("Failed to find {} LUT {}.", label, lut_address))?;
-                let lut = AddressLookupTable::deserialize(&lut_account.data).map_err(|e| {
-                    anyhow!(
-                        "Failed to deserialize {} LUT {}: {:?}",
-                        label,
-                        lut_address,
-                        e
-                    )
-                })?;
-                Ok(AddressLookupTableAccount {
-                    key: *lut_address,
-                    addresses: lut.addresses.to_vec(),
-                })
-            })
-            .collect()
     }
 
     fn load_marginfi_accounts(&self, cache: &mut Cache) -> anyhow::Result<()> {

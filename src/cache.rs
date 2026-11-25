@@ -29,7 +29,7 @@ use crate::{
     clock_manager,
     juplend_earn::accounts::Lending,
     kamino_lending::accounts::Reserve,
-    utils::{accessor, lut_registry::LutRegistry},
+    utils::accessor,
     wrappers::{oracle::OracleWrapper, token_account::TokenAccountWrapper},
 };
 
@@ -46,7 +46,6 @@ pub struct Cache {
     pub blockhash: blockhash::RecentBlockhash,
     pub tokens: TokensCache,
     pub clock: Arc<Mutex<Clock>>,
-    pub luts: Arc<LutRegistry>,
     pub global_fee_state_key: Pubkey,
     pub global_fee_wallet: Pubkey,
     /// FeeState's `liquidation_max_fee`, re-read in the background: the admin can change it.
@@ -81,7 +80,6 @@ impl Cache {
             blockhash: blockhash::RecentBlockhash::default(),
             tokens: TokensCache::default(),
             clock,
-            luts: Arc::new(LutRegistry::default()),
             global_fee_state_key,
             global_fee_wallet: Pubkey::default(),
             liquidation_max_fee: std::sync::RwLock::new(I80F48::ZERO),

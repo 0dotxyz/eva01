@@ -33,15 +33,15 @@ pub struct ExecutionPlan {
 /// How a liquidation will be landed, which decides how it is built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Landing {
-    /// Sent alone over RPC: a v1 transaction, simulated while it is built.
+    /// Sent alone over RPC, simulated while it is built.
     Rpc,
-    /// Sent in a Jito bundle, behind a price push when it needs one: a v0 transaction, since the
-    /// block engine cannot decode v1. Not simulated: a bundle that fails doesn't land and costs
-    /// nothing, and one behind a push relies on prices the chain doesn't hold yet.
+    /// Sent in a bundle, behind a price push when it needs one. Not simulated: a bundle that fails
+    /// doesn't land and costs nothing, and one behind a push relies on prices the chain doesn't
+    /// hold yet.
     Bundle,
     /// In a bundle whose earlier transaction refreshes the Kamino and JupLend accounts the
     /// liquidation reads (same slot, as both venues require), so the liquidation leaves those
-    /// instructions out and its route has their room.
+    /// instructions out and its route has their accounts.
     BundleRefreshed,
 }
 
@@ -49,10 +49,6 @@ impl Landing {
     /// Whether the liquidation refreshes the Kamino and JupLend accounts itself.
     pub fn refreshes_in_tx(self) -> bool {
         self != Landing::BundleRefreshed
-    }
-
-    pub fn is_bundle(self) -> bool {
-        self != Landing::Rpc
     }
 }
 

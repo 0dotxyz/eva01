@@ -4,6 +4,7 @@
 
 use std::{str::FromStr, time::Duration};
 
+use crate::transaction_limits::wire_bytes;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::blocking::Client;
@@ -177,7 +178,7 @@ impl QuickRpc {
         tx: &VersionedTransaction,
         skip_preflight: bool,
     ) -> Result<Signature> {
-        let encoded = BASE64.encode(bincode::serialize(tx)?);
+        let encoded = BASE64.encode(wire_bytes(tx)?);
         let result = self.call(
             "sendTransaction",
             json!([encoded, {
@@ -219,7 +220,7 @@ impl QuickRpc {
     /// Simulates `tx` against the current state: `None` when it passes, otherwise its error and
     /// logs.
     pub fn simulate(&self, tx: &VersionedTransaction) -> Result<Option<(String, Vec<String>)>> {
-        let encoded = BASE64.encode(bincode::serialize(tx)?);
+        let encoded = BASE64.encode(wire_bytes(tx)?);
         let result = self.call(
             "simulateTransaction",
             json!([encoded, {

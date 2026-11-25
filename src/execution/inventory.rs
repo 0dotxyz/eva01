@@ -24,7 +24,7 @@ use tokio::runtime::{Builder, Runtime};
 
 use crate::clock_manager;
 use crate::rebalancer::DexGate;
-use crate::transaction_limits::MAX_TX_ACCOUNT_LOCKS;
+use crate::transaction_limits::{DoesNotFit, MAX_TX_ACCOUNT_LOCKS};
 use crate::wrappers::{
     liquidator_account::{
         locked_accounts, LiquidatorAccount, PreparedLiquidatableAccount, SimulationFailed,
@@ -173,7 +173,7 @@ impl InventoryStrategy {
             .get_amount_from_value(I80F48::from_num(self.min_profit))?
             .to_num();
 
-        let (liquidation_ixs, _, _) = self.liquidator_account.liquidation_ixs(
+        let liquidation_ixs = self.liquidator_account.liquidation_ixs(
             intent,
             intent.asset_amount,
             intent.liab_amount,
@@ -184,10 +184,7 @@ impl InventoryStrategy {
             locked_accounts(&self.liquidator_account.signer.pubkey(), &liquidation_ixs)
                 .into_iter()
                 .collect();
-        // A v0 transaction also loads the compute-budget program; a v1 header carries the budget.
-        let budget_program = usize::from(landing.is_bundle());
-        let max_accounts =
-            MAX_TX_ACCOUNT_LOCKS.saturating_sub(transaction_accounts.len() + budget_program);
+        let max_accounts = MAX_TX_ACCOUNT_LOCKS.saturating_sub(transaction_accounts.len());
 
         let request = RouteRequest {
             allowed_programs: Some(RECEIVERSHIP_SWAP_PROGRAMS.to_vec()),
@@ -202,24 +199,43 @@ impl InventoryStrategy {
                 self.slippage_bps,
             )
         };
-        let swap = self
-            .tokio_rt
-            .block_on(async {
-                let _permit = self.dex_gate.acquire().await?;
-                self.dex_client.build_swap_instructions(&request).await
-            })?
-            .swap_remove(0);
-        info!(
-            "InventoryStrategy: selling {} {} for at least {} {} in-tx via {:?} (repaying {})",
-            asset_amount, asset_mint, swap.min_out_amount, liab_mint, swap.aggregator, repay_amount
-        );
-        let tx = self.liquidator_account.build_liquidate_tx(
-            intent,
-            intent.asset_amount,
-            intent.liab_amount,
-            Some(&swap),
-            landing,
-        )?;
+        let routes = self.tokio_rt.block_on(async {
+            let _permit = self.dex_gate.acquire().await?;
+            self.dex_client.build_swap_instructions(&request).await
+        })?;
+        // Best first. The aggregators bound a route's accounts, not its bytes: one too large for
+        // the transaction gives way to the next. Every route too large is held briefly, like a
+        // venue failure: with the refreshes moved out of the liquidation it may fit next time.
+        let mut too_large = Vec::new();
+        let mut built = None;
+        for swap in &routes {
+            match self.liquidator_account.build_liquidate_tx(
+                intent,
+                intent.asset_amount,
+                intent.liab_amount,
+                Some(swap),
+                landing,
+            ) {
+                Ok(tx) => {
+                    info!(
+                        "InventoryStrategy: selling {} {} for at least {} {} in-tx via {:?} (repaying {})",
+                        asset_amount, asset_mint, swap.min_out_amount, liab_mint, swap.aggregator, repay_amount
+                    );
+                    built = Some(tx);
+                    break;
+                }
+                Err(e) if e.is::<DoesNotFit>() => {
+                    debug!(
+                        "InventoryStrategy: the {:?} route doesn't fit: {e}",
+                        swap.aggregator
+                    );
+                    too_large.push(format!("{:?}: {e}", swap.aggregator));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let tx =
+            built.ok_or_else(|| anyhow!("every route is too large ({})", too_large.join("; ")))?;
         // Over RPC this is its only check: the executor sends it without preflight. A bundled one
         // isn't simulated at all: a bundle that fails doesn't land, and one behind a push relies
         // on prices the chain doesn't hold yet.

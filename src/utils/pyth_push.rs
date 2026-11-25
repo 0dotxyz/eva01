@@ -11,12 +11,10 @@ use anyhow::{anyhow, Result};
 use log::debug;
 use pyth_solana_receiver_sdk::config::Config;
 use solana_client::rpc_client::RpcClient;
-use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
-use solana_message::{v0, Hash, VersionedMessage};
+use solana_message::Hash;
 use solana_pubkey::Pubkey;
-use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
 use solana_transaction::versioned::VersionedTransaction;
@@ -29,27 +27,22 @@ use std::sync::Arc;
 use crate::cache::{pyth_prices::PushedPrices, Cache};
 use crate::config::Eva01Config;
 use crate::transaction_limits::{
-    bundle_cu_price, MAX_BUNDLE_TXS, MAX_COMPUTE_UNIT_LIMIT, MAX_V0_TX_SIZE,
+    priority_fee, signed_size, v1_message, v1_transaction, DoesNotFit, MAX_BUNDLE_TXS,
+    MAX_COMPUTE_UNIT_LIMIT, MAX_TX_SIZE,
 };
 use crate::utils::pyth_cranker::{
     close_encoded_vaa_ix, guardian_set_index, init_encoded_vaa_ix, price_feed_bump,
     update_price_feed_ix, verify_encoded_vaa_ix, write_encoded_vaa_ix, VAA_HEADER_SIZE,
-    VAA_SPLIT_INDEX,
 };
 
-/// The push transactions a bundle has room for: the liquidation and the tip take two. The tip
-/// stays the bundle's last transaction, after the liquidation: in a push transaction it would pay
-/// for a push that lands without the liquidation if the bundle were split.
+/// The push transactions a bundle has room for: the liquidation and the tip take two. Jito's tip
+/// goes after the liquidation; Sender's rides in a push transaction, which a Sender bundle keeps
+/// atomic with the liquidation.
 const MAX_PUSH_TXS: usize = MAX_BUNDLE_TXS - 2;
 
-/// The most feeds a liquidation is sized on pushing. Posting and verifying the VAA take two
-/// transactions and each further one holds about two updates; how many fit is measured
+/// The most feeds a liquidation is sized on pushing. Whether they fit the bundle is measured
 /// (`PythPusher::check`).
 pub const MAX_PUSHED_FEEDS: usize = 4;
-
-/// The most Kamino and JupLend refreshes in one transaction: a reserve refresh priced by Scope or
-/// Switchboard takes up to ~90k compute units, so eight stay well inside the limit.
-const MAX_REFRESHES_PER_TX: usize = 8;
 
 /// The most added to a transaction's compute limit to make it unique to its attempt: two
 /// liquidations pushing or refreshing the same accounts in the same blockhash would otherwise send
@@ -83,7 +76,7 @@ const CU_KAMINO_REFRESH_OBLIGATION: u32 = 26_000;
 const CU_JUPLEND_UPDATE_RATE: u32 = 20_000;
 /// Any other instruction among the refreshes: unmeasured, so generous.
 const CU_REFRESH_UNKNOWN: u32 = 150_000;
-/// The compute-budget instructions and what else a transaction is charged around its own.
+/// What a transaction is charged around its instructions.
 const CU_TX_OVERHEAD: u32 = 1_000;
 
 /// The compute verifying `vaa` takes: its signature count is its sixth byte.
@@ -100,12 +93,15 @@ fn update_cu(feed_id: &[u8; 32]) -> u32 {
 /// An instruction and the compute it is given.
 type Budgeted = (Instruction, u32);
 
+/// The compute `ixs` take in one transaction.
+fn cu_needed(ixs: &[Budgeted]) -> u32 {
+    ixs.iter()
+        .fold(CU_TX_OVERHEAD, |sum, (_, cu)| sum.saturating_add(*cu))
+}
+
 /// The compute limit of a transaction running `ixs`, for `attempt`.
 fn cu_limit(ixs: &[Budgeted], attempt: u64) -> u32 {
-    let needed = ixs
-        .iter()
-        .fold(CU_TX_OVERHEAD, |sum, (_, cu)| sum.saturating_add(*cu));
-    needed
+    cu_needed(ixs)
         .saturating_add((attempt % ATTEMPT_CU_JITTER) as u32)
         .min(MAX_COMPUTE_UNIT_LIMIT)
 }
@@ -144,7 +140,7 @@ pub struct PythPusher {
 
 /// The transactions that post one Hermes update, in the order they must land. They only ever
 /// land in a bundle with the liquidation behind them, so the VAA account the first one creates is
-/// always closed by the last.
+/// always closed within it.
 pub struct PricePush {
     pub txs: Vec<VersionedTransaction>,
     /// What was pushed, and the refreshes carried behind it, to build the push again with a tip.
@@ -215,7 +211,7 @@ impl PythPusher {
         attempt: u64,
     ) -> Result<Option<VersionedTransaction>> {
         let ixs = refreshes(ixs);
-        if ixs.len() > MAX_REFRESHES_PER_TX || !self.fits(&ixs)? {
+        if !self.fits(&ixs)? {
             return Ok(None);
         }
         let blockhash = self.cache.blockhash.get(&self.rpc_client)?;
@@ -231,15 +227,11 @@ impl PythPusher {
         tip: Option<&Instruction>,
     ) -> Result<(Vec<Vec<Budgeted>>, Keypair)> {
         let encoded_vaa = Keypair::new();
-        let (post, rest) = self.instructions(push, &encoded_vaa.pubkey())?;
-        if !self.fits(&post)? {
-            return Err(anyhow!("posting the VAA doesn't fit a transaction"));
-        }
-        let mut chunks = vec![post];
-        chunks.extend(self.pack(&rest, usize::MAX)?);
-        // The refreshes in transactions of their own, never beside the VAA's verification, which
-        // takes most of a transaction's compute.
-        chunks.extend(self.pack(&refreshes(trailing), MAX_REFRESHES_PER_TX)?);
+        // In order, so the first transaction creates the VAA account, and the refreshes read the
+        // prices already written.
+        let mut ixs = self.instructions(push, &encoded_vaa.pubkey())?;
+        ixs.extend(refreshes(trailing));
+        let mut chunks = self.pack(&ixs)?;
         if let Some(tip) = tip {
             let tip = (tip.clone(), CU_TRANSFER);
             let mut placed = false;
@@ -266,28 +258,19 @@ impl PythPusher {
         Ok((chunks, encoded_vaa))
     }
 
-    /// The push's instructions: the first transaction's, which create the VAA account at
-    /// `vaa_account` and write its head, then the rest in order.
-    fn instructions(
-        &self,
-        push: &PushedPrices,
-        vaa_account: &Pubkey,
-    ) -> Result<(Vec<Budgeted>, Vec<Budgeted>)> {
-        let vaa = push.vaa.as_slice();
-        let split = VAA_SPLIT_INDEX.min(vaa.len());
-        let mut post = self.post_instructions(push, vaa_account, split)?;
-        let mut rest = post.split_off(3);
-        rest.extend(self.update_instructions(push, vaa_account)?);
-        Ok((post, rest))
+    /// The push's instructions, in order: create the VAA account at `vaa_account` and post the VAA,
+    /// verify it, update the feeds and close it.
+    fn instructions(&self, push: &PushedPrices, vaa_account: &Pubkey) -> Result<Vec<Budgeted>> {
+        let mut ixs = self.post_instructions(push, vaa_account)?;
+        ixs.extend(self.update_instructions(push, vaa_account)?);
+        Ok(ixs)
     }
 
-    /// Create the VAA account at `vaa_account`, initialize it, write the VAA up to `split`, then the
-    /// tail, if any.
+    /// Create the VAA account at `vaa_account`, initialize it, and write the VAA in one go.
     fn post_instructions(
         &self,
         push: &PushedPrices,
         vaa_account: &Pubkey,
-        split: usize,
     ) -> Result<Vec<Budgeted>> {
         let vaa = push.vaa.as_slice();
         let payer = self.payer.pubkey();
@@ -301,7 +284,7 @@ impl PythPusher {
                 .get_minimum_balance_for_rent_exemption(vaa_account_size)?,
         };
 
-        let mut ixs = vec![
+        Ok(vec![
             (
                 system_instruction::create_account(
                     &payer,
@@ -317,17 +300,10 @@ impl PythPusher {
                 CU_INIT_VAA,
             ),
             (
-                write_encoded_vaa_ix(wormhole, &payer, vaa_account, 0, &vaa[..split]),
+                write_encoded_vaa_ix(wormhole, &payer, vaa_account, 0, vaa),
                 CU_WRITE_VAA,
             ),
-        ];
-        if split < vaa.len() {
-            ixs.push((
-                write_encoded_vaa_ix(wormhole, &payer, vaa_account, split as u32, &vaa[split..]),
-                CU_WRITE_VAA,
-            ));
-        }
-        Ok(ixs)
+        ])
     }
 
     /// The VAA's verification, one update per feed, then the close that reclaims the VAA
@@ -366,13 +342,13 @@ impl PythPusher {
         Ok(ixs)
     }
 
-    /// Splits `ixs`, in order, into as few transactions as fit, at most `max_per_tx` each.
-    fn pack(&self, ixs: &[Budgeted], max_per_tx: usize) -> Result<Vec<Vec<Budgeted>>> {
+    /// Splits `ixs`, in order, into as few transactions as fit.
+    fn pack(&self, ixs: &[Budgeted]) -> Result<Vec<Vec<Budgeted>>> {
         let mut chunks: Vec<Vec<Budgeted>> = Vec::new();
         let mut current: Vec<Budgeted> = Vec::new();
         for ix in ixs {
             current.push(ix.clone());
-            if current.len() > max_per_tx || !self.fits(&current)? {
+            if !self.fits(&current)? {
                 current.pop();
                 if current.is_empty() {
                     return Err(anyhow!(
@@ -389,38 +365,24 @@ impl PythPusher {
         Ok(chunks)
     }
 
-    /// The message for `ixs` behind their compute budget, paid by the payer.
-    fn message(&self, ixs: &[Budgeted], blockhash: Hash, attempt: u64) -> Result<v0::Message> {
-        let limit = cu_limit(ixs, attempt);
-        let mut all = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(limit),
-            ComputeBudgetInstruction::set_compute_unit_price(bundle_cu_price(
-                limit,
-                self.cu_price_micro_lamports,
-            )),
-        ];
-        all.extend(ixs.iter().map(|(ix, _)| ix.clone()));
-        Ok(v0::Message::try_compile(
-            &self.payer.pubkey(),
-            &all,
-            &[],
-            blockhash,
-        )?)
-    }
-
-    /// Whether `ixs` fit one transaction. The size depends on neither the blockhash nor the
-    /// signatures' values, so nothing is fetched or signed.
+    /// Whether `ixs` fit one transaction: its size, its accounts, and its compute with room for
+    /// any attempt's jitter. Nothing is fetched or signed: neither the blockhash nor the signatures'
+    /// values change the size.
     fn fits(&self, ixs: &[Budgeted]) -> Result<bool> {
-        // The limit's value doesn't change the size.
-        let message = self.message(ixs, Hash::default(), 0)?;
-        let signatures = usize::from(message.header.num_required_signatures);
-        let tx = VersionedTransaction {
-            signatures: vec![Signature::default(); signatures],
-            message: VersionedMessage::V0(message),
+        if cu_needed(ixs).saturating_add(ATTEMPT_CU_JITTER as u32) > MAX_COMPUTE_UNIT_LIMIT {
+            return Ok(false);
+        }
+        let only: Vec<Instruction> = ixs.iter().map(|(ix, _)| ix.clone()).collect();
+        let message = match v1_message(&self.payer.pubkey(), &only, Hash::default(), 0, 0) {
+            Ok(message) => message,
+            // Too many accounts or instructions for one transaction.
+            Err(e) if e.is::<DoesNotFit>() => return Ok(false),
+            Err(e) => return Err(e),
         };
-        Ok(bincode::serialize(&tx)?.len() <= MAX_V0_TX_SIZE)
+        Ok(signed_size(&message)? <= MAX_TX_SIZE)
     }
 
+    /// `ixs` signed by `signers`, the payer first, limited to the compute they take for `attempt`.
     fn sign(
         &self,
         ixs: &[Budgeted],
@@ -428,11 +390,15 @@ impl PythPusher {
         blockhash: Hash,
         attempt: u64,
     ) -> Result<VersionedTransaction> {
-        let message = self.message(ixs, blockhash, attempt)?;
-        Ok(VersionedTransaction::try_new(
-            VersionedMessage::V0(message),
+        let limit = cu_limit(ixs, attempt);
+        let only: Vec<Instruction> = ixs.iter().map(|(ix, _)| ix.clone()).collect();
+        v1_transaction(
             signers,
-        )?)
+            &only,
+            blockhash,
+            limit,
+            priority_fee(limit, self.cu_price_micro_lamports),
+        )
     }
 }
 
@@ -456,22 +422,18 @@ mod tests {
             cu_price_micro_lamports: 1_000,
         };
         let program = Pubkey::new_unique();
-        // About the size of a VAA tail write and per-feed updates.
-        let ixs: Vec<Budgeted> = (0..6u8)
-            .map(|i| {
-                let ix = Instruction {
-                    program_id: program,
-                    accounts: vec![AccountMeta::new(Pubkey::new_unique(), false)],
-                    data: vec![i; 400],
-                };
-                (ix, CU_UPDATE_FEED)
-            })
-            .collect();
-        let chunks = pusher.pack(&ixs, usize::MAX).unwrap();
-        // A count cap splits further.
-        assert_eq!(pusher.pack(&ixs, 2).unwrap().len(), 3);
-
-        assert!(chunks.len() > 1);
+        let ix = |i: u8, data: usize, cu: u32| {
+            let ix = Instruction {
+                program_id: program,
+                accounts: vec![AccountMeta::new(Pubkey::new_unique(), false)],
+                data: vec![i; data],
+            };
+            (ix, cu)
+        };
+        // About the size of a VAA write: four to a transaction.
+        let ixs: Vec<Budgeted> = (0..6u8).map(|i| ix(i, 900, CU_UPDATE_FEED)).collect();
+        let chunks = pusher.pack(&ixs).unwrap();
+        assert_eq!(chunks.iter().map(Vec::len).collect::<Vec<_>>(), [4, 2]);
         let order: Vec<u8> = chunks.iter().flatten().map(|(ix, _)| ix.data[0]).collect();
         assert_eq!(order, (0..6).collect::<Vec<u8>>());
         // Measured unsigned, each still fits once signed on a real blockhash.
@@ -479,8 +441,25 @@ mod tests {
             let tx = pusher
                 .sign(chunk, &[&pusher.payer], Hash::new_unique(), 9_999)
                 .unwrap();
-            assert!(bincode::serialize(&tx).unwrap().len() <= MAX_V0_TX_SIZE);
+            assert!(crate::transaction_limits::wire_bytes(&tx).unwrap().len() <= MAX_TX_SIZE);
         }
+        // Small, but too much compute for one.
+        let heavy: Vec<Budgeted> = (0..3u8).map(|i| ix(i, 10, 700_000)).collect();
+        assert_eq!(pusher.pack(&heavy).unwrap().len(), 3);
+        // More than any transaction holds.
+        assert!(pusher.pack(&[ix(0, MAX_TX_SIZE, 1)]).is_err());
+        // Over the account limit together: split, not refused.
+        let wide = |i: u8| {
+            let ix = Instruction {
+                program_id: program,
+                accounts: (0..40)
+                    .map(|_| AccountMeta::new(Pubkey::new_unique(), false))
+                    .collect(),
+                data: vec![i],
+            };
+            (ix, 1_000)
+        };
+        assert_eq!(pusher.pack(&[wide(0), wide(1)]).unwrap().len(), 2);
     }
 
     #[test]
@@ -559,6 +538,92 @@ mod tests {
             MAX_COMPUTE_UNIT_LIMIT,
             "never over the most"
         );
+    }
+
+    /// How a live Hermes payload of 1..=5 feeds is laid out, with and without a tip inside: the
+    /// transactions, their bytes and compute. Nothing is sent. `PYTH_API_KEY`.
+    #[test]
+    #[ignore = "reads Hermes and the RPC"]
+    fn a_live_push_layout() {
+        let ids = [
+            "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+            "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+            "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+            "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
+            "2b89b9dc8fdf9f34709a5b106b472f0f39bb6ca9ce04b0fd7f2e971688e2e53b",
+        ];
+        let query: String = ids.iter().map(|id| format!("ids[]={id}&")).collect();
+        let resp: serde_json::Value = reqwest::blocking::Client::new()
+            .get(format!(
+                "{}/v2/updates/price/latest?{query}encoding=hex",
+                crate::utils::pyth_cranker::DEFAULT_HERMES_URL.trim_end_matches('/')
+            ))
+            .bearer_auth(std::env::var("PYTH_API_KEY").unwrap())
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        let hex = resp["binary"]["data"][0].as_str().unwrap();
+        let payload: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let feeds: Vec<_> = crate::utils::hermes_stream::signed_updates(&payload)
+            .unwrap()
+            .into_iter()
+            .map(|(feed, signed)| {
+                (
+                    crate::utils::pyth_cranker::price_feed_address(&feed),
+                    signed,
+                )
+            })
+            .collect();
+        let rpc = RpcClient::new("https://api.mainnet-beta.solana.com".to_string());
+        let receiver_config = rpc.get_account(&get_config_address()).unwrap();
+        let pusher = PythPusher {
+            cache: Arc::new(Cache::new(
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                Arc::new(std::sync::Mutex::new(solana_clock::Clock::default())),
+                std::collections::HashSet::new(),
+            )),
+            wormhole_program_id: Config::try_deserialize(&mut receiver_config.data.as_slice())
+                .unwrap()
+                .wormhole,
+            rpc_client: rpc,
+            payer: Keypair::new(),
+            cu_price_micro_lamports: 10_000,
+        };
+        let tip = crate::utils::helius_sender::tip_instruction(&pusher.payer.pubkey(), 1_000_000)
+            .unwrap();
+        println!("VAA {} bytes", feeds[0].1.vaa.len());
+        for n in 1..=feeds.len() {
+            let push = PushedPrices {
+                vaa: Arc::clone(&feeds[0].1.vaa),
+                feeds: feeds[..n].to_vec(),
+            };
+            for tipped in [None, Some(&tip)] {
+                let (chunks, vaa) = pusher.layout(&push, &[], tipped).unwrap();
+                let shape: Vec<String> = chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, chunk)| {
+                        let signers: Vec<&Keypair> = if i == 0 {
+                            vec![&pusher.payer, &vaa]
+                        } else {
+                            vec![&pusher.payer]
+                        };
+                        let tx = pusher.sign(chunk, &signers, Hash::new_unique(), 0).unwrap();
+                        format!(
+                            "{} B / {} CU",
+                            crate::transaction_limits::wire_bytes(&tx).unwrap().len(),
+                            cu_limit(chunk, 0)
+                        )
+                    })
+                    .collect();
+                println!("{n} feed(s), tip {}: {shape:?}", tipped.is_some());
+            }
+        }
     }
 
     /// Pushes `PUSH_FEEDS` (default 2) feeds of a live Hermes payload (`PUSH_SIM_PAYLOAD_HEX`)

@@ -46,20 +46,8 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         config.excluded_liquidation_mints.iter().copied().collect(),
     );
 
-    let cache_loader = CacheLoader::new(
-        &config.wallet_keypair,
-        config.rpc_url.clone(),
-        config.luts_group1.clone(),
-        config.luts_group2.clone(),
-        config.luts_group3.clone(),
-    )?;
+    let cache_loader = CacheLoader::new(&config.wallet_keypair, config.rpc_url.clone())?;
     cache_loader.load_cache(&mut cache)?;
-
-    let signer = Keypair::try_from(config.wallet_keypair.as_slice())?;
-    let rpc_client =
-        RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
-    let owned_luts = cache.luts.discover(&rpc_client, &wallet_pubkey)?;
-    info!("Found {owned_luts} owned lookup table(s).");
 
     let accounts_to_track = get_accounts_to_track(&cache)?;
     let integration_fetcher_rpc_url = config.rpc_url.clone();
@@ -107,18 +95,6 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         config.marginfi_group_key,
         cache.clone(),
     )?);
-
-    // Every address a liquidation can reference must be in a lookup table, or the transaction
-    // won't fit. Done before any service runs; a no-op once the tables hold them.
-    info!("Covering the banks' accounts with the owned lookup tables...");
-    match cache
-        .luts
-        .ensure_covered(&rpc_client, &signer, &liquidator_account.static_accounts())
-    {
-        Ok(added) => info!("Lookup tables ready ({added} address(es) added)."),
-        // Not fatal: whatever is still uncovered gets learned when a transaction overflows.
-        Err(e) => warn!("Could not cover every bank's accounts with the lookup tables: {e}"),
-    }
 
     let mut liquidator = Liquidator::new(
         config.clone(),
