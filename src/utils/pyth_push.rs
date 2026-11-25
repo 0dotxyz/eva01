@@ -66,7 +66,7 @@ const CU_UPDATE_FEED_PER_BUMP: u32 = 2_000;
 const CU_CLOSE_VAA: u32 = 2_000; // (1,265)
 const CU_TRANSFER: u32 = 1_000; // (150)
 /// Venue refreshes, measured on every Kamino reserve and obligation and JupLend lending state of
-/// the prod group (worst in parentheses) with about 30% over it. A reserve's cost grows ~5k per
+/// a mainnet group (worst in parentheses) with about 30% over it. A reserve's cost grows ~5k per
 /// link of its Scope chain (1 link ~24k, 2 links 29,209), so a chain of four (Kamino's most) is
 /// ~39k; this keeps ~28% over that.
 const CU_KAMINO_REFRESH_RESERVE: u32 = 50_000;

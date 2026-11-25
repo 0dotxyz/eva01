@@ -235,7 +235,7 @@ impl LiquidatorAccount {
 
         // A first-time liquidatee has no record yet: create it in this same transaction, ahead of
         // `start_liquidation` (the program allows exactly that). A record created in its own
-        // transaction can be closed by anyone before we use it, since a never-used record has no
+        // transaction can be closed by anyone before it is used, since a never-used record has no
         // inactivity lock, and waiting for it to finalize would stall the liquidation.
         let (init_record_ix, liquidation_record) =
             if liquidatee_account.account.liquidation_record == Pubkey::default() {

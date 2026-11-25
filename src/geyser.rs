@@ -131,7 +131,7 @@ impl GeyserService {
             info!("Connecting to Geyser...");
             let sub_req = Self::build_geyser_subscribe_request(&tracked_accounts_vec, from_slot);
 
-            // TODO: replace from_slot with auto-reconnect once we migrate to the up-to-date client (requires updating Solana deps):
+            // TODO: replace from_slot with auto-reconnect once the up-to-date client is in (requires updating Solana deps):
             // https://docs.triton.one/project-yellowstone/dragons-mouth-grpc-subscriptions#auto-reconnect-rust-client
             //
             // Establish the connection and subscription inside the reconnect loop so that a

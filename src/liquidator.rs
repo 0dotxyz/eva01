@@ -399,7 +399,7 @@ fn spawn_tagger(liquidator_account: Arc<LiquidatorAccount>) -> Result<Sender<Due
     Ok(tags)
 }
 
-/// How often each unhealthy account we are not liquidating is reported.
+/// How often each unhealthy account eva is not liquidating is reported.
 const SKIP_REPORT_INTERVAL: Duration = Duration::from_secs(1200);
 
 /// After an attempt the same account is left alone this long, unless it lost a race. After a
@@ -1176,7 +1176,7 @@ impl Liquidator {
         }
     }
 
-    /// Our clock lags the chain, so a fresh Scope price can look "published in the future" and get
+    /// eva's clock lags the chain, so a fresh Scope price can look "published in the future" and get
     /// rejected. Moving the clock up to each new publish time prevents that.
     fn advance_clock_to_oracle(&self, address: &Pubkey, account: &Account, banks: &[Pubkey]) {
         let scope_entries: Vec<u16> = banks
@@ -1276,7 +1276,7 @@ impl Liquidator {
         Ok(())
     }
 
-    /// Reports the unhealthy accounts we are not liquidating and tags the ones the tag policy says
+    /// Reports the unhealthy accounts eva is not liquidating and tags the ones the tag policy says
     /// are due.
     fn handle_unhealthy(&mut self, checked: &[Pubkey], unhealthy: &[UnhealthyAccount]) {
         let now = Instant::now();
@@ -1846,7 +1846,7 @@ impl Evaluator {
             return Ok(None);
         }
 
-        // Every deposit we can seize and every liability we can buy, so an unsupported or excluded
+        // Every deposit eva can seize and every liability it can buy, so an unsupported or excluded
         // position doesn't block an otherwise liquidatable account.
         let usable = |bank_pk: &Pubkey, collateral: bool| {
             self.cache.banks.try_get_bank(bank_pk).is_ok_and(|bank| {
@@ -2836,8 +2836,8 @@ mod push_choice_tests {
         };
         let oracles = [sol, eth];
 
-        let ours = program_accounts(&cache, &oracles, Pricing::Newest).unwrap();
-        assert_eq!(ours.iter().map(price).collect::<Vec<_>>(), vec![2, 2]);
+        let newest = program_accounts(&cache, &oracles, Pricing::Newest).unwrap();
+        assert_eq!(newest.iter().map(price).collect::<Vec<_>>(), vec![2, 2]);
         let chain = program_accounts(&cache, &oracles, Pricing::Chain).unwrap();
         assert_eq!(chain.iter().map(price).collect::<Vec<_>>(), vec![1, 1]);
         // SOL at the price its push posts, which need not be the newest eva holds.

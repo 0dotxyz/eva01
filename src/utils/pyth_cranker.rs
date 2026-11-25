@@ -163,7 +163,7 @@ impl PythCranker {
     ///
     /// A feed is adopted once it is [`ADOPT_AGE_MULTIPLE`] times past its max age, and is then kept
     /// alive on the [`REFRESH_AGE_DIVISOR`] cadence until its sponsor comes back: a publish time
-    /// newer than the one we posted means somebody else cranked it, so we release it.
+    /// newer than the one eva posted means somebody else cranked it, so eva releases it.
     fn stale_feeds(&self) -> Result<Vec<StaleFeed>> {
         let now = clock_manager::get_clock(&self.cache.clock)?.unix_timestamp;
         let mut adopted = self
@@ -192,16 +192,16 @@ impl PythCranker {
                 .onchain(&oracle)
                 .unwrap_or(price_update.price_message.publish_time);
             let threshold = match adopted.get(&oracle) {
-                Some(&ours) if published > ours => {
+                Some(&posted) if published > posted => {
                     info!(
                         "PythCranker: the Pyth feed {oracle} is being cranked again, releasing it"
                     );
                     adopted.remove(&oracle);
                     continue;
                 }
-                // Our own write may not have reached the cache yet, so age from whichever is newer.
-                Some(&ours) => {
-                    let age = feed_age(now, ours.max(published));
+                // eva's own write may not have reached the cache yet, so age from whichever is newer.
+                Some(&posted) => {
+                    let age = feed_age(now, posted.max(published));
                     if age < max_age / REFRESH_AGE_DIVISOR {
                         continue;
                     }
@@ -546,7 +546,7 @@ pub(crate) fn update_price_feed_ix(
     })
 }
 
-/// Publish time carried by the update we post, used to recognise our own write later.
+/// Publish time carried by the update eva posts, used to recognise its own write later.
 pub(crate) fn publish_time(update: &MerklePriceUpdate) -> Result<i64> {
     match from_slice::<byteorder::BE, Message>(update.message.as_ref())
         .map_err(|e| anyhow!("Failed to parse the price message: {e:?}"))?

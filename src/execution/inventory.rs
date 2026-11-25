@@ -132,7 +132,7 @@ impl InventoryStrategy {
 
     /// A price-only token wrapper (balance 0) for `mint`, used solely for the oracle-price <-> token
     /// amount conversions when sizing the swap input. Avoids depending on a wallet token account for
-    /// a liability we may hold none of.
+    /// a liability the wallet may hold none of.
     fn value_wrapper(&self, mint: &Pubkey) -> Result<TokenAccountWrapper<OracleWrapper>> {
         let cache = &self.liquidator_account.cache;
         let bank_address = cache.banks.try_get_account_for_mint(mint)?;
