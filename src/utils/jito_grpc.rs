@@ -20,7 +20,10 @@ use anyhow::{anyhow, Result};
 use log::{debug, info, warn};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
-use tokio::{runtime::Runtime, sync::Notify};
+use tokio::{
+    runtime::Runtime,
+    sync::{oneshot, Notify},
+};
 use tonic::{
     codec::Streaming,
     codegen::http::uri::PathAndQuery,
@@ -69,6 +72,13 @@ const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// A session that lasted this long was healthy: the next reconnect starts from the shortest wait.
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+/// The block engine ends a result stream an hour after it opens (measured: 60 min 3 s, twice). A
+/// session this old is replaced by a new one, connected first, so sends never lack one.
+const ROTATE_AFTER: Duration = Duration::from_secs(55 * 60);
+/// A replacement that couldn't connect is tried again this much later, the old session serving.
+const ROTATE_RETRY: Duration = Duration::from_secs(60);
+/// The replaced session keeps reading its stream this long, for the results of bundles it sent.
+const ROTATE_DRAIN: Duration = Duration::from_secs(10);
 /// The access token is renewed this long before it expires, or this often when it states no expiry.
 const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(120);
 const RENEW_DEFAULT: Duration = Duration::from_secs(10 * 60);
@@ -652,31 +662,68 @@ fn renew_at(expires: Option<Instant>) -> tokio::time::Instant {
 }
 
 /// Keeps a session up, for good. Each runs as a task of its own, so even a panic in one only
-/// starts the next.
+/// starts the next. One nearing the block engine's hour is replaced by a new one, connected before
+/// it takes over.
 async fn run(url: String, keypair: Arc<Keypair>, shared: Arc<Shared>) {
-    let mut wait = RECONNECT_MIN;
-    loop {
-        let started = Instant::now();
+    let start = || {
+        let (ready, up) = oneshot::channel();
         let task = tokio::spawn(session(
             url.clone(),
             Arc::clone(&keypair),
             Arc::clone(&shared),
+            ready,
         ));
-        let e = match task.await {
-            Ok(Err(e)) => e,
-            Ok(Ok(never)) => match never {},
-            Err(e) => anyhow!("the session task failed: {e}"),
-        };
-        lock(&shared.session).take();
-        if started.elapsed() >= HEALTHY_SESSION {
-            wait = RECONNECT_MIN;
+        (task, up)
+    };
+    let mut wait = RECONNECT_MIN;
+    let (mut task, _) = start();
+    let mut started = Instant::now();
+    let mut rotate_at = tokio::time::Instant::now() + ROTATE_AFTER;
+    loop {
+        tokio::select! {
+            ended = &mut task => {
+                let e = match ended {
+                    Ok(Err(e)) => e,
+                    Ok(Ok(never)) => match never {},
+                    Err(e) => anyhow!("the session task failed: {e}"),
+                };
+                lock(&shared.session).take();
+                if started.elapsed() >= HEALTHY_SESSION {
+                    wait = RECONNECT_MIN;
+                }
+                warn!(
+                    "Jito gRPC: {e:#}; sending over JSON-RPC, reconnecting in {}s",
+                    wait.as_secs()
+                );
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(RECONNECT_MAX);
+                (task, _) = start();
+                started = Instant::now();
+                rotate_at = tokio::time::Instant::now() + ROTATE_AFTER;
+            }
+            _ = tokio::time::sleep_until(rotate_at) => {
+                let (next, up) = start();
+                // The new session is in place once it says so; until then the old one serves.
+                match tokio::time::timeout(SETUP_TIMEOUT * 2, up).await {
+                    Ok(Ok(())) => {
+                        let old = std::mem::replace(&mut task, next);
+                        tokio::spawn(async move {
+                            tokio::time::sleep(ROTATE_DRAIN).await;
+                            old.abort();
+                        });
+                        started = Instant::now();
+                        wait = RECONNECT_MIN;
+                        rotate_at = tokio::time::Instant::now() + ROTATE_AFTER;
+                        info!("Jito gRPC: replaced the session ahead of the block engine's hourly cut");
+                    }
+                    _ => {
+                        next.abort();
+                        warn!("Jito gRPC: a replacement session couldn't connect; the current one serves");
+                        rotate_at = tokio::time::Instant::now() + ROTATE_RETRY;
+                    }
+                }
+            }
         }
-        warn!(
-            "Jito gRPC: {e:#}; sending over JSON-RPC, reconnecting in {}s",
-            wait.as_secs()
-        );
-        tokio::time::sleep(wait).await;
-        wait = (wait * 2).min(RECONNECT_MAX);
     }
 }
 
@@ -686,6 +733,7 @@ async fn session(
     url: String,
     keypair: Arc<Keypair>,
     shared: Arc<Shared>,
+    ready: oneshot::Sender<()>,
 ) -> Result<std::convert::Infallible> {
     let endpoint = Endpoint::from_shared(url)?
         .tls_config(ClientTlsConfig::new().with_native_roots())?
@@ -717,6 +765,9 @@ async fn session(
         "Jito gRPC: authenticated as {}; bundles go over gRPC",
         keypair.pubkey()
     );
+    // Right after publishing, with no await between: on the runtime's one thread, a replacement
+    // `run` gives up on is aborted before it can publish.
+    let _ = ready.send(());
     // Renewed beside the stream, which is never left unread meanwhile.
     let _renewal = AbortOnDrop(tokio::spawn(renew(
         channel,

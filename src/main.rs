@@ -82,6 +82,41 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// `message` with every URL cut to its scheme and host: RPC and API URLs carry their access token
+/// in the path or the query, and errors quote the URL they failed on.
+fn redact_urls(message: &str) -> std::borrow::Cow<'_, str> {
+    const SCHEMES: [&str; 4] = ["https://", "http://", "wss://", "ws://"];
+    if !SCHEMES.iter().any(|scheme| message.contains(scheme)) {
+        return message.into();
+    }
+    let ends_url =
+        |c: char| c.is_whitespace() || matches!(c, ')' | '(' | '"' | '\'' | '<' | '>' | ',');
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some((at, scheme)) = SCHEMES
+        .iter()
+        .filter_map(|scheme| rest.find(scheme).map(|at| (at, *scheme)))
+        .min_by_key(|(at, _)| *at)
+    {
+        out.push_str(&rest[..at + scheme.len()]);
+        rest = &rest[at + scheme.len()..];
+        let host_end = rest
+            .find(|c: char| ends_url(c) || matches!(c, '/' | '?' | '#'))
+            .unwrap_or(rest.len());
+        // Credentials before the host (`user:token@host`) are dropped too.
+        let host = &rest[..host_end];
+        out.push_str(host.rsplit_once('@').map_or(host, |(_, host)| host));
+        rest = &rest[host_end..];
+        let url_end = rest.find(ends_url).unwrap_or(rest.len());
+        if url_end > 0 {
+            out.push_str("/…");
+        }
+        rest = &rest[url_end..];
+    }
+    out.push_str(rest);
+    out.into()
+}
+
 fn init_logging() {
     let mut b = Builder::from_env(env_logger::Env::default().default_filter_or("info"));
 
@@ -128,7 +163,7 @@ fn init_logging() {
 
             let line = json!({
                 "level": level,
-                "message": record.args().to_string(),
+                "message": redact_urls(&record.args().to_string()),
                 "target": record.target(),
             });
 
@@ -177,5 +212,29 @@ mod tests {
         assert_eq!(tee.console, b"line one\nline two\n");
         assert_eq!(std::fs::read(&path).unwrap(), b"line one\nline two\n");
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::redact_urls;
+
+    #[test]
+    fn a_logged_url_keeps_only_its_host() {
+        assert_eq!(
+            redact_urls("error sending request for url (https://rpc.example.com/0212-secret)"),
+            "error sending request for url (https://rpc.example.com/…)"
+        );
+        assert_eq!(
+            redact_urls("GET https://api.example.com/v1/x?api-key=secret failed, http://h:8899 ok"),
+            "GET https://api.example.com/… failed, http://h:8899 ok"
+        );
+        assert_eq!(
+            redact_urls("connecting to https://mainnet.block-engine.jito.wtf as X"),
+            "connecting to https://mainnet.block-engine.jito.wtf as X"
+        );
+        assert_eq!(redact_urls("no url here"), "no url here");
+        assert_eq!(redact_urls("https://user:token@h/x é"), "https://h/… é");
+        assert_eq!(redact_urls("wss://h/a/b"), "wss://h/…");
     }
 }
