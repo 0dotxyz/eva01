@@ -51,8 +51,8 @@ use marginfi_type_crate::{
     constants::{ASSET_TAG_JUPLEND, ASSET_TAG_KAMINO, BANKRUPT_THRESHOLD},
     types::{
         reconcile_emode_configs, BalanceSide, Bank, BankOperationalState, EmodeConfig,
-        HealthPriceMode, MarginfiAccount, MarginfiGroup, OracleSetup, ReconciledEmodeConfig,
-        RequirementType,
+        HealthPriceMode, MarginfiAccount, MarginfiGroup, OraclePriceType, OracleSetup,
+        ReconciledEmodeConfig, RequirementType,
     },
 };
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -399,7 +399,7 @@ fn spawn_tagger(liquidator_account: Arc<LiquidatorAccount>) -> Result<Sender<Due
     Ok(tags)
 }
 
-/// How often each unhealthy account we are not liquidating is reported.
+/// How often each unhealthy account eva is not liquidating is reported.
 const SKIP_REPORT_INTERVAL: Duration = Duration::from_secs(1200);
 
 /// After an attempt the same account is left alone this long, unless it lost a race. After a
@@ -456,6 +456,8 @@ struct LiquidationAmounts {
     /// The premium the liquidation is sized at.
     premium: I80F48,
     liquidator_profit: I80F48,
+    /// The profit at real-time prices (`real_time_profit`).
+    real_time_profit: I80F48,
     /// Unhealthy, untagged, solvent and not e-mode boosted: tagging would let the premium grow.
     taggable: bool,
     caps: RepayCapBreakdown,
@@ -478,6 +480,7 @@ impl LiquidationAmounts {
             max_repay: I80F48::ZERO,
             premium: I80F48::ZERO,
             liquidator_profit: I80F48::ZERO,
+            real_time_profit: I80F48::ZERO,
             taggable: false,
             caps: RepayCapBreakdown::default(),
         }
@@ -659,6 +662,40 @@ fn maintenance_to_equity_price(
 ) -> Result<I80F48> {
     let equity = bank.price(oracle, side(), RequirementType::Equity)?;
     bank.price(oracle, side(), RequirementType::Maintenance)?
+        .checked_div(equity)
+        .ok_or_else(|| anyhow!("no equity price for the bank {}", bank.address))
+}
+
+/// What repaying `repaid` equity dollars at `premium` earns at real-time prices, given each side's
+/// real-time price over its equity price (`real_time_to_equity_price`). The premium is capped at
+/// equity (time-weighted) prices: after a fast move the seized collateral can be worth less than
+/// they say, and the debt more, so this is below `repaid * premium` and can be negative.
+fn real_time_profit(
+    repaid: I80F48,
+    premium: I80F48,
+    asset_ratio: I80F48,
+    liab_ratio: I80F48,
+) -> I80F48 {
+    repaid * ((I80F48::ONE + premium) * asset_ratio - liab_ratio)
+}
+
+/// The bank's unbiased real-time price on `market` over the equity price the program values
+/// `side` at on `sized_on`. The amounts seized and repaid follow from the biased equity price;
+/// what they are worth, from the market's price, without the confidence bias that widens just when
+/// prices move fast.
+fn real_time_to_equity_price(
+    bank: &BankWrapper,
+    sized_on: &OracleWrapper,
+    market: &OracleWrapper,
+    side: BalanceSide,
+) -> Result<I80F48> {
+    let equity = bank.price(sized_on, side, RequirementType::Equity)?;
+    market
+        .get_price_of_type(
+            OraclePriceType::RealTime,
+            None,
+            bank.bank.config.oracle_max_confidence,
+        )?
         .checked_div(equity)
         .ok_or_else(|| anyhow!("no equity price for the bank {}", bank.address))
 }
@@ -1176,7 +1213,7 @@ impl Liquidator {
         }
     }
 
-    /// Our clock lags the chain, so a fresh Scope price can look "published in the future" and get
+    /// eva's clock lags the chain, so a fresh Scope price can look "published in the future" and get
     /// rejected. Moving the clock up to each new publish time prevents that.
     fn advance_clock_to_oracle(&self, address: &Pubkey, account: &Account, banks: &[Pubkey]) {
         let scope_entries: Vec<u16> = banks
@@ -1276,7 +1313,7 @@ impl Liquidator {
         Ok(())
     }
 
-    /// Reports the unhealthy accounts we are not liquidating and tags the ones the tag policy says
+    /// Reports the unhealthy accounts eva is not liquidating and tags the ones the tag policy says
     /// are due.
     fn handle_unhealthy(&mut self, checked: &[Pubkey], unhealthy: &[UnhealthyAccount]) {
         let now = Instant::now();
@@ -1414,10 +1451,10 @@ fn attempt_liquidation(
                     )
                 },
             );
-            info!("LIQUIDATION_QUEUE attempt_id={} account={} queue_delay_ms={} pending_ms={} asset_bank={} liab_bank={} estimated_repay_usd={:.4} estimated_profit_usd={:.4} binding_cap={} push_feed_count={} sandwich_pair={}",
+            info!("LIQUIDATION_QUEUE attempt_id={} account={} queue_delay_ms={} pending_ms={} asset_bank={} liab_bank={} estimated_repay_usd={:.4} estimated_profit_usd={:.4} expected_profit_usd={:.4} binding_cap={} push_feed_count={} sandwich_pair={}",
                 fresh.attempt_id, liquidatee, queued_at.elapsed().as_millis(), pending_since.elapsed().as_millis(), fresh.asset_bank,
-                fresh.liab_bank, fresh.estimated_repay_usd, fresh.profit.to_num::<f64>(), fresh.binding_cap, fresh.push.as_ref().map_or(0, |push| push.feeds.len()), sandwich);
-            queue.resized(&liquidatee, fresh.profit);
+                fresh.liab_bank, fresh.estimated_repay_usd, fresh.profit.to_num::<f64>(), fresh.expected_profit().to_num::<f64>(), fresh.binding_cap, fresh.push.as_ref().map_or(0, |push| push.feeds.len()), sandwich);
+            queue.resized(&liquidatee, fresh.expected_profit());
             let mut attempt = activity.attempt(liquidatee);
             match executor.try_execute(strategy, &fresh) {
                 Ok(()) => attempt.succeeded(),
@@ -1792,6 +1829,7 @@ impl Evaluator {
                 asset_amount: amounts.max_liquidatable_asset_amount * LIQUIDATION_SIZE_HAIRCUT,
                 liab_amount: amounts.max_liquidatable_liab_amount * LIQUIDATION_SIZE_HAIRCUT,
                 profit: amounts.liquidator_profit * LIQUIDATION_SIZE_HAIRCUT,
+                real_time_profit: amounts.real_time_profit * LIQUIDATION_SIZE_HAIRCUT,
             });
 
         let without_push = match without_push {
@@ -1811,6 +1849,7 @@ impl Evaluator {
             asset_amount: slippage_adjusted_asset_amount,
             liab_amount: slippage_adjusted_liab_amount,
             profit,
+            real_time_profit: liquidation_amounts.real_time_profit * LIQUIDATION_SIZE_HAIRCUT,
             estimated_repay_usd: (liquidation_amounts.max_repay * LIQUIDATION_SIZE_HAIRCUT)
                 .to_num::<f64>(),
             binding_cap: liquidation_amounts.caps.binding,
@@ -1846,7 +1885,7 @@ impl Evaluator {
             return Ok(None);
         }
 
-        // Every deposit we can seize and every liability we can buy, so an unsupported or excluded
+        // Every deposit eva can seize and every liability it can buy, so an unsupported or excluded
         // position doesn't block an otherwise liquidatable account.
         let usable = |bank_pk: &Pubkey, collateral: bool| {
             self.cache.banks.try_get_bank(bank_pk).is_ok_and(|bank| {
@@ -2283,14 +2322,17 @@ impl Evaluator {
         let Some((main, sandwich)) =
             choose_pairs(candidates.iter().map(|(_, liab_bank, amounts, weight)| {
                 // Only a pair worth liquidating can be funded: one below the minimum is sized at
-                // nothing.
+                // nothing. A wallet repay earns what it earns at real-time prices too; one losing
+                // there earns nothing, leaving the order to the profit.
                 let funded = if amounts.is_liquidatable() {
-                    amounts.liquidator_profit
-                        * wallet_share(
-                            cache,
-                            liab_bank,
-                            amounts.max_liquidatable_liab_amount * LIQUIDATION_SIZE_HAIRCUT,
-                        )
+                    I80F48::max(
+                        I80F48::ZERO,
+                        amounts.liquidator_profit.min(amounts.real_time_profit),
+                    ) * wallet_share(
+                        cache,
+                        liab_bank,
+                        amounts.max_liquidatable_liab_amount * LIQUIDATION_SIZE_HAIRCUT,
+                    )
                 } else {
                     I80F48::ZERO
                 };
@@ -2434,6 +2476,33 @@ impl Evaluator {
             });
         }
 
+        // What the market pays is on the newest prices, whatever prices the program will read.
+        let newest = |bank: &BankWrapper| -> Result<Option<OracleWrapper>> {
+            match pricing {
+                Pricing::Newest => Ok(None),
+                _ => OracleWrapper::build_on(&self.cache, &clock, &bank.address, Pricing::Newest)
+                    .map(Some),
+            }
+        };
+        let asset_market = newest(asset_bank_wrapper)?;
+        let liab_market = newest(liab_bank_wrapper)?;
+        let real_time_profit = real_time_profit(
+            max_repay,
+            premium_taken,
+            real_time_to_equity_price(
+                asset_bank_wrapper,
+                &asset_oracle_wrapper,
+                asset_market.as_ref().unwrap_or(&asset_oracle_wrapper),
+                BalanceSide::Assets,
+            )?,
+            real_time_to_equity_price(
+                liab_bank_wrapper,
+                &liab_oracle_wrapper,
+                liab_market.as_ref().unwrap_or(&liab_oracle_wrapper),
+                BalanceSide::Liabilities,
+            )?,
+        );
+
         let max_liquidatable_asset_amount = asset_bank_wrapper.calc_amount(
             &asset_oracle_wrapper,
             max_repay * one_plus_premium,
@@ -2465,6 +2534,7 @@ impl Evaluator {
             max_repay,
             premium: premium_taken,
             liquidator_profit,
+            real_time_profit,
             taggable,
             caps,
         })
@@ -2485,7 +2555,9 @@ impl Evaluator {
 
             if !matches!(
                 bank_wrapper.bank.config.operational_state,
-                BankOperationalState::Operational | BankOperationalState::ReduceOnly
+                BankOperationalState::Operational
+                    | BankOperationalState::ReduceOnly
+                    | BankOperationalState::ReduceOnlyWithBorrowingPower
             ) {
                 continue;
             }
@@ -2574,6 +2646,23 @@ mod repay_bounds_tests {
         };
         let repay = bounds.max_repay(I80F48!(0.05));
         assert!((repay - I80F48!(29.6912)).abs() < I80F48!(0.001));
+    }
+
+    #[test]
+    fn a_fast_fall_of_the_collateral_turns_the_premium_into_a_loss_at_real_time_prices() {
+        let premium = I80F48!(0.055);
+        let profit = |asset_ratio, liab_ratio| {
+            real_time_profit(I80F48!(100), premium, asset_ratio, liab_ratio)
+        };
+        // Spot at the time-weighted price: the whole premium.
+        assert!((profit(I80F48::ONE, I80F48::ONE) - I80F48!(5.5)).abs() < I80F48!(0.001));
+        // Collateral 8% under it: the seized 105.5 is worth 97.06 for the 100 repaid.
+        assert!((profit(I80F48!(0.92), I80F48::ONE) - I80F48!(-2.94)).abs() < I80F48!(0.001));
+        // Debt 3% above it costs as much.
+        assert!((profit(I80F48::ONE, I80F48!(1.03)) - I80F48!(2.5)).abs() < I80F48!(0.001));
+        // Even: 1 / 1.055.
+        assert!(profit(I80F48!(0.948), I80F48::ONE) > I80F48::ZERO);
+        assert!(profit(I80F48!(0.947), I80F48::ONE) < I80F48::ZERO);
     }
 
     #[test]
@@ -2836,8 +2925,8 @@ mod push_choice_tests {
         };
         let oracles = [sol, eth];
 
-        let ours = program_accounts(&cache, &oracles, Pricing::Newest).unwrap();
-        assert_eq!(ours.iter().map(price).collect::<Vec<_>>(), vec![2, 2]);
+        let newest = program_accounts(&cache, &oracles, Pricing::Newest).unwrap();
+        assert_eq!(newest.iter().map(price).collect::<Vec<_>>(), vec![2, 2]);
         let chain = program_accounts(&cache, &oracles, Pricing::Chain).unwrap();
         assert_eq!(chain.iter().map(price).collect::<Vec<_>>(), vec![1, 1]);
         // SOL at the price its push posts, which need not be the newest eva holds.

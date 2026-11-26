@@ -113,7 +113,7 @@ pub fn oracle_account_keys(bank: &Bank, bank_address: &Pubkey) -> Result<Vec<Pub
     Ok(addresses)
 }
 
-/// Publish time of a Pyth price, or the newest of the given Scope entries (only the ones our banks
+/// Publish time of a Pyth price, or the newest of the given Scope entries (only the ones the banks
 /// use). `None` for other accounts and never-refreshed entries.
 pub fn oracle_publish_time(account: &Account, scope_entries: &[u16]) -> Option<i64> {
     if account.owner == SCOPE_PROGRAM_ID {

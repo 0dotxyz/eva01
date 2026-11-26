@@ -807,13 +807,17 @@ fn record(shared: &Shared, result: proto::BundleResult) {
             .or_insert_with(Outcome::new);
         match result.result {
             Some(Kind::Accepted(accepted)) => {
-                outcome.forwarded = true;
-                // One per leader it goes to: not worth a line each in production.
-                debug!(
-                    "JITO_BUNDLE_RESULT bundle_id={id} forwarded slot={} leader={}",
+                let what = format!(
+                    "forwarded slot={} leader={}",
                     accepted.slot, accepted.validator_identity
                 );
-                return;
+                // One per leader it goes to: the first says it went out.
+                if outcome.forwarded {
+                    debug!("JITO_BUNDLE_RESULT bundle_id={id} {what}");
+                    return;
+                }
+                outcome.forwarded = true;
+                what
             }
             Some(Kind::Rejected(rejected)) => {
                 outcome.rejections += 1;

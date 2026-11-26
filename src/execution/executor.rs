@@ -599,9 +599,13 @@ impl Executor {
     ) -> bool {
         wallet_goes_first(
             plan.profit,
-            intent.profit,
+            intent.expected_profit(),
             self.wallet_min_profit_share,
-            intent.sandwich_pair.as_ref().map(|pair| pair.profit),
+            // On the same prices as the wallet's.
+            intent
+                .sandwich_pair
+                .as_ref()
+                .map(|pair| pair.profit.min(pair.real_time_profit)),
         )
     }
 
@@ -620,7 +624,7 @@ impl Executor {
                 reason: format!(
                     "the wallet funds only ${:.4} of the ${:.4} profit",
                     plan.profit.to_num::<f64>(),
-                    intent.profit.to_num::<f64>()
+                    intent.expected_profit().to_num::<f64>()
                 ),
                 claimed: false,
             },

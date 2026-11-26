@@ -50,9 +50,9 @@ const RATE_WINDOW: Duration = Duration::from_secs(1);
 /// Requests per window without an auth uuid.
 const UNAUTHENTICATED_REQUESTS: usize = 1;
 
-/// Requests per window with an auth uuid. Ours admits about 37 a second; this leaves room for
-/// bursts the window doesn't count evenly.
-const AUTHENTICATED_REQUESTS: usize = 20;
+/// Requests per window with an auth uuid, below the uuid's limit to leave room for bursts the
+/// window doesn't count evenly.
+const AUTHENTICATED_REQUESTS: usize = 40;
 
 pub struct JitoClient {
     http: Client,
@@ -528,7 +528,7 @@ impl JitoClient {
         }
     }
 
-    /// The block-engine URL with the optional auth uuid appended (matches p0-app).
+    /// The block-engine URL with the optional auth uuid appended.
     fn url(&self) -> String {
         match &self.api_key {
             Some(key) => format!("{}?uuid={}", self.endpoint, key),

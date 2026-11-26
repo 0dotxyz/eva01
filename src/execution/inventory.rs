@@ -71,6 +71,15 @@ fn is_no_route(e: &anyhow::Error) -> bool {
     outermost.starts_with("No route pays") || outermost.starts_with("No route fits")
 }
 
+/// What a sandwich is expected to earn, which its tip is a share of: the liability its route
+/// guarantees beyond the repay (`guaranteed`, USD) or, when that is less, the profit at real-time
+/// prices, never more than the profit at equity prices and never below zero. After a fast move the equity-price
+/// profit overstates what the swap earns, and a tip on it can cost more than the liquidation pays.
+fn sandwich_profit(equity: I80F48, real_time: I80F48, guaranteed: Option<I80F48>) -> I80F48 {
+    let market = guaranteed.map_or(real_time, |guaranteed| real_time.max(guaranteed));
+    I80F48::max(I80F48::ZERO, equity.min(market))
+}
+
 /// The share of a `repay_units` repay that `held` free wallet tokens cover, at most 1, or `None`
 /// when they cover nothing.
 fn wallet_share(repay_units: u64, held: u64) -> Option<I80F48> {
@@ -132,7 +141,7 @@ impl InventoryStrategy {
 
     /// A price-only token wrapper (balance 0) for `mint`, used solely for the oracle-price <-> token
     /// amount conversions when sizing the swap input. Avoids depending on a wallet token account for
-    /// a liability we may hold none of.
+    /// a liability the wallet may hold none of.
     fn value_wrapper(&self, mint: &Pubkey) -> Result<TokenAccountWrapper<OracleWrapper>> {
         let cache = &self.liquidator_account.cache;
         let bank_address = cache.banks.try_get_account_for_mint(mint)?;
@@ -157,7 +166,7 @@ impl InventoryStrategy {
         asset_mint: Pubkey,
         liab_mint: Pubkey,
         landing: Landing,
-    ) -> Result<VersionedTransaction> {
+    ) -> Result<(VersionedTransaction, u64)> {
         // What the withdraw hands the wallet, which is what the swap can sell.
         let asset_bank = self
             .liquidator_account
@@ -221,7 +230,7 @@ impl InventoryStrategy {
                         "InventoryStrategy: selling {} {} for at least {} {} in-tx via {:?} (repaying {})",
                         asset_amount, asset_mint, swap.min_out_amount, liab_mint, swap.aggregator, repay_amount
                     );
-                    built = Some(tx);
+                    built = Some((tx, swap.min_out_amount.saturating_sub(repay_amount)));
                     break;
                 }
                 Err(e) if e.is::<DoesNotFit>() => {
@@ -234,7 +243,7 @@ impl InventoryStrategy {
                 Err(e) => return Err(e),
             }
         }
-        let tx =
+        let (tx, guaranteed) =
             built.ok_or_else(|| anyhow!("every route is too large ({})", too_large.join("; ")))?;
         // Over RPC this is its only check: the executor sends it without preflight. A bundled one
         // isn't simulated at all: a bundle that fails doesn't land, and one behind a push relies
@@ -250,7 +259,7 @@ impl InventoryStrategy {
                 }
             })?;
         }
-        Ok(tx)
+        Ok((tx, guaranteed))
     }
 
     /// Builds the fallback plan: the liquidation repaid from the liability the wallet holds and no
@@ -286,17 +295,19 @@ impl InventoryStrategy {
             .into());
         };
 
+        let profit = intent.expected_profit() * share;
+        if profit < I80F48::from_num(self.min_profit) {
+            return Err(anyhow!(
+                "the wallet's free {} {} covers {:.4} of the repay, for ${:.6} profit (${:.6} at real-time prices, ${:.6} at equity prices)",
+                held,
+                liab_mint,
+                share.to_num::<f64>(),
+                profit.to_num::<f64>(),
+                intent.real_time_profit.to_num::<f64>(),
+                intent.profit.to_num::<f64>()
+            ));
+        }
         let (asset_amount, repay_amount) = if share < I80F48::ONE {
-            let profit = intent.profit * share;
-            if profit < I80F48::from_num(self.min_profit) {
-                return Err(anyhow!(
-                    "the wallet's free {} {} covers {:.4} of the repay, for ${:.6} profit",
-                    held,
-                    liab_mint,
-                    share.to_num::<f64>(),
-                    profit.to_num::<f64>()
-                ));
-            }
             info!(
                 "InventoryStrategy: repaying {} of {} {} from the wallet; liquidating {:.4} of the plan",
                 held,
@@ -323,11 +334,7 @@ impl InventoryStrategy {
         Ok(ExecutionPlan {
             tx,
             claim: Some(claim),
-            profit: if share < I80F48::ONE {
-                intent.profit * share
-            } else {
-                intent.profit
-            },
+            profit,
         })
     }
 }
@@ -343,11 +350,18 @@ impl LiquidationStrategy for InventoryStrategy {
         let asset_mint = cache.banks.try_get_bank(&intent.asset_bank)?.bank.mint;
 
         match self.build_sandwich_tx(intent, asset_mint, liab_mint, landing) {
-            Ok(tx) => Ok(Sandwich::Plan(ExecutionPlan {
-                tx,
-                claim: None,
-                profit: intent.profit,
-            })),
+            Ok((tx, guaranteed)) => {
+                let guaranteed = self
+                    .value_wrapper(&liab_mint)
+                    .and_then(|liab| liab.get_value_for_amount(I80F48::from_num(guaranteed)))
+                    .map_err(|e| debug!("InventoryStrategy: can't value the route's profit: {e}"))
+                    .ok();
+                Ok(Sandwich::Plan(ExecutionPlan {
+                    tx,
+                    claim: None,
+                    profit: sandwich_profit(intent.profit, intent.real_time_profit, guaranteed),
+                }))
+            }
             Err(e) => {
                 info!(
                     "InventoryStrategy: not selling the collateral in-tx for {} ({}); repaying from the wallet instead",
@@ -367,7 +381,7 @@ impl LiquidationStrategy for InventoryStrategy {
     fn lamports_for_value(&self, usd: I80F48) -> Result<u64> {
         Ok(self
             .value_wrapper(&spl_token::native_mint::ID)?
-            .get_amount_from_value(usd)?
+            .get_amount_from_value(I80F48::max(I80F48::ZERO, usd))?
             .to_num())
     }
 
@@ -408,7 +422,40 @@ mod tests {
         assert!(!is_no_route(&anyhow!("Titan quote timed out")));
         assert!(!is_no_route(&anyhow!("HTTP 429 Too Many Requests")));
     }
+
     use fixed_macro::types::I80F48;
+
+    #[test]
+    fn a_sandwich_tips_on_what_its_swap_earns() {
+        let profit = sandwich_profit;
+        // At rest: the equity-price profit, as before.
+        assert_eq!(
+            profit(I80F48!(20), I80F48!(20.4), Some(I80F48!(0.05))),
+            I80F48!(20)
+        );
+        // After a crash: what the market pays, not the equity-price profit.
+        assert_eq!(
+            profit(I80F48!(20), I80F48!(1), Some(I80F48!(0.05))),
+            I80F48!(1)
+        );
+        // A lagging DEX guarantees more than the oracle suggests.
+        assert_eq!(
+            profit(I80F48!(20), I80F48!(1), Some(I80F48!(6))),
+            I80F48!(6)
+        );
+        assert_eq!(
+            profit(I80F48!(20), I80F48!(-3), Some(I80F48!(0.05))),
+            I80F48!(0.05)
+        );
+        // Never above the equity-price profit.
+        assert_eq!(
+            profit(I80F48!(20), I80F48!(1), Some(I80F48!(30))),
+            I80F48!(20)
+        );
+        // The route unvalued: the real-time profit, and nothing for a loss.
+        assert_eq!(profit(I80F48!(20), I80F48!(1), None), I80F48!(1));
+        assert_eq!(profit(I80F48!(20), I80F48!(-3), None), I80F48::ZERO);
+    }
 
     #[test]
     fn a_failed_simulation_is_told_apart_from_a_missing_route() {

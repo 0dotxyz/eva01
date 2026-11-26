@@ -2,7 +2,7 @@
 //!
 //! A tag lets the receivership premium an account pays grow over time, so a liquidation that is
 //! not worth it today may be later. The tag costs a transaction fee whether or not it pays off,
-//! and it only pays off if we are the ones liquidating the account once the premium has grown.
+//! and it only pays off if eva is the one liquidating the account once the premium has grown.
 //! Accounts that other liquidators are working get chunked away long before that, so an account
 //! is tagged only after it has stayed unhealthy, with nobody touching its position, for
 //! [`TAG_MIN_UNHEALTHY_FOR`].
