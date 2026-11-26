@@ -37,6 +37,13 @@ const LOST_RACE_WINDOW: Duration = Duration::from_secs(30);
 const MAX_ATTEMPTS_PER_ACCOUNT: u32 = 2;
 const SUPERSEDING_GAIN: f64 = 1.1;
 
+/// Whether a piece earning `new` is [`SUPERSEDING_GAIN`] more than the attempt in flight's
+/// `in_flight`. A loss at real-time prices is negative; the gain is on its size, so a worse piece
+/// never supersedes.
+fn supersedes(new: f64, in_flight: f64) -> bool {
+    new > in_flight + in_flight.abs() * (SUPERSEDING_GAIN - 1.0)
+}
+
 /// An intent held back for the same reason is logged at most this often.
 const WAIT_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -277,43 +284,42 @@ impl State {
         intent: &PreparedLiquidatableAccount,
         now: Instant,
     ) -> Option<String> {
-        let profit = intent.profit.to_num::<f64>();
-        let (reason, detail) =
-            if let Some(until) = self.cooldowns.get(address).filter(|until| **until > now) {
-                let left = until.saturating_duration_since(now).as_millis();
-                match self.awaiting.get(address) {
-                    Some(slot) => (
-                        "awaiting_landed_state",
-                        format!("cooldown_left_ms={left} landed_slot={slot}"),
-                    ),
-                    None => {
-                        let lost = self
-                            .lost_races
-                            .get(address)
-                            .map_or(0, |(count, _, _)| *count);
-                        (
-                            "cooldown",
-                            format!("cooldown_left_ms={left} lost_races_in_a_row={lost}"),
-                        )
-                    }
+        let profit = intent.expected_profit().to_num::<f64>();
+        let (reason, detail) = if let Some(until) =
+            self.cooldowns.get(address).filter(|until| **until > now)
+        {
+            let left = until.saturating_duration_since(now).as_millis();
+            match self.awaiting.get(address) {
+                Some(slot) => (
+                    "awaiting_landed_state",
+                    format!("cooldown_left_ms={left} landed_slot={slot}"),
+                ),
+                None => {
+                    let lost = self
+                        .lost_races
+                        .get(address)
+                        .map_or(0, |(count, _, _)| *count);
+                    (
+                        "cooldown",
+                        format!("cooldown_left_ms={left} lost_races_in_a_row={lost}"),
+                    )
                 }
-            } else if let Some(flight) = self.in_flight.get(address) {
-                let in_flight_profit = flight.profit.to_num::<f64>();
-                if flight.attempts < MAX_ATTEMPTS_PER_ACCOUNT
-                    && profit > in_flight_profit * SUPERSEDING_GAIN
-                {
-                    return None;
-                }
-                (
-                    "in_flight",
-                    format!(
-                        "attempts={} in_flight_profit_usd={in_flight_profit:.4}",
-                        flight.attempts
-                    ),
-                )
-            } else {
+            }
+        } else if let Some(flight) = self.in_flight.get(address) {
+            let in_flight_profit = flight.profit.to_num::<f64>();
+            if flight.attempts < MAX_ATTEMPTS_PER_ACCOUNT && supersedes(profit, in_flight_profit) {
                 return None;
-            };
+            }
+            (
+                "in_flight",
+                format!(
+                    "attempts={} in_flight_profit_usd={in_flight_profit:.4}",
+                    flight.attempts
+                ),
+            )
+        } else {
+            return None;
+        };
         if self.wait_logged.get(address).is_some_and(|(logged, at)| {
             *logged == reason && now.saturating_duration_since(*at) < WAIT_LOG_INTERVAL
         }) {
@@ -341,19 +347,21 @@ impl State {
                 !self.cooldowns.contains_key(*address)
                     && in_flight.get(*address).is_none_or(|flight| {
                         flight.attempts < MAX_ATTEMPTS_PER_ACCOUNT
-                            && queued.intent.profit.to_num::<f64>()
-                                > flight.profit.to_num::<f64>() * SUPERSEDING_GAIN
+                            && supersedes(
+                                queued.intent.expected_profit().to_num::<f64>(),
+                                flight.profit.to_num::<f64>(),
+                            )
                     })
             })
-            .max_by_key(|(_, queued)| queued.intent.profit)
+            .max_by_key(|(_, queued)| queued.intent.expected_profit())
             .map(|(address, _)| *address)?;
         let queued = self.pending.remove(&address)?;
         let flight = self.in_flight.entry(address).or_insert(InFlight {
             attempts: 0,
-            profit: queued.intent.profit,
+            profit: queued.intent.expected_profit(),
         });
         flight.attempts += 1;
-        flight.profit = queued.intent.profit;
+        flight.profit = queued.intent.expected_profit();
         Some(queued)
     }
 
@@ -389,6 +397,7 @@ mod tests {
             asset_amount: I80F48::ONE,
             liab_amount: I80F48::ONE,
             profit: I80F48::from_num(profit),
+            real_time_profit: I80F48::from_num(profit),
             estimated_repay_usd: profit as f64,
             binding_cap: "test",
             push: None,
@@ -418,6 +427,29 @@ mod tests {
         assert_eq!(take_now(&queue).unwrap().0, c);
         assert_eq!(take_now(&queue).unwrap().0, a);
         assert!(take_now(&queue).is_none());
+    }
+
+    #[test]
+    fn only_a_piece_earning_a_tenth_more_supersedes_even_at_a_loss() {
+        assert!(supersedes(11.1, 10.0));
+        assert!(!supersedes(10.9, 10.0));
+        assert!(supersedes(0.01, 0.0));
+        assert!(!supersedes(0.0, 0.0));
+        assert!(!supersedes(-2.1, -2.0), "worse");
+        assert!(!supersedes(-1.9, -2.0), "not a tenth better");
+        assert!(supersedes(-1.7, -2.0));
+    }
+
+    #[test]
+    fn a_liquidation_that_earns_less_at_real_time_prices_ranks_by_that() {
+        let queue = ExecutionQueue::new(Duration::ZERO);
+        let (fallen, steady) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut crashed = intent(fallen, 5);
+        crashed.real_time_profit = I80F48::from_num(1);
+        queue.offer(&[fallen, steady], vec![crashed, intent(steady, 2)]);
+
+        assert_eq!(take_now(&queue).unwrap().0, steady);
+        assert_eq!(take_now(&queue).unwrap().0, fallen);
     }
 
     #[test]

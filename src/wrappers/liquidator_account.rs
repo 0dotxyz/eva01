@@ -77,6 +77,7 @@ pub struct LiquidationPair {
     pub asset_amount: I80F48,
     pub liab_amount: I80F48,
     pub profit: I80F48,
+    pub real_time_profit: I80F48,
 }
 
 #[derive(Clone)]
@@ -90,6 +91,10 @@ pub struct PreparedLiquidatableAccount {
     pub asset_amount: I80F48,
     pub liab_amount: I80F48,
     pub profit: I80F48,
+    /// The profit at real-time prices, which the seized collateral sells near: below `profit`
+    /// after a fast move, and negative once the move exceeds the premium. Only a swap that pays
+    /// checks a liquidation against the market; one repaid from the wallet relies on this.
+    pub real_time_profit: I80F48,
     pub estimated_repay_usd: f64,
     pub binding_cap: &'static str,
     /// The push the liquidation is sized on, which goes ahead of it; `None` when the chain's
@@ -114,6 +119,13 @@ impl PreparedLiquidatableAccount {
         self
     }
 
+    /// What the liquidation is expected to earn: the lower of its profit at equity and at real-time
+    /// prices. It ranks the queue, and gates and tips a wallet repay, which no swap checks against
+    /// the market; a tip on it is no larger than what is earned.
+    pub fn expected_profit(&self) -> I80F48 {
+        self.profit.min(self.real_time_profit)
+    }
+
     /// This liquidation on `sandwich_pair`, when there is one.
     pub fn for_sandwich(&self) -> std::borrow::Cow<'_, Self> {
         match &self.sandwich_pair {
@@ -124,6 +136,7 @@ impl PreparedLiquidatableAccount {
                 asset_amount: pair.asset_amount,
                 liab_amount: pair.liab_amount,
                 profit: pair.profit,
+                real_time_profit: pair.real_time_profit,
                 sandwich_pair: None,
                 ..self.clone()
             }),
